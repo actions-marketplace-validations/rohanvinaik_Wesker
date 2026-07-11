@@ -445,7 +445,8 @@ def test_profiling_uses_func_key_source_path_with_stubbed_original():
 
     from Wesker.engine import run_function_profiling
 
-    tree = ast.parse(open(__file__).read())
+    with open(__file__) as f:
+        tree = ast.parse(f.read())
     node = next(
         m
         for cls in tree.body
