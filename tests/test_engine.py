@@ -397,16 +397,24 @@ def test_profiling_derives_source_path_and_kills_factory_method():
 
     tree = ast.parse(open(__file__).read())
     node = next(
-        m for cls in tree.body if isinstance(cls, ast.ClassDef) and cls.name == "_OwnerFixture"
-        for m in cls.body if isinstance(m, ast.FunctionDef) and m.name == "flag"
+        m
+        for cls in tree.body
+        if isinstance(cls, ast.ClassDef) and cls.name == "_OwnerFixture"
+        for m in cls.body
+        if isinstance(m, ast.FunctionDef) and m.name == "flag"
     )
 
     def _test_via_factory():
         assert _make_owner().flag() is True
 
     res = run_function_profiling(
-        node, f"{__file__}::_OwnerFixture.flag",
-        {MutationCategory.VALUE}, [_test_via_factory], _OwnerFixture.flag,
+        node,
+        f"{__file__}::_OwnerFixture.flag",
+        {MutationCategory.VALUE},
+        [_test_via_factory],
+        _OwnerFixture.flag,
     )
     assert res.total_mutants >= 1
-    assert res.total_survived == 0  # source_path derived -> class owner patched -> mutant killed
+    assert (
+        res.total_survived == 0
+    )  # source_path derived -> class owner patched -> mutant killed

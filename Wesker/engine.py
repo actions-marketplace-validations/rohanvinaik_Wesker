@@ -1354,7 +1354,9 @@ def evaluate_mutant(
     # this the whole module-qualified patch was inert, so a method exercised via a factory whose class
     # is not imported into the test namespace (e.g. make_role_frame(...).relationP()) was a false survivor.
     if source_path is None:
-        source_path = getattr(getattr(original_func, "__code__", None), "co_filename", None)
+        source_path = getattr(
+            getattr(original_func, "__code__", None), "co_filename", None
+        )
 
     # Compile mutated function
     try:
