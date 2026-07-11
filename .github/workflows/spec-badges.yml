@@ -1,0 +1,134 @@
+name: Specification Badges
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  spec_badges:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v4
+        with:
+          version: "latest"
+
+      - name: Install dependencies
+        run: uv sync
+
+      # ── Wesker specification metrics — the tool profiling itself ──
+      #
+      # `python -m Wesker.metrics` runs in-process multi-pass mutation
+      # profiling over Wesker's own library core (engine, ci, filter),
+      # then MC/DC verification (GITHUB_ACTIONS auto-enables it), and emits
+      # MUTATION_KILL_PCT / MEAN_SIGMA / TEST_COUNT / MCDC_* to GITHUB_ENV.
+      #
+      # MC/DC methodology: ROR (Relational Operator Replacement) mutation.
+      # Offutt & Voas (1996) prove mutation testing subsumes MC/DC; Kaminski,
+      # Ammann & Offutt (2013) show ROR mutation is strictly stronger than
+      # MC/DC in fault-detection power. Targets are auto-discovered by AST
+      # scan — every function with relational operators, no hand-curation.
+      - name: Run Wesker specification metrics
+        run: uv run python -m Wesker.metrics
+        env:
+          WESKER_COLOR: "1"
+
+      - name: Create badges directory
+        run: mkdir -p .github/badges
+
+      # ── Badge generation ──────────────────────────────────────────
+
+      - name: Generate Mutation Kill Rate Badge
+        uses: emibcn/badge-action@v2.0.2
+        with:
+          label: "Mutation Kill Rate"
+          label-color: "333"
+          status: "${{ env.MUTATION_KILL_PCT }}%"
+          color: ${{ env.MUTATION_KILL_PCT == '100' && '2ea043' || 'e5534b' }}
+          path: ".github/badges/mutation-kill-rate.svg"
+
+      - name: "Generate Mean σ Badge"
+        uses: emibcn/badge-action@v2.0.2
+        with:
+          label: "Mean σ"
+          label-color: "333"
+          status: "${{ env.MEAN_SIGMA }}"
+          color: "8b5cf6"
+          path: ".github/badges/sigma.svg"
+
+      - name: Generate Test Count Badge
+        uses: emibcn/badge-action@v2.0.2
+        with:
+          label: "Tests"
+          label-color: "333"
+          status: "${{ env.TEST_COUNT }} (${{ env.TEST_RATIO }})"
+          color: "555"
+          path: ".github/badges/test-count.svg"
+
+      - name: Compute sampling ratio
+        run: |
+          python3 -c "
+          tested = ${{ env.MUTATION_TOTAL }}
+          universe = ${{ env.MUTATION_UNIVERSE }}
+          if universe and universe > 0:
+              pct = round(100 * tested / universe, 1)
+              print(f'SAMPLING_RATIO={tested}/{universe} ({pct}%)')
+          else:
+              print(f'SAMPLING_RATIO={tested}/{tested} (100%)')
+          " | while read line; do echo "$line" >> "$GITHUB_ENV"; done
+
+      - name: Generate Mutation Sampling Badge
+        uses: emibcn/badge-action@v2.0.2
+        with:
+          label: "Mutation Sampling"
+          label-color: "333"
+          status: "${{ env.SAMPLING_RATIO }}"
+          color: "555"
+          path: ".github/badges/mutation-sampling.svg"
+
+      - name: "Generate MC/DC Badge"
+        uses: emibcn/badge-action@v2.0.2
+        with:
+          label: "MC/DC"
+          label-color: "333"
+          status: "${{ env.MCDC_STATUS }} (${{ env.MCDC_COVERED }}/${{ env.MCDC_TOTAL }})"
+          color: ${{ env.MCDC_STATUS == 'Verified' && '0ea5e9' || 'e5534b' }}
+          path: ".github/badges/mcdc.svg"
+
+      # ── Push to badges branch ────────────────────────────────────
+
+      - name: Push badges to badges branch
+        if: github.ref == 'refs/heads/main'
+        run: |
+          cp .github/badges/*.svg /tmp/
+          rm -rf .github/badges
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          if git ls-remote --exit-code --heads origin badges >/dev/null 2>&1; then
+            git fetch origin badges:badges
+            git switch badges
+          else
+            git switch --orphan badges
+            git rm -rf . >/dev/null 2>&1 || true
+          fi
+
+          mkdir -p .github/badges
+          cp /tmp/*.svg .github/badges/
+          git add .github/badges/*.svg
+
+          if git diff --cached --quiet; then
+            echo "No badge changes"
+            exit 0
+          fi
+
+          git commit -m "Update spec badges (kill=${{ env.MUTATION_KILL_PCT }}%, σ̄=${{ env.MEAN_SIGMA }}, tests=${{ env.TEST_COUNT }}, ratio=${{ env.TEST_RATIO }})"
+          git push origin badges

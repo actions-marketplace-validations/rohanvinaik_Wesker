@@ -50,15 +50,26 @@ def _pct_color(pct: int) -> str:
 # ── Layer 1: Convention-based test discovery ─────────────────────
 
 
-def _name_matches_convention(base, base_stripped, generated_name, name, parent_dir, parent_qualified, partial_stems):
+def _name_matches_convention(
+    base,
+    base_stripped,
+    generated_name,
+    name,
+    parent_dir,
+    parent_qualified,
+    partial_stems,
+):
     match = (
         # Exact generated name (highest confidence)
         name == generated_name
         # Parent-qualified (wiki/config.py -> test_wiki_config.py)
-        or (parent_qualified and (
-            name == f"test_{parent_qualified}.py"
-            or name.startswith(f"test_{parent_qualified}_")
-        ))
+        or (
+            parent_qualified
+            and (
+                name == f"test_{parent_qualified}.py"
+                or name.startswith(f"test_{parent_qualified}_")
+            )
+        )
         # Exact stem
         or name == f"test_{base}.py"
         or name == f"test_{base_stripped}.py"
@@ -120,7 +131,15 @@ def _discover_by_convention(project_root: str, source_file: str) -> list[str]:
             name = entry.name
             path_str = str(entry)
 
-            match = _name_matches_convention(base, base_stripped, generated_name, name, parent_dir, parent_qualified, partial_stems)
+            match = _name_matches_convention(
+                base,
+                base_stripped,
+                generated_name,
+                name,
+                parent_dir,
+                parent_qualified,
+                partial_stems,
+            )
 
             # Suppress ambiguous bare-stem matches for common names in subdirs
             if match and parent_qualified and base_stripped in ambiguous_stems:
@@ -177,7 +196,9 @@ def _discover_all_test_files(project_root: str) -> list[str]:
 # ── 3-Layer discovery orchestrator ───────────────────────────────
 
 
-def discover_tests(project_root: str, source_file: str, func_names: list[str]) -> list[str]:
+def discover_tests(
+    project_root: str, source_file: str, func_names: list[str]
+) -> list[str]:
     """3-layer test discovery: convention -> static impact -> full fallback.
 
     Layer 1: Convention matching (fast, filename-based)
@@ -454,6 +475,7 @@ def profile_function(
 def _code_hash(source: str) -> str:
     """Stable hash of source text for cache invalidation."""
     import hashlib
+
     return hashlib.sha256(source.encode()).hexdigest()[:16]
 
 
@@ -542,9 +564,13 @@ def profile_function_cached(
     # Cache miss — profile
     cached_state = _load_cached_state(project_root)
     result = profile_function(
-        project_root, source_file, function_name,
-        budget_ms=budget_ms, max_per_category=max_per_category,
-        passes=passes, cached_state=cached_state,
+        project_root,
+        source_file,
+        function_name,
+        budget_ms=budget_ms,
+        max_per_category=max_per_category,
+        passes=passes,
+        cached_state=cached_state,
     )
 
     if result is not None:
@@ -629,7 +655,13 @@ def profile_codebase(
                     continue
                 agg = global_cats.setdefault(
                     cat_name,
-                    {"category": cat_name, "total": 0, "killed": 0, "survived": 0, "equivalent": 0},
+                    {
+                        "category": cat_name,
+                        "total": 0,
+                        "killed": 0,
+                        "survived": 0,
+                        "equivalent": 0,
+                    },
                 )
                 agg["total"] += cat_data.get("total", 0)
                 agg["killed"] += cat_data.get("killed", 0)
@@ -638,7 +670,11 @@ def profile_codebase(
 
         if file_total > 0:
             effective_total = file_total - file_equiv
-            kill_pct = round(100 * file_killed / effective_total) if effective_total > 0 else 100
+            kill_pct = (
+                round(100 * file_killed / effective_total)
+                if effective_total > 0
+                else 100
+            )
             per_file[target] = {
                 "functions": len(results),
                 "killed": file_killed,
@@ -650,10 +686,18 @@ def profile_codebase(
             }
             if verbose:
                 c = _pct_color(kill_pct)
-                equiv_note = f" {_DIM}({file_equiv} equiv){_RESET}" if file_equiv else ""
-                coverage = f" {_DIM}[{file_total}/{file_universe}]{_RESET}" if file_universe > file_total else ""
-                print(f" {c}{file_killed}/{file_total}{_RESET}{equiv_note}{coverage}"
-                      f" {_DIM}{file_ms:.0f}ms{_RESET}")
+                equiv_note = (
+                    f" {_DIM}({file_equiv} equiv){_RESET}" if file_equiv else ""
+                )
+                coverage = (
+                    f" {_DIM}[{file_total}/{file_universe}]{_RESET}"
+                    if file_universe > file_total
+                    else ""
+                )
+                print(
+                    f" {c}{file_killed}/{file_total}{_RESET}{equiv_note}{coverage}"
+                    f" {_DIM}{file_ms:.0f}ms{_RESET}"
+                )
         else:
             if verbose:
                 print(f" {_DIM}(no mutants){_RESET}")

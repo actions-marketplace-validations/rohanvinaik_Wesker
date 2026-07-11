@@ -92,26 +92,36 @@ def _load_config() -> dict:
     if wesker:
         config["source_dir"] = wesker.get("source_dir", config["source_dir"])
         config["exclude"] = set(wesker.get("exclude", []))
-        config["mcdc_targets"] = [
-            tuple(t) for t in wesker.get("mcdc_targets", [])
-        ]
-        config["max_per_category"] = wesker.get("max_per_category", config["max_per_category"])
-        config["convergence_passes"] = wesker.get("convergence_passes", config["convergence_passes"])
+        config["mcdc_targets"] = [tuple(t) for t in wesker.get("mcdc_targets", [])]
+        config["max_per_category"] = wesker.get(
+            "max_per_category", config["max_per_category"]
+        )
+        config["convergence_passes"] = wesker.get(
+            "convergence_passes", config["convergence_passes"]
+        )
         if config["source_dir"]:
             return config
 
     # Auto-detect source_dir from coverage config
-    cov_source = data.get("tool", {}).get("coverage", {}).get("run", {}).get("source", [])
+    cov_source = (
+        data.get("tool", {}).get("coverage", {}).get("run", {}).get("source", [])
+    )
     if cov_source:
         config["source_dir"] = cov_source[0]
-        cov_omit = data.get("tool", {}).get("coverage", {}).get("run", {}).get("omit", [])
+        cov_omit = (
+            data.get("tool", {}).get("coverage", {}).get("run", {}).get("omit", [])
+        )
         config["exclude"] = set(cov_omit)
         return config
 
     # Auto-detect from hatch build config
     hatch_pkgs = (
-        data.get("tool", {}).get("hatch", {}).get("build", {})
-        .get("targets", {}).get("wheel", {}).get("packages", [])
+        data.get("tool", {})
+        .get("hatch", {})
+        .get("build", {})
+        .get("targets", {})
+        .get("wheel", {})
+        .get("packages", [])
     )
     if hatch_pkgs:
         config["source_dir"] = hatch_pkgs[0]
@@ -120,7 +130,9 @@ def _load_config() -> dict:
     # Last resort: look for src/*/ directories
     src = Path("src")
     if src.is_dir():
-        subdirs = [d for d in src.iterdir() if d.is_dir() and not d.name.startswith("_")]
+        subdirs = [
+            d for d in src.iterdir() if d.is_dir() and not d.name.startswith("_")
+        ]
         if len(subdirs) == 1:
             config["source_dir"] = str(subdirs[0])
 
@@ -218,15 +230,19 @@ def _count_source_loc() -> int:
 _TEXT_OP_SWAPS: dict[str, list[str]] = {
     " <= ": [" < ", " >= ", " > ", " == ", " != "],
     " >= ": [" > ", " <= ", " < ", " == ", " != "],
-    " < ":  [" <= ", " > ", " >= ", " == ", " != "],
-    " > ":  [" >= ", " < ", " <= ", " == ", " != "],
+    " < ": [" <= ", " > ", " >= ", " == ", " != "],
+    " > ": [" >= ", " < ", " <= ", " == ", " != "],
     " == ": [" != ", " < ", " <= ", " > ", " >= "],
     " != ": [" == ", " < ", " <= ", " > ", " >= "],
 }
 
 _AST_TO_TEXT = {
-    "LtE": " <= ", "Lt": " < ", "GtE": " >= ", "Gt": " > ",
-    "Eq": " == ", "NotEq": " != ",
+    "LtE": " <= ",
+    "Lt": " < ",
+    "GtE": " >= ",
+    "Gt": " > ",
+    "Eq": " == ",
+    "NotEq": " != ",
 }
 
 
@@ -263,7 +279,10 @@ def _verify_mcdc_single(filepath: str, func_name: str) -> dict:
 
     func_node = None
     for node in ast.walk(tree):
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == func_name:
+        if (
+            isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and node.name == func_name
+        ):
             func_node = node
             break
 
@@ -279,15 +298,22 @@ def _verify_mcdc_single(filepath: str, func_name: str) -> dict:
                 if op_text:
                     swaps = _TEXT_OP_SWAPS.get(op_text, [])
                     for swap_text in swaps:
-                        condition_sites.append({
-                            "line": child.lineno,
-                            "op_text": op_text,
-                            "swap_text": swap_text,
-                            "description": f"{op_text.strip()} -> {swap_text.strip()}",
-                        })
+                        condition_sites.append(
+                            {
+                                "line": child.lineno,
+                                "op_text": op_text,
+                                "swap_text": swap_text,
+                                "description": f"{op_text.strip()} -> {swap_text.strip()}",
+                            }
+                        )
 
     if not condition_sites:
-        return {"function": func_name, "status": "no_conditions", "covered": 0, "total": 0}
+        return {
+            "function": func_name,
+            "status": "no_conditions",
+            "covered": 0,
+            "total": 0,
+        }
 
     covered = 0
     total = 0
@@ -311,15 +337,36 @@ def _verify_mcdc_single(filepath: str, func_name: str) -> dict:
             killed = result.returncode != 0
             if killed:
                 covered += 1
-                details.append({"line": site["line"], "swap": site["description"], "killed": True, "equivalent": False})
+                details.append(
+                    {
+                        "line": site["line"],
+                        "swap": site["description"],
+                        "killed": True,
+                        "equivalent": False,
+                    }
+                )
             else:
                 is_equivalent = _check_equivalent(mutated, filepath)
                 if is_equivalent:
                     covered += 1
-                details.append({"line": site["line"], "swap": site["description"], "killed": False, "equivalent": is_equivalent})
+                details.append(
+                    {
+                        "line": site["line"],
+                        "swap": site["description"],
+                        "killed": False,
+                        "equivalent": is_equivalent,
+                    }
+                )
         except subprocess.TimeoutExpired:
             covered += 1
-            details.append({"line": site["line"], "swap": site["description"], "killed": True, "equivalent": False})
+            details.append(
+                {
+                    "line": site["line"],
+                    "swap": site["description"],
+                    "killed": True,
+                    "equivalent": False,
+                }
+            )
         finally:
             path.write_text(source)
 
@@ -367,9 +414,7 @@ def _verify_mcdc(targets: list[tuple[str, str]]) -> dict:
         total_covered += result["covered"]
         total_conditions += result["total"]
 
-    all_verified = all(
-        r["status"] == "verified" for r in results if r["total"] > 0
-    )
+    all_verified = all(r["status"] == "verified" for r in results if r["total"] > 0)
 
     return {
         "verified": all_verified,
@@ -412,9 +457,12 @@ def main():
     # 1. Mutation profiling (in-process, multi-pass convergence)
     passes = config.get("convergence_passes", 3)
     max_per_cat = config.get("max_per_category", 5)
-    print(f"\n[1/4] Running in-process mutation profiling ({passes} passes, {max_per_cat}/cat)...")
+    print(
+        f"\n[1/4] Running in-process mutation profiling ({passes} passes, {max_per_cat}/cat)..."
+    )
     mutation = profile_codebase(
-        ".", targets,
+        ".",
+        targets,
         budget_ms_per_file=15000,
         max_per_category=max_per_cat,
         passes=passes,
@@ -422,13 +470,23 @@ def main():
     equiv = mutation.get("total_equivalent", 0)
     universe = mutation.get("total_universe", 0)
     equiv_note = f" ({equiv} equivalent)" if equiv else ""
-    coverage_note = f" [{mutation['total_mutants']}/{universe} sampled]" if universe > mutation['total_mutants'] else ""
-    print(f"  Mutation: {mutation['total_killed']}/{mutation['total_mutants']} "
-          f"({mutation['kill_pct']}%) across {mutation['total_functions']} functions"
-          f"{equiv_note}{coverage_note}")
+    coverage_note = (
+        f" [{mutation['total_mutants']}/{universe} sampled]"
+        if universe > mutation["total_mutants"]
+        else ""
+    )
+    print(
+        f"  Mutation: {mutation['total_killed']}/{mutation['total_mutants']} "
+        f"({mutation['kill_pct']}%) across {mutation['total_functions']} functions"
+        f"{equiv_note}{coverage_note}"
+    )
     for f, d in sorted(mutation["per_file"].items()):
         status = "OK" if d["kill_pct"] == 100 else f"{d['kill_pct']}%"
-        file_note = f" [{d['total']}/{d.get('universe', d['total'])}]" if d.get("universe", 0) > d["total"] else ""
+        file_note = (
+            f" [{d['total']}/{d.get('universe', d['total'])}]"
+            if d.get("universe", 0) > d["total"]
+            else ""
+        )
         print(f"    {f}: {d['killed']}/{d['total']} ({status}){file_note}")
 
     # 2. MC/DC verification (CI only — each condition requires a full pytest run)
@@ -442,21 +500,36 @@ def main():
     # Target discovery: functions are auto-discovered by AST scan — any
     # function containing ast.Compare nodes (relational operators) is included.
     # Explicit [tool.wesker] mcdc_targets override auto-discovery.
-    run_mcdc = os.environ.get("GITHUB_ACTIONS") == "true" or os.environ.get("WESKER_MCDC") == "1"
+    run_mcdc = (
+        os.environ.get("GITHUB_ACTIONS") == "true"
+        or os.environ.get("WESKER_MCDC") == "1"
+    )
     if run_mcdc:
         mcdc_targets = config.get("mcdc_targets", [])
         if not mcdc_targets:
             mcdc_targets = _discover_mcdc_targets(targets)
         mcdc_label = "configured" if config.get("mcdc_targets") else "auto-discovered"
-        print(f"\n[2/4] Verifying MC/DC on {len(mcdc_targets)} functions ({mcdc_label})...")
+        print(
+            f"\n[2/4] Verifying MC/DC on {len(mcdc_targets)} functions ({mcdc_label})..."
+        )
         mcdc = _verify_mcdc(mcdc_targets)
         mcdc_status = "Verified" if mcdc["verified"] else "Partial"
-        mcdc_detail = f"{mcdc['conditions_covered']}/{mcdc['conditions_total']} conditions"
+        mcdc_detail = (
+            f"{mcdc['conditions_covered']}/{mcdc['conditions_total']} conditions"
+        )
         print(f"  MC/DC: {mcdc_status} ({mcdc_detail})")
     else:
-        print("\n[2/4] MC/DC verification — skipped (CI only, set WESKER_MCDC=1 to run locally)")
-        mcdc = {"verified": True, "functions_checked": 0, "functions_verified": 0,
-                "conditions_covered": 0, "conditions_total": 0, "results": []}
+        print(
+            "\n[2/4] MC/DC verification — skipped (CI only, set WESKER_MCDC=1 to run locally)"
+        )
+        mcdc = {
+            "verified": True,
+            "functions_checked": 0,
+            "functions_verified": 0,
+            "conditions_covered": 0,
+            "conditions_total": 0,
+            "results": [],
+        }
         mcdc_status = "Skipped"
         mcdc_detail = "CI only"
 
@@ -493,8 +566,10 @@ def main():
     }
 
     print(f"\n{'=' * 60}")
-    print(f"Mutation: {mutation['total_killed']}/{mutation['total_mutants']} "
-          f"({mutation['kill_pct']}%){equiv_note}{coverage_note}")
+    print(
+        f"Mutation: {mutation['total_killed']}/{mutation['total_mutants']} "
+        f"({mutation['kill_pct']}%){equiv_note}{coverage_note}"
+    )
     print(f"MC/DC: {mcdc_status} — {mcdc_detail}")
     print(f"Mean sigma: {mean_sigma} across {func_count} functions")
     print(f"Tests: {test_count} | Source: {source_loc} LOC | Ratio: 1:{ratio}")

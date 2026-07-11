@@ -45,13 +45,33 @@ def main(argv: list[str] | None = None) -> int:
         prog="wesker",
         description="Wesker — in-process AST mutation testing for Python",
     )
-    parser.add_argument("targets", nargs="*", default=["."], help="Files or directories to profile")
-    parser.add_argument("--mcdc", nargs="*", metavar="FILE::FUNC", help="MC/DC verification targets")
-    parser.add_argument("--json", action="store_true", dest="json_output", help="JSON output")
-    parser.add_argument("--threshold", type=int, default=0, help="Minimum kill rate %% (exit 1 if below)")
-    parser.add_argument("--budget", type=float, default=10000, help="Per-file budget in ms")
-    parser.add_argument("--max-per-category", type=int, default=5, help="Max mutants per category per pass (0=exhaustive)")
-    parser.add_argument("--passes", type=int, default=3, help="Convergence passes (different seed each)")
+    parser.add_argument(
+        "targets", nargs="*", default=["."], help="Files or directories to profile"
+    )
+    parser.add_argument(
+        "--mcdc", nargs="*", metavar="FILE::FUNC", help="MC/DC verification targets"
+    )
+    parser.add_argument(
+        "--json", action="store_true", dest="json_output", help="JSON output"
+    )
+    parser.add_argument(
+        "--threshold",
+        type=int,
+        default=0,
+        help="Minimum kill rate %% (exit 1 if below)",
+    )
+    parser.add_argument(
+        "--budget", type=float, default=10000, help="Per-file budget in ms"
+    )
+    parser.add_argument(
+        "--max-per-category",
+        type=int,
+        default=5,
+        help="Max mutants per category per pass (0=exhaustive)",
+    )
+    parser.add_argument(
+        "--passes", type=int, default=3, help="Convergence passes (different seed each)"
+    )
     parser.add_argument("--exclude", nargs="*", default=[], help="Files to exclude")
     parser.add_argument("--quiet", action="store_true", help="Minimal output")
     args = parser.parse_args(argv)
@@ -84,6 +104,7 @@ def main(argv: list[str] | None = None) -> int:
     mcdc_result = None
     if args.mcdc:
         from Wesker.metrics import _verify_mcdc
+
         mcdc_targets = _parse_mcdc_targets(args.mcdc)
         if mcdc_targets:
             if not args.quiet and not args.json_output:
@@ -99,19 +120,26 @@ def main(argv: list[str] | None = None) -> int:
     else:
         if not args.quiet:
             print(f"\n{'─' * 50}")
-            print(f"Kill rate: {result['kill_pct']}% ({result['total_killed']}/{result['total_mutants']})")
+            print(
+                f"Kill rate: {result['kill_pct']}% ({result['total_killed']}/{result['total_mutants']})"
+            )
             print(f"Functions: {result['total_functions']}")
             if result.get("total_equivalent"):
                 print(f"Equivalent: {result['total_equivalent']}")
             print(f"Elapsed: {result['elapsed_ms']}ms")
             if mcdc_result:
                 status = "PASS" if mcdc_result["verified"] else "FAIL"
-                print(f"MC/DC: {status} ({mcdc_result['conditions_covered']}/{mcdc_result['conditions_total']})")
+                print(
+                    f"MC/DC: {status} ({mcdc_result['conditions_covered']}/{mcdc_result['conditions_total']})"
+                )
 
     # Threshold gate
     if args.threshold and result["kill_pct"] < args.threshold:
         if not args.json_output:
-            print(f"\nFAIL: kill rate {result['kill_pct']}% < threshold {args.threshold}%", file=sys.stderr)
+            print(
+                f"\nFAIL: kill rate {result['kill_pct']}% < threshold {args.threshold}%",
+                file=sys.stderr,
+            )
         return 1
 
     return 0

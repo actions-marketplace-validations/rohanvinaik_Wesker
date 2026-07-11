@@ -8,6 +8,7 @@ chosen to kill the surviving categories LintGate's profile flagged
 matrix catches `isinstance→True` and `"self"→""` mutants because a
 construct that should *not* set a flag asserts it stays False.
 """
+
 from __future__ import annotations
 
 import ast
@@ -32,6 +33,7 @@ def _fn(src: str) -> ast.FunctionDef:
 # ── Structural signals: one construct sets exactly one flag ──────
 # Each case asserts the target flag True AND leaves the others False, so an
 # isinstance→True mutant (which would flip an unrelated flag) is killed.
+
 
 def test_signals_comparison_only():
     s = _collect_signals(_fn("def f(a, b):\n    return a < b\n"))
@@ -58,34 +60,52 @@ def test_signals_self_literal_matters():
 
 
 def test_signals_global_and_nonlocal():
-    assert _collect_signals(_fn("def f():\n    global g\n    g = 1\n")).has_global_nonlocal is True
+    assert (
+        _collect_signals(_fn("def f():\n    global g\n    g = 1\n")).has_global_nonlocal
+        is True
+    )
 
 
 def test_signals_isinstance():
     s = _collect_signals(_fn("def f(a):\n    return isinstance(a, int)\n"))
     assert s.has_isinstance is True
     # A non-isinstance call must not trip it (kills isinstance-name VALUE mutant).
-    assert _collect_signals(_fn("def f(a):\n    return len(a)\n")).has_isinstance is False
+    assert (
+        _collect_signals(_fn("def f(a):\n    return len(a)\n")).has_isinstance is False
+    )
 
 
 def test_signals_arithmetic_binop_and_unary():
-    assert _collect_signals(_fn("def f(a, b):\n    return a + b\n")).has_arithmetic is True
+    assert (
+        _collect_signals(_fn("def f(a, b):\n    return a + b\n")).has_arithmetic is True
+    )
     assert _collect_signals(_fn("def f(a):\n    return -a\n")).has_arithmetic is True
     # Bitwise op is not in the arithmetic set — must stay False.
-    assert _collect_signals(_fn("def f(a, b):\n    return a & b\n")).has_arithmetic is False
+    assert (
+        _collect_signals(_fn("def f(a, b):\n    return a & b\n")).has_arithmetic
+        is False
+    )
 
 
 def test_signals_logical_boolop_and_not():
-    assert _collect_signals(_fn("def f(a, b):\n    return a and b\n")).has_logical is True
+    assert (
+        _collect_signals(_fn("def f(a, b):\n    return a and b\n")).has_logical is True
+    )
     assert _collect_signals(_fn("def f(a):\n    return not a\n")).has_logical is True
 
 
 def test_signals_constant_only_sets_nothing():
     s = _collect_signals(_fn("def f():\n    return 1\n"))
-    assert not any([
-        s.has_comparisons, s.has_self_assigns, s.has_global_nonlocal,
-        s.has_isinstance, s.has_arithmetic, s.has_logical,
-    ])
+    assert not any(
+        [
+            s.has_comparisons,
+            s.has_self_assigns,
+            s.has_global_nonlocal,
+            s.has_isinstance,
+            s.has_arithmetic,
+            s.has_logical,
+        ]
+    )
 
 
 def test_collect_signals_counts_params():
@@ -95,6 +115,7 @@ def test_collect_signals_counts_params():
 
 def test_classify_signal_node_mutates_in_place():
     from Wesker.filter import _FunctionSignals
+
     sig = _FunctionSignals()
     cmp_node = ast.parse("a < b").body[0].value
     _classify_signal_node(cmp_node, sig)
@@ -102,6 +123,7 @@ def test_classify_signal_node_mutates_in_place():
 
 
 # ── Layer 1: filter_categories ───────────────────────────────────
+
 
 def test_filter_value_always_present():
     assert MutationCategory.VALUE in filter_categories(_fn("def f():\n    return 1\n"))
@@ -116,8 +138,12 @@ def test_filter_swap_needs_two_params():
 
 
 def test_filter_boundary_from_comparison():
-    assert MutationCategory.BOUNDARY in filter_categories(_fn("def f(a, b):\n    return a < b\n"))
-    assert MutationCategory.BOUNDARY not in filter_categories(_fn("def f():\n    return 1\n"))
+    assert MutationCategory.BOUNDARY in filter_categories(
+        _fn("def f(a, b):\n    return a < b\n")
+    )
+    assert MutationCategory.BOUNDARY not in filter_categories(
+        _fn("def f():\n    return 1\n")
+    )
 
 
 def test_filter_state_gated_by_purity():
@@ -129,25 +155,39 @@ def test_filter_state_gated_by_purity():
 
 
 def test_filter_type_arithmetic_logical():
-    assert MutationCategory.TYPE in filter_categories(_fn("def f(a):\n    return isinstance(a, int)\n"))
-    assert MutationCategory.ARITHMETIC in filter_categories(_fn("def f(a, b):\n    return a + b\n"))
-    assert MutationCategory.LOGICAL in filter_categories(_fn("def f(a, b):\n    return a and b\n"))
+    assert MutationCategory.TYPE in filter_categories(
+        _fn("def f(a):\n    return isinstance(a, int)\n")
+    )
+    assert MutationCategory.ARITHMETIC in filter_categories(
+        _fn("def f(a, b):\n    return a + b\n")
+    )
+    assert MutationCategory.LOGICAL in filter_categories(
+        _fn("def f(a, b):\n    return a and b\n")
+    )
 
 
 # ── Layer 2: prioritize_categories ───────────────────────────────
 
+
 def test_priors_uniform_without_cache():
     priors = prioritize_categories({MutationCategory.VALUE, MutationCategory.BOUNDARY})
     assert all(p.prior == 0.5 for p in priors)
-    assert {p.category for p in priors} == {MutationCategory.VALUE, MutationCategory.BOUNDARY}
+    assert {p.category for p in priors} == {
+        MutationCategory.VALUE,
+        MutationCategory.BOUNDARY,
+    }
 
 
 def test_priors_computed_from_list_cache():
-    cache = {"per_category": [
-        {"category": "VALUE", "total": 10, "survived": 3},
-        {"category": "BOUNDARY", "total": 4, "survived": 3},
-    ]}
-    priors = prioritize_categories({MutationCategory.VALUE, MutationCategory.BOUNDARY}, cache)
+    cache = {
+        "per_category": [
+            {"category": "VALUE", "total": 10, "survived": 3},
+            {"category": "BOUNDARY", "total": 4, "survived": 3},
+        ]
+    }
+    priors = prioritize_categories(
+        {MutationCategory.VALUE, MutationCategory.BOUNDARY}, cache
+    )
     by_cat = {p.category: p.prior for p in priors}
     # survived/total — kills the ARITHMETIC mutant (/ → *) and VALUE rounding.
     assert by_cat[MutationCategory.VALUE] == 0.3
@@ -155,11 +195,15 @@ def test_priors_computed_from_list_cache():
 
 
 def test_priors_sorted_descending():
-    cache = {"per_category": [
-        {"category": "VALUE", "total": 10, "survived": 1},
-        {"category": "BOUNDARY", "total": 10, "survived": 9},
-    ]}
-    priors = prioritize_categories({MutationCategory.VALUE, MutationCategory.BOUNDARY}, cache)
+    cache = {
+        "per_category": [
+            {"category": "VALUE", "total": 10, "survived": 1},
+            {"category": "BOUNDARY", "total": 10, "survived": 9},
+        ]
+    }
+    priors = prioritize_categories(
+        {MutationCategory.VALUE, MutationCategory.BOUNDARY}, cache
+    )
     assert [p.prior for p in priors] == sorted([p.prior for p in priors], reverse=True)
     assert priors[0].category == MutationCategory.BOUNDARY  # highest survival first
 

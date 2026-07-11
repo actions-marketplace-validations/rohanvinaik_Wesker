@@ -5,3 +5,6 @@ dist/
 build/
 .wesker/
 .wesker-report.json
+.coverage
+coverage.xml
+.venv/

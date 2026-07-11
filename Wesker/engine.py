@@ -247,7 +247,9 @@ class _ValueMutator(_BaseMutator):
             and (node.lineno, node.col_offset) in self._ds_pos
         ):
             return node
-        self._note(f"VALUE:{'bool' if isinstance(node.value, bool) else type(node.value).__name__}")
+        self._note(
+            f"VALUE:{'bool' if isinstance(node.value, bool) else type(node.value).__name__}"
+        )
         if self.current == self.target:
             mutated = self._mutate_constant(node)
             if mutated is not node:
@@ -303,9 +305,7 @@ class _BoundaryMutator(_BaseMutator):
             # increment). Non-swappable ops (is/in/…) produce no mutant, so
             # they carry the dead key and sink to the end of the greedy order.
             self._note(
-                f"BOUNDARY:{type(op).__name__}"
-                if type(op) in self._SWAP
-                else _DEAD_DIM
+                f"BOUNDARY:{type(op).__name__}" if type(op) in self._SWAP else _DEAD_DIM
             )
             self.current += 1
         node.ops = new_ops
@@ -496,7 +496,9 @@ def _count_value_target(
     # None, bytes, complex, and Ellipsis are left unchanged by _mutate_constant,
     # so counting them produces phantom mutants that always survive.
     # Skip docstring constants — they produce equivalent mutants that waste budget.
-    if isinstance(node, ast.Constant) and isinstance(node.value, _ValueMutator._MUTABLE_TYPES):
+    if isinstance(node, ast.Constant) and isinstance(
+        node.value, _ValueMutator._MUTABLE_TYPES
+    ):
         if (
             docstring_positions
             and isinstance(node.value, str)
@@ -611,7 +613,11 @@ def _generate_state_mutants(
 
     for mode, desc, counter in sub_modes:
         target_count = sum(counter(node) for node in ast.walk(func_node))
-        limit = min(target_count, max_per_category) if max_per_category > 0 else target_count
+        limit = (
+            min(target_count, max_per_category)
+            if max_per_category > 0
+            else target_count
+        )
 
         if greedy and max_per_category > 0 and target_count > limit:
             keys = _record_state_dimensions(func_node, mode)
@@ -788,7 +794,7 @@ def _select_greedy(
     seen = set(order)
     order += [i for i in range(target_count) if i not in seen]  # defensive: full cover
     lo = pass_index * limit
-    window = order[lo:lo + limit]
+    window = order[lo : lo + limit]
     return window if window else order[:limit]
 
 
@@ -847,7 +853,11 @@ def generate_mutants(
             continue
 
         target_count = _count_targets(func_node, cat)
-        limit = min(target_count, max_per_category) if max_per_category > 0 else target_count
+        limit = (
+            min(target_count, max_per_category)
+            if max_per_category > 0
+            else target_count
+        )
 
         if max_per_category > 0 and target_count > limit:
             if greedy:
@@ -906,7 +916,9 @@ def _make_transformer(
 ) -> tuple[_BaseMutator, str]:
     """Create the appropriate transformer for a category + target index."""
     if category == MutationCategory.VALUE:
-        return _ValueMutator(index, docstring_positions), "replace constant with boundary value"
+        return _ValueMutator(
+            index, docstring_positions
+        ), "replace constant with boundary value"
     if category == MutationCategory.BOUNDARY:
         return _BoundaryMutator(index), "off-by-one comparison"
     if category == MutationCategory.SWAP:
@@ -943,8 +955,12 @@ def extract_boundary_inputs(mutant: Mutant) -> list[BoundaryInput]:
         return []
 
     results: list[BoundaryInput] = []
-    orig_compares = [n for n in ast.walk(mutant.original_node) if isinstance(n, ast.Compare)]
-    mut_compares = [n for n in ast.walk(mutant.mutated_node) if isinstance(n, ast.Compare)]
+    orig_compares = [
+        n for n in ast.walk(mutant.original_node) if isinstance(n, ast.Compare)
+    ]
+    mut_compares = [
+        n for n in ast.walk(mutant.mutated_node) if isinstance(n, ast.Compare)
+    ]
 
     for orig_cmp, mut_cmp in zip(orig_compares, mut_compares, strict=False):
         # Find the op that changed
@@ -1026,7 +1042,9 @@ def _patch_mutant_into_test(
 
     test_module = inspect.getmodule(test_fn)
 
-    owner = _resolve_qualified_owner(test_globals, closure_bindings, test_module, qualname)
+    owner = _resolve_qualified_owner(
+        test_globals, closure_bindings, test_module, qualname
+    )
     if owner is not None and hasattr(owner, func_name):
         saved = _get_raw_attr(owner, func_name)
         setattr(owner, func_name, _preserve_descriptor_shape(saved, mutated_obj))
@@ -1046,7 +1064,9 @@ def _patch_mutant_into_test(
     # Fallback: inspect.getmodule (works for regular module-level functions)
     if test_module is not None and hasattr(test_module, func_name):
         saved = getattr(test_module, func_name)
-        setattr(test_module, func_name, _preserve_closure_binding_shape(saved, mutated_obj))
+        setattr(
+            test_module, func_name, _preserve_closure_binding_shape(saved, mutated_obj)
+        )
         return True, saved, test_module
 
     return False, None, None
@@ -1251,7 +1271,10 @@ def evaluate_mutant(
         remaining_ms = timeout_ms - _elapsed(start)
         if remaining_ms <= 0:
             return MutantResult(
-                mutant=mutant, killed=True, killed_by="timeout", elapsed_ms=_elapsed(start)
+                mutant=mutant,
+                killed=True,
+                killed_by="timeout",
+                elapsed_ms=_elapsed(start),
             )
         # Strategy: monkey-patch the mutated function into the test's namespace
         # so the test calls the mutant instead of the original. Uses __globals__
@@ -1259,7 +1282,9 @@ def evaluate_mutant(
         # both regular imports and dynamically loaded test modules. Falls back to
         # inspect.getmodule for inline test callables without __globals__.
         patch_name = qualname or func_name
-        patched, saved, patch_target = _patch_mutant_into_test(test_fn, patch_name, mutated_obj)
+        patched, saved, patch_target = _patch_mutant_into_test(
+            test_fn, patch_name, mutated_obj
+        )
         try:
             result = _run_test_with_timeout(
                 test_fn,
@@ -1371,7 +1396,11 @@ def run_function_sampling(
     results_by_cat: dict[MutationCategory, CategoryResult] = {}
     budget_exhausted = False
     all_results: list[MutantResult] = []
-    qualname = func_key.split("::", 1)[1] if "::" in func_key else getattr(func_node, "name", None)
+    qualname = (
+        func_key.split("::", 1)[1]
+        if "::" in func_key
+        else getattr(func_node, "name", None)
+    )
 
     for mutant in mutants:
         if _elapsed(start) > budget_ms:
@@ -1387,7 +1416,9 @@ def run_function_sampling(
         )
         all_results.append(result)
 
-        cr = results_by_cat.setdefault(mutant.category, CategoryResult(category=mutant.category))
+        cr = results_by_cat.setdefault(
+            mutant.category, CategoryResult(category=mutant.category)
+        )
         cr.total += 1
         if result.killed:
             cr.killed += 1
@@ -1443,7 +1474,11 @@ def run_function_profiling(
     survivor_records: list[dict] = []
     killed_records: list[dict] = []
     budget_exhausted = False
-    qualname = func_key.split("::", 1)[1] if "::" in func_key else getattr(func_node, "name", None)
+    qualname = (
+        func_key.split("::", 1)[1]
+        if "::" in func_key
+        else getattr(func_node, "name", None)
+    )
 
     for mutant in mutants:
         if budget_ms is not None and _elapsed(start) > budget_ms:
@@ -1458,7 +1493,9 @@ def run_function_profiling(
             qualname=qualname,
         )
 
-        cr = results_by_cat.setdefault(mutant.category, CategoryResult(category=mutant.category))
+        cr = results_by_cat.setdefault(
+            mutant.category, CategoryResult(category=mutant.category)
+        )
         cr.total += 1
         if result.killed:
             cr.killed += 1
@@ -1470,22 +1507,26 @@ def run_function_profiling(
                 cr.timed_out += 1
             if result.test_name:
                 kill_matrix.setdefault(mutant.description, []).append(result.test_name)
-            killed_records.append({
-                "mutant_id": mutant.mutant_id,
-                "mutant": mutant.description,
-                "category": mutant.category.value,
-                "killed_by": result.killed_by,
-                "test": result.test_name,
-                "elapsed_ms": round(result.elapsed_ms, 1),
-            })
+            killed_records.append(
+                {
+                    "mutant_id": mutant.mutant_id,
+                    "mutant": mutant.description,
+                    "category": mutant.category.value,
+                    "killed_by": result.killed_by,
+                    "test": result.test_name,
+                    "elapsed_ms": round(result.elapsed_ms, 1),
+                }
+            )
         else:
             cr.survived += 1
-            survivor_records.append({
-                "mutant_id": mutant.mutant_id,
-                "mutant": mutant.description,
-                "category": mutant.category.value,
-                "elapsed_ms": round(result.elapsed_ms, 1),
-            })
+            survivor_records.append(
+                {
+                    "mutant_id": mutant.mutant_id,
+                    "mutant": mutant.description,
+                    "category": mutant.category.value,
+                    "elapsed_ms": round(result.elapsed_ms, 1),
+                }
+            )
 
     per_cat = list(results_by_cat.values())
     total = sum(cr.total for cr in per_cat)
@@ -1574,10 +1615,7 @@ def check_equivalent(
     meaningful instance for boundary testing.
     """
     # Methods: can't provide meaningful self — skip equivalence check
-    if (
-        func_node.args.args
-        and func_node.args.args[0].arg in ("self", "cls")
-    ):
+    if func_node.args.args and func_node.args.args[0].arg in ("self", "cls"):
         return False
 
     try:
@@ -1689,8 +1727,11 @@ def run_function_converged(
         if _elapsed(start) > budget_ms:
             break
         mutants = generate_mutants(
-            func_node, categories, max_per_category=max_per_category,
-            pass_index=pass_idx, category_order=category_order,
+            func_node,
+            categories,
+            max_per_category=max_per_category,
+            pass_index=pass_idx,
+            category_order=category_order,
         )
         for mutant in mutants:
             if mutant.mutant_id in seen:
@@ -1699,15 +1740,20 @@ def run_function_converged(
                 break
 
             result = evaluate_mutant(
-                mutant, test_functions, original_func,  # type: ignore[arg-type]
-                timeout_ms=per_mutant_timeout_ms, qualname=qualname,
+                mutant,
+                test_functions,
+                original_func,  # type: ignore[arg-type]
+                timeout_ms=per_mutant_timeout_ms,
+                qualname=qualname,
             )
 
             # Integrated equivalence: check survivors immediately
             if not result.killed:
                 if check_equivalent(func_node, mutant):
                     result = MutantResult(
-                        mutant=mutant, killed=False, equivalent=True,
+                        mutant=mutant,
+                        killed=False,
+                        equivalent=True,
                         elapsed_ms=result.elapsed_ms,
                     )
 
@@ -1725,7 +1771,9 @@ def run_function_converged(
                 record["test"] = result.test_name
                 killed_records.append(record)
                 if result.test_name:
-                    kill_matrix.setdefault(mutant.description, []).append(result.test_name)
+                    kill_matrix.setdefault(mutant.description, []).append(
+                        result.test_name
+                    )
             elif result.equivalent:
                 record["equivalent"] = True
                 survivor_records.append(record)

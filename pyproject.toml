@@ -33,4 +33,25 @@ Repository = "https://github.com/rohanvinaik/Wesker"
 
 # Runtime is zero-dependency by design; the test framework is dev-only.
 [dependency-groups]
-dev = ["pytest>=7"]
+dev = ["pytest>=7", "pytest-cov>=4"]
+
+# Wesker profiles its own library core. CLI/entry/orchestration modules
+# (cli, __main__, __init__, metrics) are excluded — they are thin dispatch,
+# matching the coverage exclusions below.
+[tool.wesker]
+source_dir = "Wesker"
+exclude = [
+    "Wesker/cli.py",
+    "Wesker/__main__.py",
+    "Wesker/__init__.py",
+    "Wesker/metrics.py",
+]
+
+[tool.coverage.run]
+source = ["Wesker"]
+omit = [
+    "Wesker/cli.py",
+    "Wesker/__main__.py",
+    "Wesker/__init__.py",
+    "Wesker/metrics.py",
+]

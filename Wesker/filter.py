@@ -54,7 +54,8 @@ def _classify_signal_node(node: ast.AST, signals: _FunctionSignals) -> None:
     ):
         signals.has_isinstance = True
     elif isinstance(node, ast.BinOp) and isinstance(
-        node.op, (ast.Add, ast.Sub, ast.Mult, ast.Div, ast.FloorDiv, ast.Mod, ast.Pow),
+        node.op,
+        (ast.Add, ast.Sub, ast.Mult, ast.Div, ast.FloorDiv, ast.Mod, ast.Pow),
     ):
         signals.has_arithmetic = True
     elif isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.USub):

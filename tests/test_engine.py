@@ -10,6 +10,7 @@ greedy_coverage_bound}.lean.
 Named tests/test_engine.py so Wesker's own convention-based test discovery maps
 it to Wesker/engine.py when the engine self-profiles.
 """
+
 from __future__ import annotations
 
 import ast
@@ -228,10 +229,14 @@ def test_generate_mutants_passes_are_disjoint():
         """
     )
     p0 = _selected_indices(
-        generate_mutants(func, {MutationCategory.BOUNDARY}, max_per_category=3, pass_index=0)
+        generate_mutants(
+            func, {MutationCategory.BOUNDARY}, max_per_category=3, pass_index=0
+        )
     )
     p1 = _selected_indices(
-        generate_mutants(func, {MutationCategory.BOUNDARY}, max_per_category=3, pass_index=1)
+        generate_mutants(
+            func, {MutationCategory.BOUNDARY}, max_per_category=3, pass_index=1
+        )
     )
     assert p0.isdisjoint(p1)
     assert p0 | p1 == set(range(6))
@@ -279,7 +284,9 @@ def test_state_greedy_spreads_across_attributes():
         "STATE:remove_assign:b",
         "STATE:remove_assign:c",
     ]
-    muts = generate_mutants(func, {MutationCategory.STATE}, max_per_category=2, pass_index=0)
+    muts = generate_mutants(
+        func, {MutationCategory.STATE}, max_per_category=2, pass_index=0
+    )
     # Two distinct attributes covered before repeating (both sub-modes present;
     # here only remove_assign has targets).
     picked = {m.description.split(":", 2)[-1].split(" ")[0] for m in muts}
