@@ -395,30 +395,45 @@ def test_profiling_derives_source_path_and_kills_factory_method():
     # reached only via a factory (owner class not in the test namespace) is a false survivor.
     from Wesker.engine import run_function_profiling
 
-    tree = ast.parse(open(__file__).read())
+    with open(__file__) as f:
+        tree = ast.parse(f.read())
     node = next(
-        m for cls in tree.body if isinstance(cls, ast.ClassDef) and cls.name == "_OwnerFixture"
-        for m in cls.body if isinstance(m, ast.FunctionDef) and m.name == "flag"
+        m
+        for cls in tree.body
+        if isinstance(cls, ast.ClassDef) and cls.name == "_OwnerFixture"
+        for m in cls.body
+        if isinstance(m, ast.FunctionDef) and m.name == "flag"
     )
 
     def _test_via_factory():
         assert _make_owner().flag() is True
 
     res = run_function_profiling(
-        node, f"{__file__}::_OwnerFixture.flag",
-        {MutationCategory.VALUE}, [_test_via_factory], _OwnerFixture.flag,
+        node,
+        f"{__file__}::_OwnerFixture.flag",
+        {MutationCategory.VALUE},
+        [_test_via_factory],
+        _OwnerFixture.flag,
     )
     assert res.total_mutants >= 1
-    assert res.total_survived == 0  # source_path derived -> class owner patched -> mutant killed
+    assert (
+        res.total_survived == 0
+    )  # source_path derived -> class owner patched -> mutant killed
 
 
 def test_co_filename_matches_absolute_and_relative():
     from Wesker.engine import _co_filename_matches
 
-    assert _co_filename_matches("/a/b/regen/roleframes.py", "/a/b/regen/roleframes.py")  # abspath equal
-    assert _co_filename_matches("/a/b/regen/roleframes.py", "regen/roleframes.py")        # relative suffix
-    assert not _co_filename_matches("/a/b/xregen/roleframes.py", "regen/roleframes.py")   # segment boundary
-    assert not _co_filename_matches("/a/b/other.py", "regen/roleframes.py")               # unrelated
+    assert _co_filename_matches(
+        "/a/b/regen/roleframes.py", "/a/b/regen/roleframes.py"
+    )  # abspath equal
+    assert _co_filename_matches(
+        "/a/b/regen/roleframes.py", "regen/roleframes.py"
+    )  # relative suffix
+    assert not _co_filename_matches(
+        "/a/b/xregen/roleframes.py", "regen/roleframes.py"
+    )  # segment boundary
+    assert not _co_filename_matches("/a/b/other.py", "regen/roleframes.py")  # unrelated
     assert not _co_filename_matches(None, "x") and not _co_filename_matches("x", None)
 
 
@@ -430,10 +445,14 @@ def test_profiling_uses_func_key_source_path_with_stubbed_original():
 
     from Wesker.engine import run_function_profiling
 
-    tree = ast.parse(open(__file__).read())
+    with open(__file__) as f:
+        tree = ast.parse(f.read())
     node = next(
-        m for cls in tree.body if isinstance(cls, ast.ClassDef) and cls.name == "_OwnerFixture"
-        for m in cls.body if isinstance(m, ast.FunctionDef) and m.name == "flag"
+        m
+        for cls in tree.body
+        if isinstance(cls, ast.ClassDef) and cls.name == "_OwnerFixture"
+        for m in cls.body
+        if isinstance(m, ast.FunctionDef) and m.name == "flag"
     )
 
     def _test_via_factory():
@@ -441,8 +460,11 @@ def test_profiling_uses_func_key_source_path_with_stubbed_original():
 
     rel = os.path.relpath(__file__)
     res = run_function_profiling(
-        node, f"{rel}::_OwnerFixture.flag",
-        {MutationCategory.VALUE}, [_test_via_factory], lambda *_a: None,   # STUB original_func
+        node,
+        f"{rel}::_OwnerFixture.flag",
+        {MutationCategory.VALUE},
+        [_test_via_factory],
+        lambda *_a: None,  # STUB original_func
     )
     assert res.total_mutants >= 1
     assert res.total_survived == 0
