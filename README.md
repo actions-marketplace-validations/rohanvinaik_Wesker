@@ -2,14 +2,16 @@
 
 **Mutation testing at CI speed — with exhaustive-grade soundness and a provably optimal test budget.**
 
-[![CI](https://github.com/rohanvinaik/Wesker/actions/workflows/ci.yml/badge.svg)](https://github.com/rohanvinaik/Wesker/actions/workflows/ci.yml)
-[![Quality Gate](https://sonarcloud.io/api/project_badges/measure?project=rohanvinaik_Wesker&metric=alert_status)](https://sonarcloud.io/summary/new_code?id=rohanvinaik_Wesker)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
-<br>
-[![Mean σ](https://raw.githubusercontent.com/rohanvinaik/Wesker/badges/.github/badges/sigma.svg)](https://github.com/rohanvinaik/Wesker/actions/workflows/spec-badges.yml)
-[![Mutation Kill Rate](https://raw.githubusercontent.com/rohanvinaik/Wesker/badges/.github/badges/mutation-kill-rate.svg)](https://github.com/rohanvinaik/Wesker/actions/workflows/spec-badges.yml)
-[![MC/DC](https://raw.githubusercontent.com/rohanvinaik/Wesker/badges/.github/badges/mcdc.svg)](https://github.com/rohanvinaik/Wesker/actions/workflows/spec-badges.yml)
+<p align="center">
+  <a href="https://github.com/rohanvinaik/Wesker/actions/workflows/ci.yml"><img src="https://github.com/rohanvinaik/Wesker/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+  <a href="https://sonarcloud.io/summary/new_code?id=rohanvinaik_Wesker"><img src="https://sonarcloud.io/api/project_badges/measure?project=rohanvinaik_Wesker&amp;metric=alert_status" alt="Quality Gate"></a>
+  <a href="https://opensource.org/licenses/MIT"><img src="https://img.shields.io/badge/License-MIT-3367d6.svg" alt="License: MIT"></a>
+  <a href="https://www.python.org/downloads/"><img src="https://img.shields.io/badge/python-3.10+-3367d6.svg" alt="Python 3.10+"></a>
+  <br>
+  <a href="https://github.com/rohanvinaik/Wesker/actions/workflows/spec-badges.yml"><img src="https://raw.githubusercontent.com/rohanvinaik/Wesker/badges/.github/badges/sigma.svg" alt="Mean σ"></a>
+  <a href="https://github.com/rohanvinaik/Wesker/actions/workflows/spec-badges.yml"><img src="https://raw.githubusercontent.com/rohanvinaik/Wesker/badges/.github/badges/mutation-kill-rate.svg" alt="Mutation Kill Rate"></a>
+  <a href="https://github.com/rohanvinaik/Wesker/actions/workflows/spec-badges.yml"><img src="https://raw.githubusercontent.com/rohanvinaik/Wesker/badges/.github/badges/mcdc.svg" alt="MC/DC"></a>
+</p>
 
 `7 semantic categories · (1−1/e)-optimal selection · Fully deterministic`
 
