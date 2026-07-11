@@ -1045,13 +1045,8 @@ def _patch_module_qualified(
     """
     if not func_name or not source_path:
         return []
-    import os
     import sys
 
-    try:
-        src_abs = os.path.abspath(source_path)
-    except Exception:
-        return []
     saved: list[tuple[Any, Any]] = []
     for mod in list(sys.modules.values()):
         if mod is None:
@@ -1064,7 +1059,7 @@ def _patch_module_qualified(
         if code is None:
             continue
         try:
-            if os.path.abspath(code.co_filename) == src_abs:
+            if _co_filename_matches(code.co_filename, source_path):
                 setattr(mod, func_name, mutated_obj)
                 saved.append((mod, obj))
         except Exception:
@@ -1095,7 +1090,7 @@ def _patch_module_qualified(
             if code is None:
                 continue
             try:
-                if os.path.abspath(code.co_filename) == src_abs:
+                if _co_filename_matches(code.co_filename, source_path):
                     setattr(
                         owner, method, _preserve_descriptor_shape(existing, mutated_obj)
                     )
@@ -1103,6 +1098,26 @@ def _patch_module_qualified(
             except Exception:
                 continue
     return saved
+
+
+def _co_filename_matches(co_filename: str | None, source_path: str | None) -> bool:
+    """True when a code object's file is the function-under-test's source. `source_path` may be absolute
+    OR project-RELATIVE (callers derive it from func_key = 'rel/path.py::Q'), while co_filename is
+    absolute — so accept exact abspath equality OR an absolute co_filename ending in the normalized
+    relative source_path. The relative match is bounded to a full path-segment suffix so 'a/b.py' does
+    not match '.../xa/b.py'."""
+    if not co_filename or not source_path:
+        return False
+    import os
+
+    a = os.path.abspath(co_filename).replace("\\", "/")
+    try:
+        if a == os.path.abspath(source_path).replace("\\", "/"):
+            return True
+    except Exception:
+        pass
+    rel = source_path.replace("\\", "/").lstrip("./")
+    return bool(rel) and (a == rel or a.endswith("/" + rel))
 
 
 def _patch_mutant_into_test(
@@ -1548,6 +1563,9 @@ def run_function_sampling(
         if "::" in func_key
         else getattr(func_node, "name", None)
     )
+    # func_key = 'rel/path.py::Qualname' — the (project-relative) source path callers know but do not
+    # pass to evaluate_mutant (original_func is stubbed by some callers, so its co_filename is useless).
+    source_path = func_key.split("::", 1)[0] if "::" in func_key else None
 
     for mutant in mutants:
         if _elapsed(start) > budget_ms:
@@ -1560,6 +1578,7 @@ def run_function_sampling(
             original_func,
             timeout_ms=per_mutant_timeout_ms,
             qualname=qualname,
+            source_path=source_path,
         )
         all_results.append(result)
 
@@ -1626,6 +1645,9 @@ def run_function_profiling(
         if "::" in func_key
         else getattr(func_node, "name", None)
     )
+    # func_key = 'rel/path.py::Qualname' — the (project-relative) source path callers know but do not
+    # pass to evaluate_mutant (original_func is stubbed by some callers, so its co_filename is useless).
+    source_path = func_key.split("::", 1)[0] if "::" in func_key else None
 
     for mutant in mutants:
         if budget_ms is not None and _elapsed(start) > budget_ms:
@@ -1638,6 +1660,7 @@ def run_function_profiling(
             original_func,
             timeout_ms=per_mutant_timeout_ms,
             qualname=qualname,
+            source_path=source_path,
         )
 
         cr = results_by_cat.setdefault(
@@ -1866,6 +1889,9 @@ def run_function_converged(
         if "::" in func_key
         else getattr(func_node, "name", None)
     )
+    # func_key = 'rel/path.py::Qualname' — the (project-relative) source path callers know but do not
+    # pass to evaluate_mutant (original_func is stubbed by some callers, so its co_filename is useless).
+    source_path = func_key.split("::", 1)[0] if "::" in func_key else None
 
     seen: dict[str, MutantResult] = {}
     kill_matrix: dict[str, list[str]] = {}
