@@ -395,7 +395,8 @@ def test_profiling_derives_source_path_and_kills_factory_method():
     # reached only via a factory (owner class not in the test namespace) is a false survivor.
     from Wesker.engine import run_function_profiling
 
-    tree = ast.parse(open(__file__).read())
+    with open(__file__) as f:
+        tree = ast.parse(f.read())
     node = next(
         m
         for cls in tree.body

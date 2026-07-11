@@ -1110,12 +1110,12 @@ def _co_filename_matches(co_filename: str | None, source_path: str | None) -> bo
         return False
     import os
 
-    a = os.path.abspath(co_filename).replace("\\", "/")
     try:
+        a = os.path.abspath(co_filename).replace("\\", "/")
         if a == os.path.abspath(source_path).replace("\\", "/"):
             return True
     except Exception:
-        pass
+        return False
     rel = source_path.replace("\\", "/").lstrip("./")
     return bool(rel) and (a == rel or a.endswith("/" + rel))
 
