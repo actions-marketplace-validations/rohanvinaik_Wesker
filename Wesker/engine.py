@@ -195,12 +195,28 @@ class ProfilingResult:
 
 
 class _BaseMutator(ast.NodeTransformer):
-    """Base class for all category mutators — tracks ``applied`` state."""
+    """Base class for all category mutators — tracks ``applied`` state.
+
+    Doubles as a *dimension recorder*. When ``keys`` is a list (record mode,
+    entered by constructing with ``target_index=-1``), each mutator calls
+    ``_note(dim_key)`` exactly once per candidate site — at the same point it
+    increments ``self.current`` — so ``keys[i]`` is the behavioral dimension of
+    target index ``i`` in the *identical* traversal order the transformer uses
+    to consume that index. Alignment is therefore by construction, not by a
+    re-implementation of the walk. When ``keys`` is ``None`` (normal mutation),
+    ``_note`` is a no-op.
+    """
 
     def __init__(self, target_index: int = 0):
         self.current = 0
         self.target = target_index
         self.applied = False
+        self.keys: list[str] | None = None
+
+    def _note(self, dim_key: str) -> None:
+        """Record the behavioral dimension of the current candidate site."""
+        if self.keys is not None:
+            self.keys.append(dim_key)
 
 
 class _ValueMutator(_BaseMutator):
@@ -231,6 +247,7 @@ class _ValueMutator(_BaseMutator):
             and (node.lineno, node.col_offset) in self._ds_pos
         ):
             return node
+        self._note(f"VALUE:{'bool' if isinstance(node.value, bool) else type(node.value).__name__}")
         if self.current == self.target:
             mutated = self._mutate_constant(node)
             if mutated is not node:
@@ -282,6 +299,14 @@ class _BoundaryMutator(_BaseMutator):
                     new_ops.append(op)
             else:
                 new_ops.append(op)
+            # One dimension per op position (matches the per-op ``current``
+            # increment). Non-swappable ops (is/in/…) produce no mutant, so
+            # they carry the dead key and sink to the end of the greedy order.
+            self._note(
+                f"BOUNDARY:{type(op).__name__}"
+                if type(op) in self._SWAP
+                else _DEAD_DIM
+            )
             self.current += 1
         node.ops = new_ops
         return self.generic_visit(node)
@@ -297,6 +322,7 @@ class _SwapMutator(_BaseMutator):
             self.applied = True
             node.args = list(node.args)
             node.args[0], node.args[1] = node.args[1], node.args[0]
+        self._note(f"SWAP:{_callee_name(node)}")
         self.current += 1
         return self.generic_visit(node)
 
@@ -320,6 +346,7 @@ class _StateMutator(_BaseMutator):
                 if self.current == self.target:
                     self.applied = True
                     return ast.Pass()
+                self._note(f"STATE:remove_assign:{target.attr}")
                 self.current += 1
         return node
 
@@ -330,6 +357,7 @@ class _StateMutator(_BaseMutator):
             if self.current == self.target:
                 self.applied = True
                 return ast.Return(value=ast.Constant(value=None))
+            self._note("STATE:return_none")
             self.current += 1
         return node
 
@@ -344,6 +372,7 @@ class _TypeMutator(_BaseMutator):
             if self.current == self.target:
                 self.applied = True
                 return ast.Constant(value=True)
+            self._note(f"TYPE:{_isinstance_type_name(node)}")
             self.current += 1
         return self.generic_visit(node)
 
@@ -373,6 +402,7 @@ class _ArithmeticMutator(_BaseMutator):
             if self.current == self.target:
                 self.applied = True
                 node.op = swapped()
+            self._note(f"ARITHMETIC:{type(node.op).__name__}")
             self.current += 1
         return self.generic_visit(node)
 
@@ -383,6 +413,7 @@ class _ArithmeticMutator(_BaseMutator):
             if self.current == self.target:
                 self.applied = True
                 return self.generic_visit(node.operand)
+            self._note("ARITHMETIC:USub")
             self.current += 1
         return self.generic_visit(node)
 
@@ -407,6 +438,7 @@ class _LogicalMutator(_BaseMutator):
             if self.current == self.target:
                 self.applied = True
                 node.op = swapped()
+            self._note(f"LOGICAL:{type(node.op).__name__}")
             self.current += 1
         return self.generic_visit(node)
 
@@ -417,6 +449,7 @@ class _LogicalMutator(_BaseMutator):
             if self.current == self.target:
                 self.applied = True
                 return self.generic_visit(node.operand)
+            self._note("LOGICAL:Not")
             self.current += 1
         return self.generic_visit(node)
 
@@ -552,6 +585,8 @@ _TARGET_COUNTERS: dict[MutationCategory, Callable[[ast.AST], int]] = {
 def _generate_state_mutants(
     func_node: ast.FunctionDef,
     max_per_category: int,
+    greedy: bool = True,
+    pass_index: int = 0,
 ) -> list[Mutant]:
     """Generate STATE mutants across both sub-modes (assign + return).
 
@@ -560,7 +595,11 @@ def _generate_state_mutants(
     - return_none: replaces ``return expr`` with ``return None``
 
     Each sub-mode gets its own target count and transformer pass so that
-    target indices align correctly with what the transformer visits.
+    target indices align correctly with what the transformer visits. Under
+    ``greedy`` the assign sub-mode is ordered by distinct attribute (its
+    behavioral dimension) so a budget spreads across state fields before
+    repeating one; both sub-modes are always represented (they are two
+    distinct dimensions the greedy never collapses).
     """
     mutants: list[Mutant] = []
     cat = MutationCategory.STATE
@@ -574,7 +613,13 @@ def _generate_state_mutants(
         target_count = sum(counter(node) for node in ast.walk(func_node))
         limit = min(target_count, max_per_category) if max_per_category > 0 else target_count
 
-        for i in range(limit):
+        if greedy and max_per_category > 0 and target_count > limit:
+            keys = _record_state_dimensions(func_node, mode)
+            selected = _select_greedy(keys, target_count, limit, pass_index)
+        else:
+            selected = list(range(limit))
+
+        for i in selected:
             mutated_tree = copy.deepcopy(func_node)
             transformer = _StateMutator(i, mode)
             mutated_node = transformer.visit(mutated_tree)
@@ -596,12 +641,165 @@ def _generate_state_mutants(
     return mutants
 
 
+# ── Behavioral-Dimension Coverage (Layer 2, greedy submodular) ───
+#
+# A mutant is an unconstrained *behavioral degree of freedom* (§2.1 of the SSL
+# homology: surviving mutant ↔ candidate reading). The behavioral *dimension* it
+# probes is (category, construct-kind) — e.g. ``BOUNDARY:Lt``, ``ARITHMETIC:Add``.
+# The set-cover value f(S) = |dimensions covered by S| is monotone submodular
+# (proofs/coverage_submodular.lean), so greedily selecting mutants by marginal
+# coverage κ = |cover(v) \ cover(S)| — which is antitone (marginal_antitone.lean)
+# — reaches ≥(1−1/e) of the optimally-coverable dimension set within any budget
+# k (greedy_coverage_bound.lean). This replaces seeded random sampling: instead
+# of "((n−k)/n)^K probability we missed a survivor," we *select* the provably
+# near-optimal covering set. Multi-pass slicing (pass p takes window
+# [p·k, (p+1)·k) of the greedy order) makes cross-pass accrual the gap-contraction
+# the bound is stated over.
+
+_DEAD_DIM = "\x00dead"  # sentinel: a candidate site that yields no mutant
+
+
+def _is_dead(dim_key: str) -> bool:
+    return dim_key == _DEAD_DIM
+
+
+def _callee_name(node: ast.Call) -> str:
+    """Best-effort callable name for SWAP dimension keys."""
+    f = node.func
+    if isinstance(f, ast.Name):
+        return f.id
+    if isinstance(f, ast.Attribute):
+        return f.attr
+    return "call"
+
+
+def _isinstance_type_name(node: ast.Call) -> str:
+    """Type-argument name of an ``isinstance(x, T)`` call for TYPE dimension keys."""
+    if len(node.args) >= 2:
+        t = node.args[1]
+        if isinstance(t, ast.Name):
+            return t.id
+        if isinstance(t, ast.Attribute):
+            return t.attr
+        if isinstance(t, ast.Tuple):
+            names = [e.id for e in t.elts if isinstance(e, ast.Name)]
+            return "+".join(names) if names else "tuple"
+    return "type"
+
+
+# Record-mode mutator factory per category (STATE is handled separately by
+# _generate_state_mutants / _record_state_dimensions). Dispatch table keeps
+# _record_dimensions a flat regime-A function rather than a 6-way branch.
+_RECORD_MUTATOR_FACTORIES: dict[
+    MutationCategory, Callable[[set[tuple[int, int]] | None], _BaseMutator]
+] = {
+    MutationCategory.VALUE: lambda ds: _ValueMutator(-1, ds),
+    MutationCategory.BOUNDARY: lambda ds: _BoundaryMutator(-1),
+    MutationCategory.ARITHMETIC: lambda ds: _ArithmeticMutator(-1),
+    MutationCategory.LOGICAL: lambda ds: _LogicalMutator(-1),
+    MutationCategory.SWAP: lambda ds: _SwapMutator(-1),
+    MutationCategory.TYPE: lambda ds: _TypeMutator(-1),
+}
+
+
+def _record_dimensions(
+    func_node: ast.FunctionDef,
+    category: MutationCategory,
+    docstring_positions: set[tuple[int, int]] | None = None,
+) -> list[str]:
+    """Behavioral dimension of each target index, in transformer-visit order.
+
+    Runs the *actual* category mutator in record mode (``target_index=-1`` so
+    nothing applies) over a copy of the tree; each mutator notes one key per
+    candidate site at the same point it would increment its index counter, so
+    ``keys[i]`` is guaranteed to be the dimension of target ``i``. STATE is
+    generated by ``_generate_state_mutants`` and recorded via
+    ``_record_state_dimensions`` instead.
+    """
+    factory = _RECORD_MUTATOR_FACTORIES.get(category)
+    if factory is None:
+        return []
+    mutator = factory(docstring_positions)
+    mutator.keys = []
+    mutator.visit(copy.deepcopy(func_node))
+    return mutator.keys
+
+
+def _record_state_dimensions(func_node: ast.FunctionDef, mode: str) -> list[str]:
+    """Dimension keys for one STATE sub-mode, in transformer-visit order."""
+    tree = copy.deepcopy(func_node)
+    mutator = _StateMutator(-1, mode)
+    mutator.keys = []
+    mutator.visit(tree)
+    return mutator.keys
+
+
+def _greedy_dimension_order(keys: list[str]) -> list[int]:
+    """Greedy submodular order over target indices by their dimension keys.
+
+    Round-robins across distinct (live) dimensions in first-appearance order:
+    round 0 takes one index per dimension (each a marginal-coverage-1 pick),
+    round 1 a second per dimension, and so on. Prefixes therefore maximize the
+    number of distinct behavioral dimensions covered — the greedy max-coverage
+    schedule whose gap contracts by (1−1/k) per pick. Dead sites (no mutant)
+    sink to the end. Deterministic; no seed.
+    """
+    groups: dict[str, list[int]] = {}
+    key_order: list[str] = []
+    for i, k in enumerate(keys):
+        if k not in groups:
+            groups[k] = []
+            key_order.append(k)
+        groups[k].append(i)
+
+    live = [k for k in key_order if not _is_dead(k)]
+    dead = [k for k in key_order if _is_dead(k)]
+
+    result: list[int] = []
+    depth = 0
+    while True:
+        progressed = False
+        for k in live:
+            g = groups[k]
+            if depth < len(g):
+                result.append(g[depth])
+                progressed = True
+        if not progressed:
+            break
+        depth += 1
+    for k in dead:
+        result.extend(groups[k])
+    return result
+
+
+def _select_greedy(
+    keys: list[str],
+    target_count: int,
+    limit: int,
+    pass_index: int,
+) -> list[int]:
+    """Select ``limit`` target indices for pass ``pass_index`` by greedy coverage.
+
+    Pass p takes the window [p·limit, (p+1)·limit) of the greedy order, so the
+    union across passes is a growing prefix of the (1−1/e)-optimal schedule.
+    Falls back to the top window once the order is exhausted (converged).
+    """
+    order = [i for i in _greedy_dimension_order(keys) if i < target_count]
+    seen = set(order)
+    order += [i for i in range(target_count) if i not in seen]  # defensive: full cover
+    lo = pass_index * limit
+    window = order[lo:lo + limit]
+    return window if window else order[:limit]
+
+
 def generate_mutants(
     func_node: ast.FunctionDef,
     categories: set[MutationCategory],
     max_per_category: int = 0,
     seed: int | None = None,
     category_order: list[MutationCategory] | None = None,
+    greedy: bool = True,
+    pass_index: int = 0,
 ) -> list[Mutant]:
     """Generate mutants for a function across specified categories.
 
@@ -609,14 +807,21 @@ def generate_mutants(
         func_node: The function AST node to mutate.
         categories: Set of mutation categories to generate.
         max_per_category: Max mutants per category (0 = unlimited).
-        seed: Deterministic seed for shuffling target indices. When set and
-              ``max_per_category > 0``, the target indices are shuffled before
-              truncation so different seeds sample different mutants from the
-              same function. ``None`` (default) preserves AST-walk order.
+        seed: Legacy deterministic shuffle seed. Only consulted when
+              ``greedy=False`` (see below); retained for backward compatibility
+              and the exhaustive/random-sampling fallback. ``None`` preserves
+              AST-walk order.
         category_order: Optional priority ordering of categories. When provided,
               mutants are generated in this order (high-priority first). Categories
               in this list but not in ``categories`` are skipped. When None, uses
               alphabetical order.
+        greedy: When True (default) and ``max_per_category > 0``, targets are
+              selected by greedy behavioral-dimension coverage (Layer 2), which
+              reaches ≥(1−1/e) of the optimally-coverable dimensions per budget
+              (greedy_coverage_bound.lean) rather than sampling randomly.
+        pass_index: Convergence pass. Pass p takes window
+              [p·max_per_category, (p+1)·max_per_category) of the greedy order,
+              so the union across passes grows the (1−1/e)-optimal prefix.
     """
     mutants: list[Mutant] = []
     ds_pos = _docstring_positions(func_node)
@@ -634,18 +839,32 @@ def generate_mutants(
         # STATE needs special handling: two independent sub-modes with
         # separate target counts so indices align with the transformer.
         if cat == MutationCategory.STATE:
-            mutants.extend(_generate_state_mutants(func_node, max_per_category))
+            mutants.extend(
+                _generate_state_mutants(
+                    func_node, max_per_category, greedy=greedy, pass_index=pass_index
+                )
+            )
             continue
 
         target_count = _count_targets(func_node, cat)
-        indices = list(range(target_count))
-
-        # Stable shuffle: deterministic per seed, varies across iterations.
-        if seed is not None and max_per_category > 0 and target_count > max_per_category:
-            indices = _stable_target_order(indices, seed=seed, category=cat.value)
-
         limit = min(target_count, max_per_category) if max_per_category > 0 else target_count
-        selected = indices[:limit]
+
+        if max_per_category > 0 and target_count > limit:
+            if greedy:
+                # Layer 2: greedy submodular selection by behavioral dimension.
+                keys = _record_dimensions(func_node, cat, ds_pos)
+                selected = _select_greedy(keys, target_count, limit, pass_index)
+            elif seed is not None:
+                # Legacy fallback: deterministic pseudo-random shuffle.
+                indices = _stable_target_order(
+                    list(range(target_count)), seed=seed, category=cat.value
+                )
+                selected = indices[:limit]
+            else:
+                selected = list(range(limit))
+        else:
+            # Exhaustive for this category (budget ≥ targets): order is irrelevant.
+            selected = list(range(limit))
 
         for i in selected:
             mutated_tree = copy.deepcopy(func_node)
@@ -1136,16 +1355,17 @@ def run_function_sampling(
         per_mutant_timeout_ms: Timeout for evaluating a single mutant.
             Separate from budget_ms to prevent one slow mutant from
             consuming the entire budget.
-        seed: Deterministic shuffle seed for target selection. Different seeds
-            sample different mutants from the same function, reducing sampling
-            bias across convergence iterations.
+        seed: Convergence pass index for greedy dimension selection. Each value
+            draws the next window of the (1−1/e)-optimal coverage order, so
+            successive iterations extend coverage rather than re-roll a random
+            subset. (Name retained for backward compatibility.)
     """
     start = time.monotonic()
     mutants = generate_mutants(
         func_node,
         categories,
         max_per_category=max_per_category,
-        seed=seed,
+        pass_index=seed or 0,
     )
 
     results_by_cat: dict[MutationCategory, CategoryResult] = {}
@@ -1436,11 +1656,12 @@ def run_function_converged(
     records, and gateability — compatible with downstream consumers
     (gap classifiers, convergence engines, cross-channel gates).
 
-    Each pass uses a different seed, so ``max_per_category`` mutants are
-    sampled from a different subset of each category's target space.
-    Across N passes, tests up to N × max_per_category unique mutants per
-    category. Surviving mutants are checked for semantic equivalence via
-    boundary input evaluation.
+    Each pass p takes the next window of the greedy behavioral-dimension
+    order (Layer 2), so ``max_per_category`` fresh mutants are drawn per
+    category per pass, extending the (1−1/e)-optimal coverage prefix rather
+    than re-rolling a random subset. Across N passes, tests exactly up to
+    N × max_per_category unique mutants per category. Surviving mutants are
+    checked for semantic equivalence via boundary input evaluation.
 
     When ``category_order`` is provided (from Layer 2 predictive priors),
     mutants are generated in priority order within each pass. If budget
@@ -1464,12 +1685,12 @@ def run_function_converged(
     survivor_records: list[dict] = []
     killed_records: list[dict] = []
 
-    for seed in range(passes):
+    for pass_idx in range(passes):
         if _elapsed(start) > budget_ms:
             break
         mutants = generate_mutants(
             func_node, categories, max_per_category=max_per_category,
-            seed=seed, category_order=category_order,
+            pass_index=pass_idx, category_order=category_order,
         )
         for mutant in mutants:
             if mutant.mutant_id in seen:
