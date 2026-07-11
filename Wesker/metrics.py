@@ -208,10 +208,14 @@ def _count_tests() -> int:
     return sum(1 for line in result.stdout.splitlines() if "::" in line)
 
 
-def _count_source_loc() -> int:
-    """Count non-blank, non-comment lines in src/."""
+def _count_source_loc(source_dir: str, exclude: set[str] | None = None) -> int:
+    """Count non-blank, non-comment lines in the configured source directory."""
+    exclude = exclude or set()
+    root = Path(source_dir) if source_dir else Path(".")
     total = 0
-    for py in Path("src").rglob("*.py"):
+    for py in root.rglob("*.py"):
+        if str(py) in exclude:
+            continue
         for line in py.read_text().splitlines():
             stripped = line.strip()
             if stripped and not stripped.startswith("#"):
@@ -542,7 +546,7 @@ def main():
     # 4. Test metrics
     print("\n[4/4] Counting tests and source...")
     test_count = _count_tests()
-    source_loc = _count_source_loc()
+    source_loc = _count_source_loc(config["source_dir"], config.get("exclude", set()))
     ratio = round(source_loc / max(test_count, 1), 1)
     print(f"  Tests: {test_count} | Source: {source_loc} LOC | Ratio: 1:{ratio}")
 
