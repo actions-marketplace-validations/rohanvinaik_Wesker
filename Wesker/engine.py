@@ -1326,7 +1326,7 @@ def _unpatch_mutant(
 def evaluate_mutant(
     mutant: Mutant,
     test_functions: list[Callable[..., None]],
-    original_func: Callable[..., Any],  # noqa: ARG001 — kept for API compat
+    original_func: Callable[..., Any],
     timeout_ms: float = 5000,
     qualname: str | None = None,
     record_all_killers: bool = False,
@@ -1347,6 +1347,14 @@ def evaluate_mutant(
     the full suite.
     """
     start = time.monotonic()
+
+    # The module-qualified patch (module-level bindings AND class-method owners) needs the ABSOLUTE
+    # source path to match call-site objects by co_filename. Callers pass qualname but not source_path,
+    # so derive it from the original function's own code object — authoritative and absolute. Without
+    # this the whole module-qualified patch was inert, so a method exercised via a factory whose class
+    # is not imported into the test namespace (e.g. make_role_frame(...).relationP()) was a false survivor.
+    if source_path is None:
+        source_path = getattr(getattr(original_func, "__code__", None), "co_filename", None)
 
     # Compile mutated function
     try:

@@ -387,3 +387,26 @@ def test_patch_module_qualified_skips_inherited_method():
     for owner, orig in saved:  # cleanup if anything was (wrongly) patched
         setattr(owner, "flag", orig)
     assert saved == []  # nothing defines _SubNoOverride.flag directly
+
+
+def test_profiling_derives_source_path_and_kills_factory_method():
+    # End-to-end regression: run_function_profiling passes no source_path, so evaluate_mutant must
+    # derive it from original_func — else the module-qualified/class-owner patch is inert and a method
+    # reached only via a factory (owner class not in the test namespace) is a false survivor.
+    from Wesker.engine import run_function_profiling
+
+    tree = ast.parse(open(__file__).read())
+    node = next(
+        m for cls in tree.body if isinstance(cls, ast.ClassDef) and cls.name == "_OwnerFixture"
+        for m in cls.body if isinstance(m, ast.FunctionDef) and m.name == "flag"
+    )
+
+    def _test_via_factory():
+        assert _make_owner().flag() is True
+
+    res = run_function_profiling(
+        node, f"{__file__}::_OwnerFixture.flag",
+        {MutationCategory.VALUE}, [_test_via_factory], _OwnerFixture.flag,
+    )
+    assert res.total_mutants >= 1
+    assert res.total_survived == 0  # source_path derived -> class owner patched -> mutant killed
