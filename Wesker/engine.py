@@ -52,9 +52,10 @@ class MutantResult:
     mutant: Mutant
     killed: bool = False
     killed_by: str | None = None  # "assertion" | "crash" | "timeout"
-    test_name: str | None = None
+    test_name: str | None = None  # first killing test (first-killer mode)
     elapsed_ms: float = 0.0
     equivalent: bool = False
+    killed_by_tests: list[str] = field(default_factory=list)  # all killers (full-matrix mode)
 
 
 @dataclass
@@ -1009,6 +1010,95 @@ def _extract_compare_parts(
 # ── Mutant Evaluation ─────────────────────────────────────────────
 
 
+def _patch_module_qualified(
+    func_name: str | None,
+    mutated_obj: Any,
+    source_path: str | None,
+    qualname: str | None = None,
+) -> list[tuple[Any, Any]]:
+    """Patch every module-level binding of the ORIGINAL function to the mutant.
+
+    Real-world suites call functions through the imported module
+    (``import pkg as p; p.func(...)``) rather than a bare name in the test's
+    globals. Patching only the test globals leaves those call sites pointing at
+    the original, so the mutant is never exercised. This patches the function in
+    its defining module *and* every module that re-exports it (``pkg.func``,
+    ``import as`` aliases share the same module object), so module-qualified
+    call sites hit the mutant.
+
+    When ``qualname`` is class-qualified (``Class.method``), it ALSO patches the
+    method on its owner class in the defining module. Without this, a suite that
+    exercises a method via a factory (``make_thing(...).method()``) WITHOUT
+    importing the class leaves the owner absent from the test namespace, so both
+    the test-namespace patch and the module-level patch miss it and the mutant is
+    never installed — a false "survivor" (an impact-map/patch blind spot, not a
+    test gap).
+
+    Matching on the original's ``__code__.co_filename == source_path`` means
+    only the specific function under test is patched — unrelated same-named
+    functions in other modules are left untouched. Returns ``[(target, saved)]``
+    for restoration (``target`` is a module or an owner class; the caller restores
+    ``func_name`` on it). No-ops (empty list) when ``source_path`` is unavailable,
+    so the caller's behaviour and output are unchanged in that case.
+    """
+    if not func_name or not source_path:
+        return []
+    import os
+    import sys
+
+    try:
+        src_abs = os.path.abspath(source_path)
+    except Exception:
+        return []
+    saved: list[tuple[Any, Any]] = []
+    for mod in list(sys.modules.values()):
+        if mod is None:
+            continue
+        try:
+            obj = getattr(mod, func_name, None)
+        except Exception:
+            continue
+        code = getattr(obj, "__code__", None)
+        if code is None:
+            continue
+        try:
+            if os.path.abspath(code.co_filename) == src_abs:
+                setattr(mod, func_name, mutated_obj)
+                saved.append((mod, obj))
+        except Exception:
+            continue
+
+    # Class-method owner patch: resolve ``Class.method`` within the defining module and patch the
+    # method on the class, so instance-dispatch call sites hit the mutant even when the class was never
+    # imported into the test namespace. Only a class that DEFINES the method directly (not inherited)
+    # and whose original method lives in source_path is touched — same precision as the module loop.
+    if qualname and "." in qualname:
+        owner_parts = qualname.split(".")[:-1]
+        method = qualname.split(".")[-1]
+        for mod in list(sys.modules.values()):
+            if mod is None:
+                continue
+            owner: Any = mod
+            try:
+                for part in owner_parts:
+                    owner = getattr(owner, part)
+            except Exception:
+                continue
+            if not isinstance(owner, type) or method not in getattr(owner, "__dict__", {}):
+                continue
+            existing = _get_raw_attr(owner, method)
+            code = getattr(_unwrap_descriptor(existing), "__code__", None)
+            if code is None:
+                continue
+            try:
+                if os.path.abspath(code.co_filename) == src_abs:
+                    setattr(owner, method, _preserve_descriptor_shape(existing, mutated_obj))
+                    saved.append((owner, existing))
+            except Exception:
+                continue
+    return saved
+
+
 def _patch_mutant_into_test(
     test_fn: Callable[..., None],
     qualname: str | None,
@@ -1233,12 +1323,22 @@ def evaluate_mutant(
     original_func: Callable[..., Any],  # noqa: ARG001 — kept for API compat
     timeout_ms: float = 5000,
     qualname: str | None = None,
+    record_all_killers: bool = False,
+    source_path: str | None = None,
 ) -> MutantResult:
     """Evaluate a mutant against test functions.
 
     Compiles the mutated function, then monkey-patches it into each test's
     module namespace before invoking the test with zero args (standard pytest
     contract). The original function is restored after each test.
+
+    By default (``record_all_killers=False``) returns on the first killing
+    test (efficient — one killer proves the mutant is caught). With
+    ``record_all_killers=True`` (full-matrix mode) every test is run and
+    ``killed_by_tests`` records *all* killers — the per-test attribution a
+    greedy specification-convergence analysis needs. Full-matrix mode shares
+    ``timeout_ms`` across the whole test set, so callers must budget it for
+    the full suite.
     """
     start = time.monotonic()
 
@@ -1266,44 +1366,75 @@ def evaluate_mutant(
             elapsed_ms=_elapsed(start),
         )
 
-    # Run tests against mutated function
-    for test_fn in test_functions:
-        remaining_ms = timeout_ms - _elapsed(start)
-        if remaining_ms <= 0:
-            return MutantResult(
-                mutant=mutant,
-                killed=True,
-                killed_by="timeout",
-                elapsed_ms=_elapsed(start),
-            )
-        # Strategy: monkey-patch the mutated function into the test's namespace
-        # so the test calls the mutant instead of the original. Uses __globals__
-        # (the test function's defining module globals) which works reliably for
-        # both regular imports and dynamically loaded test modules. Falls back to
-        # inspect.getmodule for inline test callables without __globals__.
-        patch_name = qualname or func_name
-        patched, saved, patch_target = _patch_mutant_into_test(
-            test_fn, patch_name, mutated_obj
-        )
-        try:
-            result = _run_test_with_timeout(
-                test_fn,
-                _unwrap_descriptor(mutated_obj),
-                patched,
-                remaining_ms,
-            )
-            if result is not None:
+    # Patch module-qualified bindings (pkg.func / mi.func) to the mutant for the
+    # whole evaluation, so tests that call through the module namespace exercise
+    # the mutant — not only tests that call a bare imported name. Restored in the
+    # finally regardless of how the loop exits. No-op when source_path is absent,
+    # so existing callers/output are unchanged.
+    module_saved = _patch_module_qualified(func_name, mutated_obj, source_path, qualname)
+    try:
+        # Run tests against mutated function
+        killers: list[str] = []
+        first_reason: str | None = None
+        for test_fn in test_functions:
+            remaining_ms = timeout_ms - _elapsed(start)
+            if remaining_ms <= 0:
+                if record_all_killers and killers:
+                    break  # budget hit — keep the killers already collected
                 return MutantResult(
                     mutant=mutant,
                     killed=True,
-                    killed_by=result,
-                    test_name=getattr(test_fn, "__name__", "unknown"),
+                    killed_by="timeout",
                     elapsed_ms=_elapsed(start),
                 )
-        finally:
-            _unpatch_mutant(patched, saved, patch_target, func_name)
+            # Strategy: monkey-patch the mutated function into the test's namespace
+            # so the test calls the mutant instead of the original. Uses __globals__
+            # (the test function's defining module globals) which works reliably for
+            # both regular imports and dynamically loaded test modules. Falls back to
+            # inspect.getmodule for inline test callables without __globals__.
+            patch_name = qualname or func_name
+            patched, saved, patch_target = _patch_mutant_into_test(
+                test_fn, patch_name, mutated_obj
+            )
+            try:
+                result = _run_test_with_timeout(
+                    test_fn,
+                    _unwrap_descriptor(mutated_obj),
+                    patched,
+                    remaining_ms,
+                )
+                if result is not None:
+                    tname = getattr(test_fn, "__name__", "unknown")
+                    if not record_all_killers:
+                        return MutantResult(
+                            mutant=mutant,
+                            killed=True,
+                            killed_by=result,
+                            test_name=tname,
+                            elapsed_ms=_elapsed(start),
+                        )
+                    killers.append(tname)
+                    if first_reason is None:
+                        first_reason = result
+            finally:
+                _unpatch_mutant(patched, saved, patch_target, func_name)
 
-    return MutantResult(mutant=mutant, killed=False, elapsed_ms=_elapsed(start))
+        if record_all_killers and killers:
+            return MutantResult(
+                mutant=mutant,
+                killed=True,
+                killed_by=first_reason,
+                test_name=killers[0],
+                killed_by_tests=killers,
+                elapsed_ms=_elapsed(start),
+            )
+        return MutantResult(mutant=mutant, killed=False, elapsed_ms=_elapsed(start))
+    finally:
+        for _mod, _orig in module_saved:
+            try:
+                setattr(_mod, func_name, _orig)
+            except Exception:
+                pass
 
 
 def _run_test_with_timeout(
@@ -1687,6 +1818,8 @@ def run_function_converged(
     per_mutant_timeout_ms: float = 500,
     passes: int = 3,
     category_order: list[MutationCategory] | None = None,
+    full_matrix: bool = False,
+    source_path: str | None = None,
 ) -> ProfilingResult:
     """Multi-pass convergence with integrated equivalence detection.
 
@@ -1743,8 +1876,16 @@ def run_function_converged(
                 mutant,
                 test_functions,
                 original_func,  # type: ignore[arg-type]
-                timeout_ms=per_mutant_timeout_ms,
+                # Full-matrix mode runs every test, so budget for the whole
+                # suite (~50ms/test) rather than the first-killer per-mutant cap.
+                timeout_ms=(
+                    max(per_mutant_timeout_ms, 50.0 * len(test_functions))
+                    if full_matrix
+                    else per_mutant_timeout_ms
+                ),
                 qualname=qualname,
+                record_all_killers=full_matrix,
+                source_path=source_path,
             )
 
             # Integrated equivalence: check survivors immediately
@@ -1770,7 +1911,14 @@ def run_function_converged(
                 record["killed_by"] = result.killed_by
                 record["test"] = result.test_name
                 killed_records.append(record)
-                if result.test_name:
+                # First-killer mode records the single killer; full-matrix mode
+                # records every test that kills this mutant (the per-test
+                # attribution a greedy-convergence analysis needs).
+                if full_matrix and result.killed_by_tests:
+                    kill_matrix.setdefault(mutant.description, []).extend(
+                        result.killed_by_tests
+                    )
+                elif result.test_name:
                     kill_matrix.setdefault(mutant.description, []).append(
                         result.test_name
                     )

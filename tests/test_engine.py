@@ -339,3 +339,45 @@ def test_isinstance_type_name_variants():
     assert _isinstance_type_name(single) == "int"
     assert _isinstance_type_name(tup) == "int+str"
     assert _isinstance_type_name(attr) == "T"
+
+
+# ── class-method owner patching: a method exercised via a FACTORY, whose class is never imported into
+# the test namespace, must still have its mutant installed (regression: previously a false "survivor"
+# because owner resolution only searched the test namespace). ─────────────────────────────────────
+class _OwnerFixture:
+    def flag(self) -> bool:
+        return True
+
+
+def _make_owner() -> _OwnerFixture:
+    return _OwnerFixture()
+
+
+def test_patch_module_qualified_patches_class_method_owner():
+    from Wesker.engine import _patch_module_qualified
+
+    def mutant(self):        # the VALUE mutant: flip the return
+        return False
+
+    assert _make_owner().flag() is True
+    saved = _patch_module_qualified("flag", mutant, __file__, qualname="_OwnerFixture.flag")
+    try:
+        assert saved, "owner class was not resolved/patched"
+        assert _make_owner().flag() is False   # mutant on the class -> instance dispatch hits it (killable)
+    finally:
+        for owner, orig in saved:
+            setattr(owner, "flag", orig)
+    assert _make_owner().flag() is True          # cleanly restored
+
+
+def test_patch_module_qualified_skips_inherited_method():
+    # a subclass that does NOT define the method is not patched (precision: only the defining owner)
+    from Wesker.engine import _patch_module_qualified
+
+    def mutant(self):
+        return False
+
+    saved = _patch_module_qualified("flag", mutant, __file__, qualname="_SubNoOverride.flag")
+    for owner, orig in saved:                    # cleanup if anything was (wrongly) patched
+        setattr(owner, "flag", orig)
+    assert saved == []                            # nothing defines _SubNoOverride.flag directly
