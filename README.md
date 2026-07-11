@@ -4,8 +4,6 @@
 
 [![CI](https://github.com/rohanvinaik/Wesker/actions/workflows/ci.yml/badge.svg)](https://github.com/rohanvinaik/Wesker/actions/workflows/ci.yml)
 [![Quality Gate](https://sonarcloud.io/api/project_badges/measure?project=rohanvinaik_Wesker&metric=alert_status)](https://sonarcloud.io/summary/new_code?id=rohanvinaik_Wesker)
-[![Coverage](https://sonarcloud.io/api/project_badges/measure?project=rohanvinaik_Wesker&metric=coverage)](https://sonarcloud.io/summary/new_code?id=rohanvinaik_Wesker)
-[![Tests](https://raw.githubusercontent.com/rohanvinaik/Wesker/badges/.github/badges/test-count.svg)](https://github.com/rohanvinaik/Wesker/actions/workflows/spec-badges.yml)
 [![Mean σ](https://raw.githubusercontent.com/rohanvinaik/Wesker/badges/.github/badges/sigma.svg)](https://github.com/rohanvinaik/Wesker/actions/workflows/spec-badges.yml)
 <br>
 [![Mutation Kill Rate](https://raw.githubusercontent.com/rohanvinaik/Wesker/badges/.github/badges/mutation-kill-rate.svg)](https://github.com/rohanvinaik/Wesker/actions/workflows/spec-badges.yml)
