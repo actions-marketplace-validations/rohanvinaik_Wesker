@@ -50,6 +50,33 @@ def _pct_color(pct: int) -> str:
 # ── Layer 1: Convention-based test discovery ─────────────────────
 
 
+def _name_matches_convention(base, base_stripped, generated_name, name, parent_dir, parent_qualified, partial_stems):
+    match = (
+        # Exact generated name (highest confidence)
+        name == generated_name
+        # Parent-qualified (wiki/config.py -> test_wiki_config.py)
+        or (parent_qualified and (
+            name == f"test_{parent_qualified}.py"
+            or name.startswith(f"test_{parent_qualified}_")
+        ))
+        # Exact stem
+        or name == f"test_{base}.py"
+        or name == f"test_{base_stripped}.py"
+        # Prefix match
+        or name.startswith(f"test_{base}_")
+        or name.startswith(f"test_{base_stripped}_")
+        # Parent dir (extraction/det.py -> test_extraction.py)
+        or (parent_qualified and name == f"test_{parent_dir}.py")
+        # Contains-stem (test_prescriptive_deterministic.py)
+        or f"_{base_stripped}." in name
+        or f"_{base_stripped}_" in name
+        # Partial stems (query_navigate -> test_navigate.py)
+        or any(name == f"test_{s}.py" for s in partial_stems)
+        or any(name.startswith(f"test_{s}_") for s in partial_stems)
+    )
+    return match
+
+
 def _discover_by_convention(project_root: str, source_file: str) -> list[str]:
     """Find test files by naming convention (fast, high precision)."""
     base = Path(source_file).stem
@@ -93,29 +120,7 @@ def _discover_by_convention(project_root: str, source_file: str) -> list[str]:
             name = entry.name
             path_str = str(entry)
 
-            match = (
-                # Exact generated name (highest confidence)
-                name == generated_name
-                # Parent-qualified (wiki/config.py -> test_wiki_config.py)
-                or (parent_qualified and (
-                    name == f"test_{parent_qualified}.py"
-                    or name.startswith(f"test_{parent_qualified}_")
-                ))
-                # Exact stem
-                or name == f"test_{base}.py"
-                or name == f"test_{base_stripped}.py"
-                # Prefix match
-                or name.startswith(f"test_{base}_")
-                or name.startswith(f"test_{base_stripped}_")
-                # Parent dir (extraction/det.py -> test_extraction.py)
-                or (parent_qualified and name == f"test_{parent_dir}.py")
-                # Contains-stem (test_prescriptive_deterministic.py)
-                or f"_{base_stripped}." in name
-                or f"_{base_stripped}_" in name
-                # Partial stems (query_navigate -> test_navigate.py)
-                or any(name == f"test_{s}.py" for s in partial_stems)
-                or any(name.startswith(f"test_{s}_") for s in partial_stems)
-            )
+            match = _name_matches_convention(base, base_stripped, generated_name, name, parent_dir, parent_qualified, partial_stems)
 
             # Suppress ambiguous bare-stem matches for common names in subdirs
             if match and parent_qualified and base_stripped in ambiguous_stems:

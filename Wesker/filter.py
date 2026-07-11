@@ -38,33 +38,38 @@ class _FunctionSignals:
     has_logical: bool = False
 
 
+def _classify_signal_node(node: ast.AST, signals: _FunctionSignals) -> None:
+    """Set the structural-signal flags implied by a single AST node."""
+    if isinstance(node, ast.Compare):
+        signals.has_comparisons = True
+    elif isinstance(node, ast.Attribute) and isinstance(node.ctx, ast.Store):
+        if isinstance(node.value, ast.Name) and node.value.id == "self":
+            signals.has_self_assigns = True
+    elif isinstance(node, (ast.Global, ast.Nonlocal)):
+        signals.has_global_nonlocal = True
+    elif (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "isinstance"
+    ):
+        signals.has_isinstance = True
+    elif isinstance(node, ast.BinOp) and isinstance(
+        node.op, (ast.Add, ast.Sub, ast.Mult, ast.Div, ast.FloorDiv, ast.Mod, ast.Pow),
+    ):
+        signals.has_arithmetic = True
+    elif isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.USub):
+        signals.has_arithmetic = True
+    elif isinstance(node, ast.BoolOp):
+        signals.has_logical = True
+    elif isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.Not):
+        signals.has_logical = True
+
+
 def _collect_signals(func_node: ast.FunctionDef) -> _FunctionSignals:
     """Walk the function AST to collect structural signals."""
     signals = _FunctionSignals(param_count=len(func_node.args.args))
     for node in ast.walk(func_node):
-        if isinstance(node, ast.Compare):
-            signals.has_comparisons = True
-        elif isinstance(node, ast.Attribute) and isinstance(node.ctx, ast.Store):
-            if isinstance(node.value, ast.Name) and node.value.id == "self":
-                signals.has_self_assigns = True
-        elif isinstance(node, (ast.Global, ast.Nonlocal)):
-            signals.has_global_nonlocal = True
-        elif (
-            isinstance(node, ast.Call)
-            and isinstance(node.func, ast.Name)
-            and node.func.id == "isinstance"
-        ):
-            signals.has_isinstance = True
-        elif isinstance(node, ast.BinOp) and isinstance(
-            node.op, (ast.Add, ast.Sub, ast.Mult, ast.Div, ast.FloorDiv, ast.Mod, ast.Pow),
-        ):
-            signals.has_arithmetic = True
-        elif isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.USub):
-            signals.has_arithmetic = True
-        elif isinstance(node, ast.BoolOp):
-            signals.has_logical = True
-        elif isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.Not):
-            signals.has_logical = True
+        _classify_signal_node(node, signals)
     return signals
 
 

@@ -30,3 +30,7 @@ wesker = "Wesker.cli:main"
 [project.urls]
 Homepage = "https://github.com/rohanvinaik/Wesker"
 Repository = "https://github.com/rohanvinaik/Wesker"
+
+# Runtime is zero-dependency by design; the test framework is dev-only.
+[dependency-groups]
+dev = ["pytest>=7"]
