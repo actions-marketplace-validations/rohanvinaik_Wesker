@@ -41,6 +41,8 @@ jobs:
     runs-on: ubuntu-latest
     needs: test
     if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository
+    env:
+      SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -51,7 +53,8 @@ jobs:
         with:
           name: coverage-report
 
+      # Skips (keeping CI green) until SONAR_TOKEN is set; activates the
+      # Quality Gate + Coverage badges the moment the secret is added.
       - name: SonarQube Scan
+        if: env.SONAR_TOKEN != ''
         uses: SonarSource/sonarqube-scan-action@v6
-        env:
-          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
