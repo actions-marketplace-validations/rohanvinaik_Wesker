@@ -20,6 +20,9 @@ from typing import TYPE_CHECKING, Any
 from .line_coverage import executable_lines as _executable_lines
 from .line_coverage import failing_on_baseline as _failing_on_baseline
 from .line_coverage import trace_line_coverage as _trace_line_coverage
+from .memory_guard import over_budget as _over_budget
+from .memory_guard import reclaim as _reclaim
+from .memory_guard import resolve_budget as _resolve_budget
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -1667,6 +1670,7 @@ def run_function_profiling(
     original_func: Callable[..., Any],
     per_mutant_timeout_ms: float = 5000,
     budget_ms: float | None = None,
+    mem_budget_mb: int | None = None,
 ) -> ProfilingResult:
     """Exhaustive profiling mode — generate all mutants, evaluate with optional budget.
 
@@ -1703,9 +1707,17 @@ def run_function_profiling(
     # pass to evaluate_mutant (original_func is stubbed by some callers, so its co_filename is useless).
     source_path = func_key.split("::", 1)[0] if "::" in func_key else None
 
-    for mutant in mutants:
+    mem_budget = _resolve_budget(mem_budget_mb)
+    for count, mutant in enumerate(mutants):
         if budget_ms is not None and _elapsed(start) > budget_ms:
             budget_exhausted = True
+            break
+        # Memory guard: if this run has crossed the (capacity-derived, user-
+        # selectable) RAM budget, stop accumulating and reclaim rather than climb
+        # past the ceiling — the guarantee that a profile cannot take over the box.
+        if count % 16 == 0 and _over_budget(mem_budget):
+            budget_exhausted = True
+            _reclaim()
             break
 
         try:

@@ -74,7 +74,24 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--exclude", nargs="*", default=[], help="Files to exclude")
     parser.add_argument("--quiet", action="store_true", help="Minimal output")
+    parser.add_argument(
+        "--purge",
+        action="store_true",
+        help="delete regeneratable .wesker/ cruft from old runs and exit",
+    )
     args = parser.parse_args(argv)
+
+    if args.purge:
+        from Wesker.memory_guard import purge_caches
+
+        removed, reclaimed = purge_caches(".")
+        if args.json_output:
+            print(json.dumps({"removed": list(removed), "reclaimed_bytes": reclaimed}))
+        elif removed:
+            print(f"purged {len(removed)} file(s), reclaimed {reclaimed // 1024} KB")
+        else:
+            print("nothing to purge — clean state")
+        return 0
 
     from Wesker.ci import profile_codebase
 
@@ -132,6 +149,15 @@ def main(argv: list[str] | None = None) -> int:
                 print(
                     f"MC/DC: {status} ({mcdc_result['conditions_covered']}/{mcdc_result['conditions_total']})"
                 )
+
+    # Lightweight memory-telemetry footer (best-effort — never fails the run).
+    if not args.json_output and not args.quiet:
+        try:
+            from Wesker.memory_guard import telemetry
+
+            print(f"[{telemetry()}]")
+        except Exception:  # noqa: BLE001 — telemetry is advisory
+            pass
 
     # Threshold gate
     if args.threshold and result["kill_pct"] < args.threshold:
