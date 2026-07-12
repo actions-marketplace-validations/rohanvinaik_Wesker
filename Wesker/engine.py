@@ -1523,6 +1523,21 @@ def _elapsed(start: float) -> float:
     return (time.monotonic() - start) * 1000
 
 
+def _mutant_diff(mutant: Mutant) -> str:
+    """A minimal ``'- <original>\\n+ <mutated>'`` diff of the mutated node.
+
+    Gives downstream oracle synthesis the specific change (e.g. ``n >= 5`` →
+    ``n > 5``) rather than only the generic category description. Empty when the
+    nodes can't be unparsed or don't differ textually.
+    """
+    try:
+        original = ast.unparse(mutant.original_node).strip()
+        mutated = ast.unparse(mutant.mutated_node).strip()
+    except Exception:
+        return ""
+    return f"- {original}\n+ {mutated}" if original != mutated else ""
+
+
 # ── Sampling & Profiling ──────────────────────────────────────────
 
 
@@ -1700,6 +1715,7 @@ def run_function_profiling(
                     "mutant_id": mutant.mutant_id,
                     "mutant": mutant.description,
                     "category": mutant.category.value,
+                    "diff_summary": _mutant_diff(mutant),
                     "elapsed_ms": round(result.elapsed_ms, 1),
                 }
             )
@@ -1953,6 +1969,7 @@ def run_function_converged(
                 "mutant_id": mutant.mutant_id,
                 "mutant": mutant.description,
                 "category": mutant.category.value,
+                "diff_summary": _mutant_diff(mutant),
                 "elapsed_ms": round(result.elapsed_ms, 1),
             }
             if result.killed:
