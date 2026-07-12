@@ -1376,7 +1376,13 @@ def evaluate_mutant(
         module_ast = ast.Module(body=[mutant.mutated_node], type_ignores=[])  # type: ignore[list-item]
         ast.fix_missing_locations(module_ast)
         code = compile(module_ast, "<mutant>", "exec")
-        namespace: dict[str, Any] = {}
+        # Seed the mutant's namespace with the source module's globals so it can
+        # resolve sibling helpers, module constants, and imports. Without this a
+        # function that calls a module-level helper raises NameError under EVERY
+        # mutant — a false all-crash 100% that hides whether the mutation's
+        # behavior is actually caught. Degrades to an empty namespace (the prior
+        # behavior) when the caller passes no original_func.
+        namespace: dict[str, Any] = dict(getattr(original_func, "__globals__", None) or {})
         exec(code, namespace)  # noqa: S102  # nosec B102 — intentional: compiling AST mutants
         func_name = getattr(mutant.mutated_node, "name", None)
         mutated_obj = namespace.get(func_name) if func_name else None
