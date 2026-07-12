@@ -12,6 +12,7 @@ Zero external dependencies beyond the test framework.
 from __future__ import annotations
 
 import ast
+import hashlib
 import importlib.util
 import json
 import os
@@ -238,11 +239,25 @@ def load_test_callables(test_files: list[str]) -> list[Any]:
     """Load all test_* callables from test files, including class methods."""
     callables: list[Any] = []
     for tf in test_files:
-        mod_name = f"_wesker_test_{Path(tf).stem}"
+        # Key the module cache on file CONTENT, not just its stem. A long-lived
+        # process (or a converge loop) rewrites generated test files in place; a
+        # stem-only cache would serve the stale prior version via sys.modules,
+        # hiding freshly written killing tests as false survivors.
+        try:
+            with open(tf, "rb") as fh:
+                digest = hashlib.sha256(fh.read()).hexdigest()[:16]
+        except OSError:
+            continue
+        stem_prefix = f"_wesker_test_{Path(tf).stem}_"
+        mod_name = f"{stem_prefix}{digest}"
         if mod_name in sys.modules:
-            # Already loaded — reuse
+            # Same content already loaded — reuse.
             mod = sys.modules[mod_name]
         else:
+            # Evict any prior-content module for this file so sys.modules can't grow
+            # without bound across rewrites.
+            for stale in [m for m in list(sys.modules) if m.startswith(stem_prefix)]:
+                sys.modules.pop(stale, None)
             try:
                 spec = importlib.util.spec_from_file_location(mod_name, tf)
                 if spec is None or spec.loader is None:

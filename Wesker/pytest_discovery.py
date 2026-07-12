@@ -26,9 +26,11 @@ additive — the original loader stays as the fallback (see
 from __future__ import annotations
 
 import contextlib
+import importlib
 import inspect
 import io
 import os
+import sys
 from typing import Any, Callable
 
 
@@ -129,6 +131,19 @@ def collect_pytest_callables(
 
         def pytest_collection_modifyitems(self, session, config, items) -> None:
             self.items = list(items)
+
+    # Evict already-imported test modules whose source lives under this root so
+    # pytest re-imports the CURRENT on-disk file. Repeated in-process collections
+    # otherwise serve a rewritten generated test file stale from sys.modules —
+    # hiding freshly written killing tests as false survivors. Only test_* modules
+    # under the root are dropped, so unrelated imports are untouched.
+    root_abs = os.path.abspath(project_root)
+    for _name in list(sys.modules):
+        _mod = sys.modules.get(_name)
+        _f = getattr(_mod, "__file__", None)
+        if _f and os.path.basename(_f).startswith("test_") and os.path.abspath(_f).startswith(root_abs):
+            del sys.modules[_name]
+    importlib.invalidate_caches()
 
     plugin = _Collect()
     args = ["--collect-only", "-q", "-p", "no:cacheprovider"]
