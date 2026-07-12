@@ -74,6 +74,31 @@ def _trace_one(
     return hits & exec_lines
 
 
+def failing_on_baseline(
+    test_functions: list[Callable[..., None]], original_func: Callable[..., Any]
+) -> list[str]:
+    """Test names whose assertion FAILS on the UNMUTATED function — a test that does
+    not hold on correct code.
+
+    Only an ``AssertionError`` counts: it means the test's own expectation is wrong
+    for the current code (a stale golden, or a real regression the test is catching).
+    Other exceptions (a missing fixture arg, an import error) are ambiguous under the
+    direct-call contract and are NOT flagged, to avoid false accusations. Such a test
+    is surfaced for a human to investigate — never proposed for automatic deletion,
+    since it may be the only thing catching a genuine bug."""
+    if getattr(original_func, "__code__", None) is None:
+        return []
+    failing: list[str] = []
+    for test_fn in test_functions:
+        try:
+            test_fn()
+        except AssertionError:
+            failing.append(getattr(test_fn, "__name__", "unknown"))
+        except BaseException:  # noqa: BLE001,S110 — ambiguous (fixtures/imports); not a wrong assertion
+            pass
+    return failing
+
+
 def trace_line_coverage(
     test_functions: list[Callable[..., None]],
     original_func: Callable[..., Any],

@@ -18,6 +18,7 @@ from enum import Enum
 from typing import TYPE_CHECKING, Any
 
 from .line_coverage import executable_lines as _executable_lines
+from .line_coverage import failing_on_baseline as _failing_on_baseline
 from .line_coverage import trace_line_coverage as _trace_line_coverage
 
 if TYPE_CHECKING:
@@ -157,6 +158,9 @@ class ProfilingResult:
     # denominator. Empty when no baseline pass ran (backward-compatible).
     line_coverage: dict[str, list[int]] = field(default_factory=dict)
     executable_lines: list[int] = field(default_factory=list)
+    # Tests whose assertion fails on the UNMUTATED function — broken/stale, surfaced
+    # for a human (a wrong assertion or a real regression), never auto-removed.
+    failing_tests: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict:
         effective_total = self.total_mutants - self.total_equivalent
@@ -203,6 +207,8 @@ class ProfilingResult:
             d["line_coverage"] = self.line_coverage
         if self.executable_lines:
             d["executable_lines"] = self.executable_lines
+        if self.failing_tests:
+            d["failing_tests"] = self.failing_tests
         return d
 
 
@@ -1681,6 +1687,7 @@ def run_function_profiling(
     # original is unavailable, so existing callers/output are unchanged.
     exec_lines = sorted(_executable_lines(func_node))
     line_cov = _trace_line_coverage(test_functions, original_func, set(exec_lines))
+    failing = _failing_on_baseline(test_functions, original_func)
 
     results_by_cat: dict[MutationCategory, CategoryResult] = {}
     kill_matrix: dict[str, list[str]] = {}
@@ -1789,6 +1796,7 @@ def run_function_profiling(
         elapsed_ms=_elapsed(start),
         line_coverage=line_cov,
         executable_lines=exec_lines,
+        failing_tests=failing,
     )
 
 
