@@ -17,6 +17,9 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import TYPE_CHECKING, Any
 
+from .line_coverage import executable_lines as _executable_lines
+from .line_coverage import trace_line_coverage as _trace_line_coverage
+
 if TYPE_CHECKING:
     from collections.abc import Callable
 
@@ -149,6 +152,11 @@ class ProfilingResult:
     elapsed_ms: float = 0.0
     total_equivalent: int = 0
     universe_size: int = 0
+    # Second completeness axis, from a traced baseline pass over the unmutated
+    # function: which target lines each test covers, and the executable-line
+    # denominator. Empty when no baseline pass ran (backward-compatible).
+    line_coverage: dict[str, list[int]] = field(default_factory=dict)
+    executable_lines: list[int] = field(default_factory=list)
 
     def to_dict(self) -> dict:
         effective_total = self.total_mutants - self.total_equivalent
@@ -191,6 +199,10 @@ class ProfilingResult:
             d["survivor_records"] = self.survivor_records
         if self.killed_records:
             d["killed_records"] = self.killed_records
+        if self.line_coverage:
+            d["line_coverage"] = self.line_coverage
+        if self.executable_lines:
+            d["executable_lines"] = self.executable_lines
         return d
 
 
@@ -1663,6 +1675,13 @@ def run_function_profiling(
     start = time.monotonic()
     mutants = generate_mutants(func_node, categories)
 
+    # Baseline line-coverage pass over the UNMUTATED function — the second
+    # completeness axis. Each test runs once against the original under a tracer;
+    # the mutation loop below stays untraced (and fast). Degrades to empty when the
+    # original is unavailable, so existing callers/output are unchanged.
+    exec_lines = sorted(_executable_lines(func_node))
+    line_cov = _trace_line_coverage(test_functions, original_func, set(exec_lines))
+
     results_by_cat: dict[MutationCategory, CategoryResult] = {}
     kill_matrix: dict[str, list[str]] = {}
     survivor_records: list[dict] = []
@@ -1768,6 +1787,8 @@ def run_function_profiling(
         killed_records=killed_records,
         budget_exhausted=budget_exhausted,
         elapsed_ms=_elapsed(start),
+        line_coverage=line_cov,
+        executable_lines=exec_lines,
     )
 
 
