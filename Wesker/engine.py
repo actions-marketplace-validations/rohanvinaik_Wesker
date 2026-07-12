@@ -1682,14 +1682,37 @@ def run_function_profiling(
             budget_exhausted = True
             break
 
-        result = evaluate_mutant(
-            mutant,
-            test_functions,
-            original_func,
-            timeout_ms=per_mutant_timeout_ms,
-            qualname=qualname,
-            source_path=source_path,
-        )
+        try:
+            result = evaluate_mutant(
+                mutant,
+                test_functions,
+                original_func,
+                timeout_ms=per_mutant_timeout_ms,
+                qualname=qualname,
+                source_path=source_path,
+            )
+        except Exception as exc:  # noqa: BLE001
+            # A pathological mutant can crash the evaluation harness itself —
+            # e.g. self-profiling the engine's own internals, where the mutant
+            # replaces the live machinery that runs the profile. One bad mutant
+            # must never abort the whole run: record it as an un-evaluable
+            # survivor (conservative — never inflates the kill score) and move on.
+            cr = results_by_cat.setdefault(
+                mutant.category, CategoryResult(category=mutant.category)
+            )
+            cr.total += 1
+            cr.survived += 1
+            survivor_records.append(
+                {
+                    "mutant_id": mutant.mutant_id,
+                    "mutant": mutant.description,
+                    "category": mutant.category.value,
+                    "diff_summary": _mutant_diff(mutant),
+                    "error": f"{type(exc).__name__}: {exc}",
+                    "elapsed_ms": 0.0,
+                }
+            )
+            continue
 
         cr = results_by_cat.setdefault(
             mutant.category, CategoryResult(category=mutant.category)
