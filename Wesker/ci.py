@@ -575,6 +575,23 @@ def _save_function_cache(project_root: str, cache: dict) -> None:
     (cache_dir / "function_cache.json").write_text(json.dumps(cache, indent=2))
 
 
+def single_valid_copy(cache: dict, func_prefix: str, current_key: str) -> dict:
+    """The cache with every OTHER-version entry for one function removed, keeping
+    only ``current_key`` — the single-valid-copy invariant.
+
+    A cache key is ``path::qualname:code_hash``; ``func_prefix`` is ``path::qualname:``
+    and identifies the function across versions. When a function is re-profiled after
+    an edit, its previous-hash entry is stale: it can never be served again (the hash
+    won't match current code) yet it lingers forever, so the file grows without bound
+    across edits. Purging same-function/other-hash entries on write guarantees exactly
+    one valid result per function — bounded, never stale."""
+    return {
+        key: value
+        for key, value in cache.items()
+        if key == current_key or not key.startswith(func_prefix)
+    }
+
+
 def profile_function_cached(
     project_root: str,
     source_file: str,
@@ -647,6 +664,10 @@ def profile_function_cached(
     )
 
     if result is not None:
+        # Single valid copy: drop any stale entry for an earlier version of this
+        # function before recording the current one, so the cache stays bounded
+        # (one result per function) and never accumulates unservable stale copies.
+        cache = single_valid_copy(cache, f"{rel}::{qn}:", cache_key)
         cache[cache_key] = result
         _save_function_cache(project_root, cache)
 
