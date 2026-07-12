@@ -17,6 +17,7 @@ import json
 import os
 import sys
 import time
+import unittest
 from pathlib import Path
 from typing import Any
 
@@ -256,14 +257,61 @@ def load_test_callables(test_files: list[str]) -> list[Any]:
             obj = getattr(mod, name)
             if name.startswith("test_") and callable(obj):
                 callables.append(obj)
-            elif isinstance(obj, type) and name.startswith("Test"):
+            elif isinstance(obj, type) and (
+                (issubclass(obj, unittest.TestCase) and obj is not unittest.TestCase)
+                or name.startswith("Test")
+            ):
+                # unittest.TestCase subclasses use any naming (e.g. the common
+                # `<Name>Tests` suffix); detect by type, not name prefix. Bind
+                # the method name so TestCase instantiation succeeds.
                 for mname in dir(obj):
                     if mname.startswith("test_"):
                         try:
-                            callables.append(getattr(obj(), mname))
+                            callables.append(getattr(obj(mname), mname))
                         except Exception:
-                            pass
+                            try:
+                                callables.append(getattr(obj(), mname))
+                            except Exception:
+                                pass
     return callables
+
+
+def discover_test_callables(
+    project_root: str,
+    source_file: str,
+    func_names: list[str],
+    backend: str = "auto",
+) -> list[Any]:
+    """Discover runnable test callables — a dial over two backends.
+
+      * ``"pytest"`` — pytest's own collection (robust across every convention:
+        TestCase suffixes, mixins, parametrization, conftest);
+      * ``"legacy"`` — Wesker's original hand-rolled loader
+        (``discover_tests`` + ``load_test_callables``);
+      * ``"auto"``   — try pytest, fall back to legacy (the default).
+
+    pytest is the preferred/main path; the legacy loader stays intact as the
+    fallback, so projects without pytest — or that pytest cannot collect —
+    behave exactly as before.
+    """
+    if backend in ("auto", "pytest"):
+        try:
+            from Wesker.pytest_discovery import collect_pytest_callables
+
+            collected = collect_pytest_callables(project_root)
+        except Exception:
+            collected = None
+        if collected:
+            return collected
+        if backend == "pytest":
+            return []
+    # Legacy fallback: hand-rolled discovery + loader.
+    full_path = (
+        os.path.join(project_root, source_file)
+        if not os.path.isabs(source_file)
+        else source_file
+    )
+    return load_test_callables(discover_tests(project_root, full_path, func_names))
 
 
 # ── AST utilities ────────────────────────────────────────────────
@@ -321,6 +369,8 @@ def profile_file(
     max_per_category: int = 5,
     passes: int = 3,
     cached_state: dict | None = None,
+    full_matrix: bool = False,
+    test_discovery: str = "auto",
 ) -> list[dict]:
     """Profile all functions in a file with multi-pass convergence.
 
@@ -355,8 +405,9 @@ def profile_file(
     func_names = [name for name, _ in functions]
 
     # 3-layer test discovery
-    test_files = discover_tests(project_root, full_path, func_names)
-    tests = load_test_callables(test_files)
+    tests = discover_test_callables(
+        project_root, source_file, func_names, backend=test_discovery
+    )
 
     results: list[dict] = []
     for qualname, func_node in functions:
@@ -381,6 +432,8 @@ def profile_file(
             max_per_category=max_per_category,
             passes=passes,
             category_order=cat_order,
+            full_matrix=full_matrix,
+            source_path=full_path,
         )
         results.append(sr.to_dict())
 
@@ -398,6 +451,8 @@ def profile_function(
     max_per_category: int = 5,
     passes: int = 3,
     cached_state: dict | None = None,
+    full_matrix: bool = False,
+    test_discovery: str = "auto",
 ) -> dict | None:
     """Profile a single function by name — the interactive/library entry point.
 
@@ -449,8 +504,9 @@ def profile_function(
     priors = prioritize_categories(cats, cached_state)
     cat_order = [p.category for p in priors]
 
-    test_files = discover_tests(project_root, full_path, func_names)
-    tests = load_test_callables(test_files)
+    tests = discover_test_callables(
+        project_root, source_file, func_names, backend=test_discovery
+    )
 
     rel = os.path.relpath(full_path, project_root)
     func_key = f"{rel}::{qualname}"
@@ -465,6 +521,8 @@ def profile_function(
         max_per_category=max_per_category,
         passes=passes,
         category_order=cat_order,
+        full_matrix=full_matrix,
+        source_path=full_path,
     )
     return result.to_dict()
 
