@@ -1485,6 +1485,8 @@ def _run_test_with_timeout(
     Returns the kill reason ("assertion", "crash", "timeout") if killed,
     or None if the test passed (mutant survived this test).
     """
+    import contextlib
+    import io
     import threading
 
     result_box: list[str | None] = [None]  # None = survived
@@ -1508,8 +1510,13 @@ def _run_test_with_timeout(
             result_box[0] = "crash"
 
     thread = threading.Thread(target=_target, daemon=True)
-    thread.start()
-    thread.join(timeout=timeout_ms / 1000.0)
+    # Isolate the discovered test's own stdout/stderr (argparse usage banners,
+    # prints, logging) so consumer-test side-effects never pollute the engine's
+    # report. Set up in the main thread around start+join so restoration is
+    # guaranteed even when the worker hangs and is abandoned as a timeout.
+    with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+        thread.start()
+        thread.join(timeout=timeout_ms / 1000.0)
 
     if thread.is_alive():
         # Thread is stuck — treat as timeout kill.
