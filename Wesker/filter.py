@@ -36,6 +36,7 @@ class _FunctionSignals:
     has_isinstance: bool = False
     has_arithmetic: bool = False
     has_logical: bool = False
+    has_deletable_stmt: bool = False
 
 
 def _classify_signal_node(node: ast.AST, signals: _FunctionSignals) -> None:
@@ -58,12 +59,19 @@ def _classify_signal_node(node: ast.AST, signals: _FunctionSignals) -> None:
         (ast.Add, ast.Sub, ast.Mult, ast.Div, ast.FloorDiv, ast.Mod, ast.Pow),
     ):
         signals.has_arithmetic = True
+    elif isinstance(node, ast.AugAssign) and isinstance(
+        node.op,
+        (ast.Add, ast.Sub, ast.Mult, ast.Div, ast.FloorDiv, ast.Mod, ast.Pow),
+    ):
+        signals.has_arithmetic = True
     elif isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.USub):
         signals.has_arithmetic = True
     elif isinstance(node, ast.BoolOp):
         signals.has_logical = True
     elif isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.Not):
         signals.has_logical = True
+    elif isinstance(node, ast.Expr) and not isinstance(node.value, ast.Constant):
+        signals.has_deletable_stmt = True
 
 
 def _collect_signals(func_node: ast.FunctionDef) -> _FunctionSignals:
@@ -98,6 +106,8 @@ def filter_categories(
         relevant.add(MutationCategory.ARITHMETIC)
     if sig.has_logical:
         relevant.add(MutationCategory.LOGICAL)
+    if sig.has_deletable_stmt:
+        relevant.add(MutationCategory.STMT)
 
     return relevant
 

@@ -17,6 +17,8 @@ so the two feed the same set-cover.
 from __future__ import annotations
 
 import ast
+import contextlib
+import io
 import sys
 from typing import Any, Callable
 
@@ -89,13 +91,18 @@ def failing_on_baseline(
     if getattr(original_func, "__code__", None) is None:
         return []
     failing: list[str] = []
-    for test_fn in test_functions:
-        try:
-            test_fn()
-        except AssertionError:
-            failing.append(getattr(test_fn, "__name__", "unknown"))
-        except BaseException:  # noqa: BLE001,S110 — ambiguous (fixtures/imports); not a wrong assertion
-            pass
+    # Isolate each discovered test's own stdout/stderr (argparse usage banners from
+    # a `pytest.raises(SystemExit)` CLI test, prints, logging) so consumer-test
+    # side-effects never pollute the engine's machine-readable output — the same
+    # isolation evaluate_mutant's runner applies.
+    with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+        for test_fn in test_functions:
+            try:
+                test_fn()
+            except AssertionError:
+                failing.append(getattr(test_fn, "__name__", "unknown"))
+            except BaseException:  # noqa: BLE001,S110 — ambiguous (fixtures/imports); not a wrong assertion
+                pass
     return failing
 
 
@@ -118,10 +125,14 @@ def trace_line_coverage(
     if not target_file or not exec_lines:
         return {}
     coverage: dict[str, list[int]] = {}
-    for test_fn in test_functions:
-        name = getattr(test_fn, "__name__", "unknown")
-        covered = _trace_one(test_fn, target_file, exec_lines)
-        # Union across duplicate test names (parametrized cases share a __name__).
-        merged = set(coverage.get(name, ())) | covered
-        coverage[name] = sorted(merged)
+    # Isolate consumer-test stdout/stderr during the traced baseline pass (see
+    # failing_on_baseline) so a test's prints/argparse banners never leak into the
+    # engine's output.
+    with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+        for test_fn in test_functions:
+            name = getattr(test_fn, "__name__", "unknown")
+            covered = _trace_one(test_fn, target_file, exec_lines)
+            # Union across duplicate test names (parametrized cases share a __name__).
+            merged = set(coverage.get(name, ())) | covered
+            coverage[name] = sorted(merged)
     return coverage

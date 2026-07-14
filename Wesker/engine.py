@@ -11,6 +11,7 @@ from __future__ import annotations
 import ast
 import copy
 import hashlib
+import math
 import time
 import types
 from dataclasses import dataclass, field
@@ -38,6 +39,7 @@ class MutationCategory(str, Enum):
     TYPE = "TYPE"
     ARITHMETIC = "ARITHMETIC"
     LOGICAL = "LOGICAL"
+    STMT = "STMT"
 
 
 @dataclass
@@ -50,6 +52,14 @@ class Mutant:
     description: str
     location: int = 0
     mutant_id: str = ""
+    # The positional target index within its (category, sub-mode) — the engine's internal
+    # selection ordinal. ``mutant_id`` is content-addressed (invocation-stable); this stays
+    # positional for greedy-selection bookkeeping and order/coverage assertions.
+    target_index: int = -1
+    # Absolute source line the mutation changed (from the mutator's fire site). The exact
+    # line a test must EXECUTE to observe this mutant — the key to test-impact scoping.
+    # None when the mutator could not report it (falls back to running the full suite).
+    mutated_line: int | None = None
 
 
 @dataclass
@@ -83,6 +93,18 @@ class CategoryResult:
     @property
     def survival_rate(self) -> float:
         return self.survived / self.total if self.total > 0 else 0.0
+
+    @property
+    def value_killed(self) -> int:
+        """Mutants whose VALUE behavior is pinned. Only an assertion kill qualifies —
+        a crash/timeout kill proves the code RUNS, not WHAT it returns."""
+        return self.killed_by_assertion
+
+    @property
+    def value_survived(self) -> int:
+        """Value-unspecified DOF: survivors PLUS crash/timeout kills. For specification
+        these are equivalent — none pins the return value."""
+        return self.survived + self.killed_by_crash + self.timed_out
 
 
 @dataclass
@@ -164,6 +186,46 @@ class ProfilingResult:
     # Tests whose assertion fails on the UNMUTATED function — broken/stale, surfaced
     # for a human (a wrong assertion or a real regression), never auto-removed.
     failing_tests: list[str] = field(default_factory=list)
+    # How many test callables were discovered for this function. 0 means the kill
+    # rate is 0% because there is NOTHING to kill with — a discovery/"write a test"
+    # signal, not weak tests. -1 = not populated (older callers), so consumers can
+    # tell "no tests" apart from "unknown". Prevents a silent, misleading 0%.
+    tests_discovered: int = -1
+
+    # --- Value-specification view -------------------------------------------------
+    # An assertion kill pins WHAT the function returns; a crash/timeout kill only proves
+    # it RUNS. For SPECIFICATION only assertion kills count, so crash/timeout kills are
+    # unspecified value-DOF. Derived (not stored) so they can never drift from the record
+    # of record — any ProfilingResult, however constructed, reports the split correctly.
+
+    @property
+    def value_killed(self) -> int:
+        """Mutants whose return value is pinned — assertion kills only."""
+        return sum(cr.value_killed for cr in self.per_category)
+
+    @property
+    def value_survived(self) -> int:
+        """Value-unspecified DOF: true survivors PLUS crash/timeout kills."""
+        return sum(cr.value_survived for cr in self.per_category)
+
+    @property
+    def value_survivor_records(self) -> list[dict]:
+        """Survivor-shaped record for every value-unspecified mutant — the true survivors
+        plus each crash/timeout kill (reshaped from ``killed_records``, carrying its diff)
+        so a value-distinguishing witness can be sought for behavior the tests only ran."""
+        crash_survivors = [
+            {
+                "mutant_id": r.get("mutant_id"),
+                "mutant": r.get("mutant"),
+                "category": r.get("category"),
+                "diff_summary": r.get("diff_summary", ""),
+                "killed_by": r.get("killed_by"),
+                "elapsed_ms": r.get("elapsed_ms", 0.0),
+            }
+            for r in self.killed_records
+            if r.get("killed_by") != "assertion"
+        ]
+        return list(self.survivor_records) + crash_survivors
 
     def to_dict(self) -> dict:
         effective_total = self.total_mutants - self.total_equivalent
@@ -236,6 +298,17 @@ class _BaseMutator(ast.NodeTransformer):
         self.target = target_index
         self.applied = False
         self.keys: list[str] | None = None
+        # The absolute source line the mutation changed — the exact line a test
+        # must EXECUTE to observe this mutant. Captured at the fire site so
+        # test-impact scoping can run only the covering tests (verdict-preserving:
+        # a test that never runs the mutated line cannot kill the mutant).
+        self.mutated_lineno: int | None = None
+
+    def _mark_applied(self, node: ast.AST) -> None:
+        """Record that the mutation fired at ``node`` — sets the applied flag and
+        the source line changed. Mutators call this in place of a bare applied-flag
+        set so every category reports WHERE it mutated with no per-category drift."""
+        self.applied, self.mutated_lineno = True, getattr(node, "lineno", None)
 
     def _note(self, dim_key: str) -> None:
         """Record the behavioral dimension of the current candidate site."""
@@ -277,7 +350,7 @@ class _ValueMutator(_BaseMutator):
         if self.current == self.target:
             mutated = self._mutate_constant(node)
             if mutated is not node:
-                self.applied = True
+                self._mark_applied(node)
                 return mutated
             # Defensive: if _mutate_constant somehow returned the original,
             # do not mark applied — skip this target.
@@ -300,8 +373,12 @@ class _ValueMutator(_BaseMutator):
 
 
 class _BoundaryMutator(_BaseMutator):
-    """Off-by-one on comparisons: < → <=, >= → >, etc."""
+    """Comparison-operator mutation: off-by-one (< → <=), equality flip
+    (== → !=), identity/membership flip (is → is not, in → not in), and
+    direction reversal on orderings (< → >, <= → >=)."""
 
+    # Boundary / predicate flip — the always-present alternative for every
+    # comparison operator.
     _SWAP = {
         ast.Lt: ast.LtE,
         ast.LtE: ast.Lt,
@@ -309,29 +386,58 @@ class _BoundaryMutator(_BaseMutator):
         ast.GtE: ast.Gt,
         ast.Eq: ast.NotEq,
         ast.NotEq: ast.Eq,
+        # Identity / membership predicate flips — whole operator classes that
+        # previously produced no mutant, leaving a real behavioral DOF unpinned.
+        ast.Is: ast.IsNot,
+        ast.IsNot: ast.Is,
+        ast.In: ast.NotIn,
+        ast.NotIn: ast.In,
     }
+
+    # Direction reversal — a SECOND alternative on ordering comparisons only.
+    # Distinct behavioral DOF from the boundary shift (`<` vs `>` vs `<=`).
+    _DIRECTION = {
+        ast.Lt: ast.Gt,
+        ast.Gt: ast.Lt,
+        ast.LtE: ast.GtE,
+        ast.GtE: ast.LtE,
+    }
+
+    @staticmethod
+    def _alternatives(op: ast.cmpop) -> list[tuple[type, str]]:
+        """Ordered (replacement-op class, dimension label) for one comparison
+        operator — the boundary/flip swap always, plus a direction reversal for
+        orderings. Single source of truth for the mutation dimensions, so the
+        mutator and ``_count_boundary_target`` cannot drift."""
+        alts: list[tuple[type, str]] = []
+        name = type(op).__name__
+        boundary = _BoundaryMutator._SWAP.get(type(op))
+        if boundary is not None:
+            alts.append((boundary, f"BOUNDARY:{name}"))
+        direction = _BoundaryMutator._DIRECTION.get(type(op))
+        if direction is not None:
+            alts.append((direction, f"BOUNDARY:{name}~dir"))
+        return alts
 
     def visit_Compare(self, node: ast.Compare) -> ast.AST:
         if self.applied:
             return self.generic_visit(node)
-        new_ops = []
-        for op in node.ops:
-            if not self.applied and self.current == self.target:
-                swapped = self._SWAP.get(type(op))
-                if swapped:
-                    new_ops.append(swapped())
-                    self.applied = True
-                else:
-                    new_ops.append(op)
-            else:
-                new_ops.append(op)
-            # One dimension per op position (matches the per-op ``current``
-            # increment). Non-swappable ops (is/in/…) produce no mutant, so
-            # they carry the dead key and sink to the end of the greedy order.
-            self._note(
-                f"BOUNDARY:{type(op).__name__}" if type(op) in self._SWAP else _DEAD_DIM
-            )
-            self.current += 1
+        new_ops = list(node.ops)
+        for pos, op in enumerate(node.ops):
+            alts = self._alternatives(op)
+            if not alts:
+                # No swap for this op → dead dimension (still one entry per op),
+                # sinks to the end of the greedy order.
+                self._note(_DEAD_DIM)
+                self.current += 1
+                continue
+            # One dimension per alternative; apply the one the target selects.
+            for repl_cls, label in alts:
+                if not self.applied and self.current == self.target:
+                    new_ops[pos] = repl_cls()
+                    self._mark_applied(node)
+                self._note(label)
+                self.current += 1
         node.ops = new_ops
         return self.generic_visit(node)
 
@@ -343,7 +449,7 @@ class _SwapMutator(_BaseMutator):
         if self.applied or len(node.args) < 2:
             return self.generic_visit(node)
         if self.current == self.target:
-            self.applied = True
+            self._mark_applied(node)
             node.args = list(node.args)
             node.args[0], node.args[1] = node.args[1], node.args[0]
         self._note(f"SWAP:{_callee_name(node)}")
@@ -368,7 +474,7 @@ class _StateMutator(_BaseMutator):
                 and target.value.id == "self"
             ):
                 if self.current == self.target:
-                    self.applied = True
+                    self._mark_applied(node)
                     return ast.Pass()
                 self._note(f"STATE:remove_assign:{target.attr}")
                 self.current += 1
@@ -379,7 +485,7 @@ class _StateMutator(_BaseMutator):
             return node
         if node.value is not None:
             if self.current == self.target:
-                self.applied = True
+                self._mark_applied(node)
                 return ast.Return(value=ast.Constant(value=None))
             self._note("STATE:return_none")
             self.current += 1
@@ -394,7 +500,7 @@ class _TypeMutator(_BaseMutator):
             return self.generic_visit(node)
         if isinstance(node.func, ast.Name) and node.func.id == "isinstance":
             if self.current == self.target:
-                self.applied = True
+                self._mark_applied(node)
                 return ast.Constant(value=True)
             self._note(f"TYPE:{_isinstance_type_name(node)}")
             self.current += 1
@@ -424,7 +530,7 @@ class _ArithmeticMutator(_BaseMutator):
         swapped = self._BIN_SWAP.get(type(node.op))
         if swapped:
             if self.current == self.target:
-                self.applied = True
+                self._mark_applied(node)
                 node.op = swapped()
             self._note(f"ARITHMETIC:{type(node.op).__name__}")
             self.current += 1
@@ -435,9 +541,23 @@ class _ArithmeticMutator(_BaseMutator):
             return self.generic_visit(node)
         if isinstance(node.op, ast.USub):
             if self.current == self.target:
-                self.applied = True
+                self._mark_applied(node)
                 return self.generic_visit(node.operand)
             self._note("ARITHMETIC:USub")
+            self.current += 1
+        return self.generic_visit(node)
+
+    def visit_AugAssign(self, node: ast.AugAssign) -> ast.AST:
+        # Augmented assignment (x += 1) carries the same operator DOF as a
+        # BinOp — swap it under the same table so `+=`/`*=`/… get pinned.
+        if self.applied:
+            return self.generic_visit(node)
+        swapped = self._BIN_SWAP.get(type(node.op))
+        if swapped:
+            if self.current == self.target:
+                self._mark_applied(node)
+                node.op = swapped()
+            self._note(f"ARITHMETIC:{type(node.op).__name__}")
             self.current += 1
         return self.generic_visit(node)
 
@@ -460,7 +580,7 @@ class _LogicalMutator(_BaseMutator):
         swapped = self._BOOL_SWAP.get(type(node.op))
         if swapped:
             if self.current == self.target:
-                self.applied = True
+                self._mark_applied(node)
                 node.op = swapped()
             self._note(f"LOGICAL:{type(node.op).__name__}")
             self.current += 1
@@ -471,11 +591,43 @@ class _LogicalMutator(_BaseMutator):
             return self.generic_visit(node)
         if isinstance(node.op, ast.Not):
             if self.current == self.target:
-                self.applied = True
+                self._mark_applied(node)
                 return self.generic_visit(node.operand)
             self._note("LOGICAL:Not")
             self.current += 1
         return self.generic_visit(node)
+
+
+def _stmt_label(node: ast.Expr) -> str:
+    """Dimension label for a deletable expression-statement — the callee name for a
+    call (so distinct side effects are distinct greedy dimensions), else the kind."""
+    if isinstance(node.value, ast.Call):
+        return _callee_name(node.value)
+    return type(node.value).__name__
+
+
+class _StmtMutator(_BaseMutator):
+    """Delete an expression-statement — a discarded-value call like ``log.info(x)``
+    or ``items.append(y)`` — by replacing it with ``pass``, asking whether the
+    statement's side effect is observable.
+
+    Only ``ast.Expr`` statements whose value is a real expression are targeted:
+    deleting a bound name (``x = ...``) would be a syntactic crash (NameError), not a
+    behavioral degree of freedom, so it is excluded (enumeration fidelity); a bare
+    constant ``Expr`` (docstring / no-op literal) has no side effect and is skipped.
+    """
+
+    def visit_Expr(self, node: ast.Expr) -> ast.AST:
+        if self.applied:
+            return node
+        if isinstance(node.value, ast.Constant):
+            return node  # docstring / bare literal — nothing to delete
+        if self.current == self.target:
+            self._mark_applied(node)
+            return ast.Pass()
+        self._note(f"STMT:{_stmt_label(node)}")
+        self.current += 1
+        return node
 
 
 # ── Mutant Generation ─────────────────────────────────────────────
@@ -536,7 +688,9 @@ def _count_value_target(
 def _count_boundary_target(node: ast.AST) -> int:
     if not isinstance(node, ast.Compare):
         return 0
-    return sum(1 for op in node.ops if type(op) in _BoundaryMutator._SWAP)
+    # One dimension per alternative per op (a dead op still notes once) — derive
+    # from _alternatives so this never drifts from _BoundaryMutator's _note count.
+    return sum(len(_BoundaryMutator._alternatives(op)) or 1 for op in node.ops)
 
 
 def _count_swap_target(node: ast.AST) -> int:
@@ -580,8 +734,15 @@ def _count_type_target(node: ast.AST) -> int:
 
 
 def _count_arithmetic_target(node: ast.AST) -> int:
-    """Count arithmetic mutation targets (BinOp + unary negation)."""
+    """Count arithmetic mutation targets (BinOp + AugAssign + unary negation).
+
+    Must stay in lockstep with ``_ArithmeticMutator``'s ``visit_*`` methods —
+    the count defines the index range generation iterates, and it has to equal
+    the number of ``_note`` calls the mutator makes over the same constructs.
+    """
     if isinstance(node, ast.BinOp) and type(node.op) in _ArithmeticMutator._BIN_SWAP:
+        return 1
+    if isinstance(node, ast.AugAssign) and type(node.op) in _ArithmeticMutator._BIN_SWAP:
         return 1
     if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.USub):
         return 1
@@ -597,6 +758,15 @@ def _count_logical_target(node: ast.AST) -> int:
     return 0
 
 
+def _count_stmt_target(node: ast.AST) -> int:
+    """Count deletable statements — non-constant expression-statements (side-effecting
+    calls). Must stay in lockstep with ``_StmtMutator``: docstrings / bare literals
+    are not side effects, and bound names are excluded (deletion would just crash)."""
+    if isinstance(node, ast.Expr) and not isinstance(node.value, ast.Constant):
+        return 1
+    return 0
+
+
 _TARGET_COUNTERS: dict[MutationCategory, Callable[[ast.AST], int]] = {
     MutationCategory.VALUE: _count_value_target,
     MutationCategory.BOUNDARY: _count_boundary_target,
@@ -605,7 +775,22 @@ _TARGET_COUNTERS: dict[MutationCategory, Callable[[ast.AST], int]] = {
     MutationCategory.TYPE: _count_type_target,
     MutationCategory.ARITHMETIC: _count_arithmetic_target,
     MutationCategory.LOGICAL: _count_logical_target,
+    MutationCategory.STMT: _count_stmt_target,
 }
+
+
+def _content_mutant_id(category: MutationCategory, mutated_node: ast.AST) -> str:
+    """A content-addressed, invocation-stable mutant id.
+
+    A short hash of the mutation's CONTENT — the mutated function's AST including source
+    locations — so the SAME mutation gets the SAME id in every mode, pass, and process.
+    Positional ``CATEGORY_i`` ids drift because greedy/fast passes emit different index
+    subsets, and the index carries no meaning; the content id does not drift, which is what
+    makes a cross-invocation reference to "this mutant" (the audit→flag handoff) resolvable.
+    """
+    content = ast.dump(mutated_node, include_attributes=True)
+    digest = hashlib.sha1(content.encode("utf-8"), usedforsecurity=False).hexdigest()[:8]
+    return f"{category.value}_{digest}"
 
 
 def _generate_state_mutants(
@@ -656,7 +841,7 @@ def _generate_state_mutants(
             ast.fix_missing_locations(mutated_node)
 
             if transformer.applied:
-                mid = f"{cat.value}_{mode}_{i}"
+                mid = _content_mutant_id(cat, mutated_node)
                 mutants.append(
                     Mutant(
                         category=cat,
@@ -665,6 +850,8 @@ def _generate_state_mutants(
                         description=f"{mid}: {desc}",
                         location=getattr(func_node, "lineno", 0),
                         mutant_id=mid,
+                        target_index=i,
+                        mutated_line=transformer.mutated_lineno,
                     )
                 )
 
@@ -729,6 +916,7 @@ _RECORD_MUTATOR_FACTORIES: dict[
     MutationCategory.LOGICAL: lambda ds: _LogicalMutator(-1),
     MutationCategory.SWAP: lambda ds: _SwapMutator(-1),
     MutationCategory.TYPE: lambda ds: _TypeMutator(-1),
+    MutationCategory.STMT: lambda ds: _StmtMutator(-1),
 }
 
 
@@ -907,7 +1095,7 @@ def generate_mutants(
             ast.fix_missing_locations(mutated_node)
 
             if transformer.applied:
-                mid = f"{cat.value}_{i}"
+                mid = _content_mutant_id(cat, mutated_node)
                 mutants.append(
                     Mutant(
                         category=cat,
@@ -916,6 +1104,8 @@ def generate_mutants(
                         description=f"{mid}: {desc}",
                         location=getattr(func_node, "lineno", 0),
                         mutant_id=mid,
+                        target_index=i,
+                        mutated_line=transformer.mutated_lineno,
                     )
                 )
 
@@ -955,6 +1145,8 @@ def _make_transformer(
         return _ArithmeticMutator(index), "replace arithmetic operator"
     if category == MutationCategory.LOGICAL:
         return _LogicalMutator(index), "replace logical operator"
+    if category == MutationCategory.STMT:
+        return _StmtMutator(index), "delete expression-statement"
     msg = f"Unknown category: {category}"
     raise ValueError(msg)
 
@@ -1374,13 +1566,20 @@ def evaluate_mutant(
     module namespace before invoking the test with zero args (standard pytest
     contract). The original function is restored after each test.
 
-    By default (``record_all_killers=False``) returns on the first killing
-    test (efficient — one killer proves the mutant is caught). With
-    ``record_all_killers=True`` (full-matrix mode) every test is run and
-    ``killed_by_tests`` records *all* killers — the per-test attribution a
-    greedy specification-convergence analysis needs. Full-matrix mode shares
-    ``timeout_ms`` across the whole test set, so callers must budget it for
-    the full suite.
+    Kill attribution follows VALUE-SPECIFICATION PRECEDENCE (crash-as-spec): an
+    *assertion* kill pins the return value, so it is the strongest verdict and
+    ends the search immediately. A *crash*/*timeout* kill only proves the mutant
+    runs differently — it does not pin the value — so it is provisional: the
+    search keeps going, looking for a later test that kills by assertion, and
+    only settles for the crash/timeout verdict once the covering tests are
+    exhausted. This makes ``killed_by`` independent of test order: a mutant that
+    ANY test kills by assertion is recorded value-killed, never a crash-survivor.
+
+    With ``record_all_killers=True`` (full-matrix mode) every test is run and
+    ``killed_by_tests`` records *all* killers; ``killed_by`` is ``"assertion"``
+    when any killer pinned the value, else the first reason. Full-matrix mode
+    shares ``timeout_ms`` across the whole test set, so callers must budget it
+    for the full suite.
     """
     start = time.monotonic()
 
@@ -1433,12 +1632,16 @@ def evaluate_mutant(
     try:
         # Run tests against mutated function
         killers: list[str] = []
-        first_reason: str | None = None
+        reasons: list[str] = []
+        first_reason: str | None = None  # provisional crash/timeout kill (no assertion yet)
+        first_killer: str | None = None
         for test_fn in test_functions:
             remaining_ms = timeout_ms - _elapsed(start)
             if remaining_ms <= 0:
                 if record_all_killers and killers:
                     break  # budget hit — keep the killers already collected
+                if first_reason is not None:
+                    break  # already have a crash/timeout kill; settle for it below
                 return MutantResult(
                     mutant=mutant,
                     killed=True,
@@ -1463,17 +1666,24 @@ def evaluate_mutant(
                 )
                 if result is not None:
                     tname = getattr(test_fn, "__name__", "unknown")
-                    if not record_all_killers:
+                    if record_all_killers:
+                        killers.append(tname)
+                        reasons.append(result)
+                        if first_reason is None:
+                            first_reason = result
+                    elif result == "assertion":
+                        # Strongest verdict: the value is pinned — stop here.
                         return MutantResult(
                             mutant=mutant,
                             killed=True,
-                            killed_by=result,
+                            killed_by="assertion",
                             test_name=tname,
                             elapsed_ms=_elapsed(start),
                         )
-                    killers.append(tname)
-                    if first_reason is None:
-                        first_reason = result
+                    elif first_reason is None:
+                        # Provisional crash/timeout kill — remember it, but keep
+                        # scanning: a later test may pin the value by assertion.
+                        first_reason, first_killer = result, tname
             finally:
                 _unpatch_mutant(patched, saved, patch_target, func_name)
 
@@ -1481,9 +1691,18 @@ def evaluate_mutant(
             return MutantResult(
                 mutant=mutant,
                 killed=True,
-                killed_by=first_reason,
+                killed_by=("assertion" if "assertion" in reasons else first_reason),
                 test_name=killers[0],
                 killed_by_tests=killers,
+                elapsed_ms=_elapsed(start),
+            )
+        if first_reason is not None:
+            # Killed, but only ever by crash/timeout — no test pinned the value.
+            return MutantResult(
+                mutant=mutant,
+                killed=True,
+                killed_by=first_reason,
+                test_name=first_killer,
                 elapsed_ms=_elapsed(start),
             )
         return MutantResult(mutant=mutant, killed=False, elapsed_ms=_elapsed(start))
@@ -1671,8 +1890,20 @@ def run_function_profiling(
     per_mutant_timeout_ms: float = 5000,
     budget_ms: float | None = None,
     mem_budget_mb: int | None = None,
+    max_per_category: int = 0,
+    pass_index: int = 0,
+    progress: Callable[[int, int, float], None] | None = None,
+    scope_tests: bool = True,
+    mutant_slice: tuple[int, int] | None = None,
+    precomputed_line_data: tuple[dict[str, list[int]], list[str]] | None = None,
+    pregenerated: list[Mutant] | None = None,
 ) -> ProfilingResult:
-    """Exhaustive profiling mode — generate all mutants, evaluate with optional budget.
+    """Profiling mode — generate mutants (exhaustive by default), evaluate with budget.
+
+    ``progress(done, total, elapsed_ms)`` — optional callback invoked before each mutant
+    evaluation AND once at the end (done == total). ``total`` is known up front (the
+    generated mutant count), so a caller can stream ``K/N`` with a running-average ETA and
+    a final completion line. Cheap: one function call per mutant; throttling is the caller's.
 
     Returns full survival profile with kill matrix for convergence analysis.
     Result has coverage_depth="profiled" and is_gateable=True.
@@ -1681,17 +1912,73 @@ def run_function_profiling(
         per_mutant_timeout_ms: Timeout for evaluating a single mutant.
         budget_ms: Optional total wall-clock budget. None means unlimited.
             When exceeded, returns partial results with budget_exhausted=True.
+        max_per_category: 0 (default) tests every mutant — exhaustive / comprehensive,
+            identical to classical mutation testing. N > 0 tests the N greedily-selected
+            (``(1−1/e)``-optimal) mutants per category — fast mode.
+        pass_index: Convergence pass; pass p draws the greedy window
+            [p·max_per_category, (p+1)·max_per_category), so successive passes extend
+            coverage rather than re-roll the same subset.
+        scope_tests: When True (default), each mutant is evaluated only against the tests
+            that EXECUTE its mutated line (test-impact selection) — a verdict-preserving
+            speedup, since a test that never runs the mutated line behaves identically under
+            the mutation. False evaluates every mutant against the full set (the A/B baseline
+            for verifying the scoping is bit-identical).
     """
     start = time.monotonic()
-    mutants = generate_mutants(func_node, categories)
+    # Reuse a caller's already-generated mutant list when given (an adaptive probe generates
+    # once and hands the same list to both the probe and the follow-up run), else generate.
+    # Deterministic, so the reused list is identical to a fresh generation here.
+    mutants = (
+        pregenerated
+        if pregenerated is not None
+        else generate_mutants(
+            func_node, categories, max_per_category=max_per_category, pass_index=pass_index
+        )
+    )
+    # Shard for parallel evaluation: generation is deterministic, so mutants[a:b] here is
+    # the SAME set a serial run would evaluate at those indices — a worker owns one slice
+    # and the parent merges. The baseline line-coverage/failing pass below still runs over
+    # the full test set (cheap, and each shard needs the same coverage map for scoping).
+    if mutant_slice is not None:
+        mutants = mutants[mutant_slice[0] : mutant_slice[1]]
 
     # Baseline line-coverage pass over the UNMUTATED function — the second
     # completeness axis. Each test runs once against the original under a tracer;
     # the mutation loop below stays untraced (and fast). Degrades to empty when the
     # original is unavailable, so existing callers/output are unchanged.
     exec_lines = sorted(_executable_lines(func_node))
-    line_cov = _trace_line_coverage(test_functions, original_func, set(exec_lines))
-    failing = _failing_on_baseline(test_functions, original_func)
+    if precomputed_line_data is not None:
+        # An adaptive-probe caller already ran this baseline over the same tests+function;
+        # reuse it so a probe + follow-up run don't trace line coverage twice. Deterministic,
+        # so the reused map is identical to what a fresh trace would produce here.
+        line_cov, failing = precomputed_line_data
+    else:
+        line_cov = _trace_line_coverage(test_functions, original_func, set(exec_lines))
+        failing = _failing_on_baseline(test_functions, original_func)
+
+    # Test-impact scoping. A test can only kill a mutant if it EXECUTES the mutated
+    # line, so evaluating each mutant against just the tests covering its line yields
+    # identical verdicts at a fraction of the cost. Kept verdict-EXACT vs the full run:
+    # a failing-on-baseline test kills every mutant it runs (it fails regardless), and the
+    # full path runs it against all mutants — so those tests are added to EVERY scoped set.
+    # Scoping is skipped (full set used) when line data is unavailable or a mutant did not
+    # report its line. Parametrized cases share a __name__, so one name maps to many fns.
+    tests_by_name: dict[str, list[Callable[..., None]]] = {}
+    for _tf in test_functions:
+        tests_by_name.setdefault(getattr(_tf, "__name__", "unknown"), []).append(_tf)
+    always_run = [fn for name in failing for fn in tests_by_name.get(name, [])]
+    covering_by_line: dict[int, list[Callable[..., None]]] = {}
+    if scope_tests and line_cov:
+        for tname, lines in line_cov.items():
+            fns = tests_by_name.get(tname, [])
+            for ln in lines:
+                covering_by_line.setdefault(ln, []).extend(fns)
+
+    def _tests_for(mutant: Mutant) -> list[Callable[..., None]]:
+        if not scope_tests or not line_cov or mutant.mutated_line is None:
+            return test_functions  # cannot scope safely — run the full set
+        covering = covering_by_line.get(mutant.mutated_line, [])
+        return covering + always_run if always_run else covering
 
     results_by_cat: dict[MutationCategory, CategoryResult] = {}
     kill_matrix: dict[str, list[str]] = {}
@@ -1708,7 +1995,10 @@ def run_function_profiling(
     source_path = func_key.split("::", 1)[0] if "::" in func_key else None
 
     mem_budget = _resolve_budget(mem_budget_mb)
+    total_m = len(mutants)
     for count, mutant in enumerate(mutants):
+        if progress is not None:
+            progress(count, total_m, _elapsed(start))
         if budget_ms is not None and _elapsed(start) > budget_ms:
             budget_exhausted = True
             break
@@ -1723,7 +2013,7 @@ def run_function_profiling(
         try:
             result = evaluate_mutant(
                 mutant,
-                test_functions,
+                _tests_for(mutant),
                 original_func,
                 timeout_ms=per_mutant_timeout_ms,
                 qualname=qualname,
@@ -1766,6 +2056,9 @@ def run_function_profiling(
                 cr.timed_out += 1
             if result.test_name:
                 kill_matrix.setdefault(mutant.description, []).append(result.test_name)
+            # Carry diff_summary on EVERY kill: a crash/timeout kill is a value-survivor
+            # (see ProfilingResult.value_survivor_records) and needs the diff for a
+            # value-distinguishing witness search downstream.
             killed_records.append(
                 {
                     "mutant_id": mutant.mutant_id,
@@ -1773,6 +2066,7 @@ def run_function_profiling(
                     "category": mutant.category.value,
                     "killed_by": result.killed_by,
                     "test": result.test_name,
+                    "diff_summary": _mutant_diff(mutant),
                     "elapsed_ms": round(result.elapsed_ms, 1),
                 }
             )
@@ -1788,6 +2082,8 @@ def run_function_profiling(
                 }
             )
 
+    if progress is not None:
+        progress(total_m, total_m, _elapsed(start))
     per_cat = list(results_by_cat.values())
     total = sum(cr.total for cr in per_cat)
     killed = sum(cr.killed for cr in per_cat)
@@ -1809,6 +2105,7 @@ def run_function_profiling(
         line_coverage=line_cov,
         executable_lines=exec_lines,
         failing_tests=failing,
+        tests_discovered=len(test_functions),
     )
 
 
@@ -1825,6 +2122,58 @@ def estimate_universe_size(
     report sampling coverage: tested/killed out of universe_size.
     """
     return sum(_count_targets(func_node, cat) for cat in categories)
+
+
+def coverage_floor(
+    target_counts: tuple[int, ...],
+    max_per_category: int,
+    passes: int,
+) -> float:
+    """Provable LOWER BOUND on behavioral-dimension coverage for a greedy run.
+
+    Each entry of ``target_counts`` is one category's mutant universe — an
+    independent maximum-coverage problem. With budget ``max_per_category`` = k
+    over ``passes`` = N, greedy selection takes ``min(target, N*k)`` mutants per
+    category by marginal behavioral-dimension coverage. Two regimes follow:
+
+    * A category whose universe fits the budget (``target <= N*k``, or
+      ``k == 0`` = comprehensive) is covered **exhaustively** → 1.0.
+    * A larger one is covered to ``>= 1 - (1/e)**N`` of its optimally-coverable
+      dimensions: the per-pick optimality-gap contraction ``g_{i+1} <= (1-1/k)
+      g_i`` (greedy_coverage_bound.lean) compounds to ``<= e**-N`` after the
+      ``N*k`` picks accrued across passes.
+
+    The result is the universe-weighted mean of those per-category guarantees —
+    the fraction of the DOF space the greedy run provably reaches. It is a
+    *floor*: the measured kill rate meets or beats it. Deterministic, no I/O.
+    """
+    universe = sum(target_counts)
+    if universe == 0:
+        return 1.0
+    exhaustive = max_per_category <= 0
+    per_pass_floor = 1.0 - (1.0 / math.e) ** passes if passes > 0 else 0.0
+    covered = 0.0
+    for target in target_counts:
+        if target <= 0:
+            continue
+        selected = target if exhaustive else min(target, passes * max_per_category)
+        covered += target if selected >= target else target * per_pass_floor
+    return covered / universe
+
+
+def greedy_coverage_guarantee(
+    func_node: ast.FunctionDef,
+    categories: set[MutationCategory],
+    max_per_category: int,
+    passes: int,
+) -> float:
+    """Coverage floor (see :func:`coverage_floor`) over a function's categories.
+
+    Reuses the same per-category target counts as :func:`estimate_universe_size`
+    so the guarantee's denominator matches the reported DOF universe exactly.
+    """
+    counts = tuple(_count_targets(func_node, cat) for cat in categories)
+    return coverage_floor(counts, max_per_category, passes)
 
 
 # ── Equivalence Detection ────────────────────────────────────────

@@ -13,15 +13,22 @@ a GUARANTEE rather than trusting scope and process-exit:
   * when a run crosses the budget it stops accumulating and reclaims — the caller
     dumps transient state instead of climbing past the ceiling.
 
-Stdlib only (``os`` + ``resource``); no psutil dependency.
+Stdlib only (``os`` + ``resource``); no psutil dependency. ``resource`` is Unix-only,
+so it is imported defensively: on Windows the RSS self-check degrades to a no-op and the
+memory guarantee rests on static worker-count admission (see ``worker_count``), which needs
+only arithmetic and is identical on every OS.
 """
 
 from __future__ import annotations
 
 import gc
 import os
-import resource
 import sys
+
+try:
+    import resource  # Unix only — absent on Windows.
+except ImportError:  # pragma: no cover — exercised only on Windows
+    resource = None  # type: ignore[assignment]
 
 _MB = 1024 * 1024
 _GB = 1024 * _MB
@@ -32,6 +39,15 @@ _GB = 1024 * _MB
 _DEFAULT_FRACTION = 8
 _DEFAULT_FLOOR = 256 * _MB
 _DEFAULT_CEILING = 2 * _GB
+
+# Parallel profiling budgets the WHOLE fleet, not one process, so it may claim a larger
+# slice of RAM (a quarter, higher ceiling) than the single-process default — still a
+# minority of a big box. ``per_worker_peak`` is the conservative RSS a worker may reach;
+# the fleet is sized so ``workers × peak <= budget`` BY CONSTRUCTION (the portable
+# guarantee), independent of any OS resource limit.
+_PARALLEL_FRACTION = 4
+_PARALLEL_CEILING = 8 * _GB
+_DEFAULT_WORKER_PEAK = 512 * _MB
 
 
 def system_memory_bytes() -> int:
@@ -72,7 +88,11 @@ def process_rss_bytes() -> int:
     """This process's peak resident set size. ``ru_maxrss`` is bytes on macOS and
     kilobytes on Linux — normalized to bytes. Peak (not instantaneous) is the
     conservative signal: once the peak crosses the budget the run has already
-    demanded that much, so stopping there is the guarantee."""
+    demanded that much, so stopping there is the guarantee. Returns 0 where
+    ``resource`` is unavailable (Windows) — the self-check simply never fires and the
+    static worker-count admission carries the memory guarantee instead."""
+    if resource is None:
+        return 0
     peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
     return peak if sys.platform == "darwin" else peak * 1024
 
@@ -88,6 +108,64 @@ def reclaim() -> None:
     dropped — the "dump" half of the guard, made explicit rather than left to the
     collector's own schedule."""
     gc.collect()
+
+
+def parallel_budget_bytes(system_bytes: int | None = None) -> int:
+    """Total RAM the whole worker fleet may claim — ``system_RAM / 4`` clamped to
+    [256 MB, 8 GB]. Larger than the single-process default (it budgets many workers) but
+    still a minority of a big box. Pure in ``system_bytes`` for testability."""
+    total = system_bytes if system_bytes is not None else system_memory_bytes()
+    return max(_DEFAULT_FLOOR, min(total // _PARALLEL_FRACTION, _PARALLEL_CEILING))
+
+
+def available_cores() -> int:
+    """Usable CPU count, leaving 2 for the OS + the parent; at least 1."""
+    return max(1, (os.cpu_count() or 2) - 2)
+
+
+def worker_count(
+    per_worker_peak: int | None = None,
+    cores: int | None = None,
+    budget_bytes: int | None = None,
+) -> int:
+    """The PORTABLE memory guarantee: how many workers fit without exceeding the fleet
+    budget, ``min(cores, ⌊budget / per_worker_peak⌋)``, at least 1.
+
+    Because each worker is admitted only if ``workers × per_worker_peak <= budget``, the
+    fleet's total memory is bounded BY CONSTRUCTION — no OS resource limit required, so the
+    guarantee holds identically on Mac, Windows and Linux. Deterministic per machine: the
+    same box always plans the same fleet. ``resolve_budget`` env/explicit override still
+    applies (a user capping ``WESKER_MEM_BUDGET_MB`` shrinks the fleet accordingly)."""
+    peak = per_worker_peak or _DEFAULT_WORKER_PEAK
+    cores = available_cores() if cores is None else max(1, cores)
+    # Honour an explicit/env budget override, else the parallel (fleet) budget.
+    explicit = resolve_budget()
+    budget = budget_bytes if budget_bytes is not None else (
+        explicit if explicit != default_budget_bytes() else parallel_budget_bytes()
+    )
+    by_mem = max(1, budget // max(1, peak))
+    return max(1, min(cores, by_mem))
+
+
+def apply_address_limit(peak_bytes: int | None = None) -> bool:
+    """Best-effort per-process address-space cap (``RLIMIT_AS``) — a runaway allocation
+    then fails as a catchable ``MemoryError`` (a deterministic resource-guard kill) rather
+    than an OOM. Returns whether the limit was actually applied.
+
+    This is a Linux BONUS, not the guarantee: macOS often rejects lowering ``RLIMIT_AS``
+    and Windows has no ``resource`` module, so it degrades to a no-op there. The portable
+    guarantee is the static ``worker_count`` admission; this only hardens it where the OS
+    cooperates. Never raises — a platform that refuses the limit is not an error."""
+    if resource is None:
+        return False
+    cap = peak_bytes or _DEFAULT_WORKER_PEAK
+    try:
+        _soft, hard = resource.getrlimit(resource.RLIMIT_AS)
+        new_hard = hard if hard != resource.RLIM_INFINITY and hard < cap else cap
+        resource.setrlimit(resource.RLIMIT_AS, (cap, new_hard))
+        return True
+    except (ValueError, OSError, AttributeError):
+        return False
 
 
 def telemetry(budget_bytes: int | None = None) -> str:

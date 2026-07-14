@@ -184,14 +184,21 @@ def _build_static_impact_map(test_files: list[str]) -> dict[str, list[str]]:
 
 
 def _discover_all_test_files(project_root: str) -> list[str]:
-    """Find all test_*.py files under tests/."""
+    """Find all ``test_*.py`` files ANYWHERE in the project — matching pytest's default
+    collection, not just ``tests/`` — so a fresh install without the pytest extra still
+    discovers root-level and package-level tests through the legacy loader (otherwise a
+    user whose tests live at the repo root gets a misleading 0% kill rate)."""
+    skip = {
+        ".git", ".venv", "venv", "env", "__pycache__", ".tox", ".mypy_cache",
+        ".pytest_cache", "build", "dist", "node_modules", ".serena", ".lintgate",
+    }
+    root = Path(project_root)
     found: list[str] = []
-    tests_dir = Path(project_root) / "tests"
-    if not tests_dir.is_dir():
-        return found
-    for py in sorted(tests_dir.rglob("*.py")):
-        if py.name.startswith("test_") and "__pycache__" not in str(py):
-            found.append(str(py))
+    for py in sorted(root.rglob("test_*.py")):
+        rel = py.relative_to(root)
+        if any(part in skip or part.startswith(".") for part in rel.parts[:-1]):
+            continue
+        found.append(str(py))
     return found
 
 
@@ -235,9 +242,19 @@ def discover_tests(
 # ── Test callable loading ────────────────────────────────────────
 
 
-def load_test_callables(test_files: list[str]) -> list[Any]:
-    """Load all test_* callables from test files, including class methods."""
+def load_test_callables(test_files: list[str], project_root: str | None = None) -> list[Any]:
+    """Load all test_* callables from test files, including class methods.
+
+    Intra-project imports in a test (``from calc import add``) resolve only if the code's
+    directory is importable, so the project root and each test file's own directory are
+    put on ``sys.path`` before import — the rootdir insertion pytest does for you, which
+    the legacy loader must do itself (else a fresh no-pytest user gets import errors and a
+    misleading 0% kill rate)."""
     callables: list[Any] = []
+    for path in filter(None, [project_root, *(str(Path(tf).parent) for tf in test_files)]):
+        ap = os.path.abspath(path)
+        if ap not in sys.path:
+            sys.path.insert(0, ap)
     for tf in test_files:
         # Key the module cache on file CONTENT, not just its stem. A long-lived
         # process (or a converge loop) rewrites generated test files in place; a
@@ -296,6 +313,7 @@ def discover_test_callables(
     source_file: str,
     func_names: list[str],
     backend: str = "auto",
+    extra_dirs: list[str] | None = None,
 ) -> list[Any]:
     """Discover runnable test callables — a dial over two backends.
 
@@ -308,25 +326,49 @@ def discover_test_callables(
     pytest is the preferred/main path; the legacy loader stays intact as the
     fallback, so projects without pytest — or that pytest cannot collect —
     behave exactly as before.
+
+    ``extra_dirs`` are additional roots to collect from, beyond ``project_root``
+    — used when a caller wrote tests OUTSIDE the project tree (e.g. converge's
+    ``--write-dir`` pointing at a scratch dir) and the kill count must still
+    reflect them. Without this, tests written out-of-tree are invisible to
+    discovery and the run reports a misleading 0% — the opposite of honest.
     """
+    # Only EXISTING extra roots: a caller (converge) may pass its write-dir before
+    # it has written anything there (the first profiling pass runs BEFORE tests are
+    # written). Passing a nonexistent path to pytest's collector aborts collection
+    # entirely → silent fallback to the legacy loader → a DIFFERENT test set and
+    # inconsistent survivor counts. Filtering by existence is correct by lifecycle:
+    # skip the empty/not-yet-created dir early, include it once tests land there.
+    extra = [os.path.abspath(d) for d in (extra_dirs or []) if os.path.isdir(d)]
     if backend in ("auto", "pytest"):
         try:
             from Wesker.pytest_discovery import collect_pytest_callables
 
-            collected = collect_pytest_callables(project_root)
+            # "." resolves to project_root inside the collector's chdir; the extra
+            # roots are absolute so they collect regardless of cwd. No overlap with
+            # "." when out-of-tree, so no double-collection.
+            collected = collect_pytest_callables(project_root, paths=["."] + extra if extra else None)
         except Exception:
             collected = None
         if collected:
             return collected
         if backend == "pytest":
             return []
-    # Legacy fallback: hand-rolled discovery + loader.
+    # Legacy fallback: hand-rolled discovery + loader. Union the project-tree test
+    # files with any found under the extra roots so out-of-tree tests still load.
     full_path = (
         os.path.join(project_root, source_file)
         if not os.path.isabs(source_file)
         else source_file
     )
-    return load_test_callables(discover_tests(project_root, full_path, func_names))
+    files = discover_tests(project_root, full_path, func_names)
+    seen = set(files)
+    for d in extra:
+        for tf in _discover_all_test_files(d):
+            if tf not in seen:
+                files.append(tf)
+                seen.add(tf)
+    return load_test_callables(files, project_root)
 
 
 # ── AST utilities ────────────────────────────────────────────────

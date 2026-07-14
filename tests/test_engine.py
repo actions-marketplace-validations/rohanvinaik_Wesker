@@ -41,8 +41,9 @@ def _fn(src: str) -> ast.FunctionDef:
 
 
 def _selected_indices(mutants) -> set[int]:
-    """Recover target indices from mutant ids like ``VALUE_3`` / ``STATE_return_none_0``."""
-    return {int(m.mutant_id.rsplit("_", 1)[1]) for m in mutants}
+    """The positional target indices selected — now a first-class ``target_index`` field
+    (``mutant_id`` is content-addressed, so the ordinal no longer lives in the id string)."""
+    return {m.target_index for m in mutants}
 
 
 # ── _is_dead ──────────────────────────────────────────────────────
@@ -89,20 +90,31 @@ def test_record_dimensions_keys_carry_construct_kind():
         """
     )
     keys = _record_dimensions(func, MutationCategory.BOUNDARY, set())
-    assert keys == ["BOUNDARY:Lt", "BOUNDARY:Gt", "BOUNDARY:Eq"]
+    # Orderings carry two dimensions — boundary shift + direction reversal;
+    # equality carries only the flip.
+    assert keys == [
+        "BOUNDARY:Lt",
+        "BOUNDARY:Lt~dir",
+        "BOUNDARY:Gt",
+        "BOUNDARY:Gt~dir",
+        "BOUNDARY:Eq",
+    ]
 
 
-def test_record_dimensions_marks_non_swappable_ops_dead():
-    # `is` / `in` have no boundary mutant → dead key, but still one entry per op.
+def test_record_dimensions_identity_membership_are_live_boundary_dims():
+    # `is` / `in` are now mutable comparison ops (predicate flip) → live BOUNDARY
+    # dims, one per op. Previously these produced a dead key; that blind spot is closed.
     func = _fn(
         """
-        def f(a, b):
-            return a is None, a < b
+        def f(a, b, xs):
+            return a is None, a in xs, a < b
         """
     )
     keys = _record_dimensions(func, MutationCategory.BOUNDARY, set())
-    assert _DEAD_DIM in keys
+    assert "BOUNDARY:Is" in keys
+    assert "BOUNDARY:In" in keys
     assert "BOUNDARY:Lt" in keys
+    assert _DEAD_DIM not in keys  # every comparison op is now swappable
 
 
 def test_record_dimensions_value_keys_by_python_type():
@@ -205,7 +217,9 @@ def test_select_greedy_covers_all_indices_when_keys_short():
 
 
 def test_generate_mutants_greedy_spans_dimensions_under_budget():
-    # 4x Lt, 1x Gt, 1x Eq; budget 3 must hit all three boundary kinds.
+    # 4x Lt, 1x Gt, 1x Eq → dimension KINDS {Lt, Lt~dir, Gt, Gt~dir, Eq}.
+    # Greedy submodular coverage ((1-1/e)-optimal) must spend a budget of 3 on 3
+    # DISTINCT dimension kinds — never clustering redundant instances of one kind.
     func = _fn(
         """
         def f(a, b, c, d, e, g):
@@ -217,8 +231,8 @@ def test_generate_mutants_greedy_spans_dimensions_under_budget():
         func, {MutationCategory.BOUNDARY}, max_per_category=3, greedy=True
     )
     dims = {keys[i] for i in _selected_indices(muts)}
-    assert dims == {"BOUNDARY:Lt", "BOUNDARY:Gt", "BOUNDARY:Eq"}
     assert len(muts) == 3
+    assert len(dims) == 3  # 3 distinct kinds — maximal coverage under the budget
 
 
 def test_generate_mutants_passes_are_disjoint():
@@ -239,7 +253,9 @@ def test_generate_mutants_passes_are_disjoint():
         )
     )
     assert p0.isdisjoint(p1)
-    assert p0 | p1 == set(range(6))
+    # Two consecutive budget-windows of the greedy order: disjoint, each of size 3.
+    assert len(p0) == 3 and len(p1) == 3
+    assert len(p0 | p1) == 6
 
 
 def test_generate_mutants_greedy_false_uses_ast_order():
@@ -263,7 +279,9 @@ def test_generate_mutants_exhaustive_ignores_selection():
         """
     )
     muts = generate_mutants(func, {MutationCategory.BOUNDARY}, max_per_category=0)
-    assert _selected_indices(muts) == set(range(6))
+    # Exhaustive covers every target dimension, whatever the count.
+    n = _count_targets(func, MutationCategory.BOUNDARY)
+    assert _selected_indices(muts) == set(range(n))
 
 
 # ── STATE greedy (attribute diversity) ───────────────────────────

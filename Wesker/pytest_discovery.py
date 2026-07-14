@@ -132,17 +132,23 @@ def collect_pytest_callables(
         def pytest_collection_modifyitems(self, session, config, items) -> None:
             self.items = list(items)
 
-    # Evict already-imported test modules whose source lives under this root so
-    # pytest re-imports the CURRENT on-disk file. Repeated in-process collections
-    # otherwise serve a rewritten generated test file stale from sys.modules —
-    # hiding freshly written killing tests as false survivors. Only test_* modules
-    # under the root are dropped, so unrelated imports are untouched.
-    root_abs = os.path.abspath(project_root)
+    # Evict already-imported test modules whose source lives under any collection
+    # root so pytest re-imports the CURRENT on-disk file. Repeated in-process
+    # collections otherwise serve a rewritten generated test file stale from
+    # sys.modules — hiding freshly written killing tests as false survivors. Only
+    # test_* modules under a root are dropped, so unrelated imports are untouched.
+    # Extra roots (absolute paths in ``paths``) are included so tests written
+    # OUT-OF-TREE — e.g. converge's --write-dir on a scratch dir — are re-imported
+    # too; otherwise the out-of-tree fix would still serve stale survivors.
+    roots = [os.path.abspath(project_root)]
+    roots += [os.path.abspath(p) for p in (paths or []) if os.path.isabs(p)]
     for _name in list(sys.modules):
         _mod = sys.modules.get(_name)
         _f = getattr(_mod, "__file__", None)
-        if _f and os.path.basename(_f).startswith("test_") and os.path.abspath(_f).startswith(root_abs):
-            del sys.modules[_name]
+        if _f and os.path.basename(_f).startswith("test_"):
+            _fa = os.path.abspath(_f)
+            if any(_fa.startswith(r) for r in roots):
+                del sys.modules[_name]
     importlib.invalidate_caches()
 
     plugin = _Collect()
