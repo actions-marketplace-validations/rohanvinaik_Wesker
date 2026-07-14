@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "Wesker"
-version = "0.1.0"
+version = "0.3.0"
 description = "In-process AST mutation testing for Python. Zero dependencies."
 readme = "README.md"
 license = "MIT"
@@ -31,7 +31,13 @@ wesker = "Wesker.cli:main"
 Homepage = "https://github.com/rohanvinaik/Wesker"
 Repository = "https://github.com/rohanvinaik/Wesker"
 
-# Runtime is zero-dependency by design; the test framework is dev-only.
+# The engine core is zero-dependency by design. pytest is a STATED OPTIONAL extra: the
+# preferred test-discovery path uses pytest's own collection (robust across parametrize /
+# fixtures / conftest — the conventions real projects use); without it the engine degrades
+# to a legacy unittest loader. `pip install Wesker[pytest]` opts into the preferred path.
+[project.optional-dependencies]
+pytest = ["pytest>=7"]
+
 [dependency-groups]
 # ruff pinned so CI's `ruff format --check` gate cannot drift on a newer release.
 dev = ["pytest>=7", "pytest-cov>=4", "ruff==0.14.10"]
