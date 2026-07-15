@@ -174,8 +174,23 @@ def test_greedy_order_sinks_dead_keys_to_end():
 
 
 def test_greedy_order_is_deterministic():
+    """Pins the ORDER, not merely that two calls agree.
+
+    This asserted ``f(keys) == f(keys)``, which can only fail if the function reaches for
+    randomness or global state — it cannot see a changed order, because both sides change
+    together. The claim being made is stronger than that ("Fully deterministic" means a
+    SPECIFIC order, stable across runs and processes), so the expected value is written
+    down.
+
+    And the value is the round-robin itself: one index per distinct dimension (A B C)
+    before any dimension repeats, then the second of each, then the tail. That ordering is
+    what makes ``m = D`` cover every dimension exactly once — the 1.00-mutants-per-dimension
+    result rests on this list being exactly this.
+    """
     keys = ["A", "B", "A", "C", "B", "A"]
-    assert _greedy_dimension_order(keys) == _greedy_dimension_order(keys)
+    order = _greedy_dimension_order(keys)
+    assert order == [0, 1, 3, 2, 4, 5]
+    assert [keys[i] for i in order] == ["A", "B", "C", "A", "B", "A"]
 
 
 def test_greedy_order_empty():

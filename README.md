@@ -24,51 +24,49 @@ $$\mathrm{SC}(f)=1 \quad\Longleftrightarrow\quad \underbrace{\log_2\bigl\lvert\,
 
 </div>
 
-Mutation testing is the gold standard for measuring what your tests actually pin down: change the code, and see whether a test complains. Every mutation that slips through silently is a behavior your suite never constrained — a gap line coverage cannot see. DeMillo, Lipton, and Sayward formalized this in 1978.
+Mutation testing measures what your tests actually pin down: change the code, see whether a
+test complains. Every mutation that slips through silently is a behavior your suite never
+constrained — a gap line coverage cannot see. DeMillo, Lipton and Sayward formalized it in 1978.
 
-The cost has always been the objection, and the established tools have gotten fast: mutmut 3 pools workers and clears thousands of mutants a minute on a quick suite. But speed was only ever half the problem. The other half is that the *denominator is an artifact*. Enumerate every change an operator can express and you count the same gap many times over — most loudly in code with no tests at all, where every mutant survives and each one restates the identical fact. The number that comes out is weighted by the operator's enumeration, not by your code's behavior.
+Cost was always the objection, and the tools got fast. mutmut 3 pools workers and clears
+thousands of mutants a minute. But speed was only half the problem.
 
-Wesker counts the questions instead of the phrasings. It refuses to do work that provably
-cannot change a result, and spends what remains on one mutant per behavioral dimension —
-which is not a heuristic but the optimum, and the run below shows it reached exactly.
+**The other half: the denominator is an artifact.** Enumerate every change an operator can
+express and you count the same gap many times over. What comes out is weighted by the
+operator's enumeration — not by your code.
+
+**Wesker counts the questions instead of the phrasings.**
 
 ```
-Detective — 23 files, 209 functions                     mutants   per dimension
+Detective · 25 files · 271 functions
 
-  behavioral dimensions (the distinct questions)          2,210            —
-
-  mutmut 3      every mutant its operators can write      8,657         3.92
-  Wesker        exhaustive — the same thing, our operators 4,366         1.98
-  Wesker        DOF mode — one mutant per dimension        2,210         1.00
+  the questions            2,795
+  ─────────────────────────────────
+                   mutants  per dim
+  mutmut 3           8,657     3.10
+  Wesker exhaustive  5,693     2.04
+  Wesker DOF         2,795     1.00
 ```
 
-**2,210 questions. mutmut asks them 8,657 times.**
+**2,795 questions. mutmut asks them 8,657 times.**
 
-A mutation tester asks: *does your suite notice if I change this?* Some changes ask the
-same question. If a return value is unconstrained, the operator can express that one gap
-forty different ways and hand you forty survivors — forty copies of one fact. Your score
-is then weighted by how many ways the operator happened to enumerate each gap, which is a
-property of the operator, not of your code.
+Some changes ask the same question. An unconstrained return value can be phrased forty
+ways — forty survivors, one fact. The score is weighted by the operator's enumeration,
+not by your code.
 
-Count the questions instead of the phrasings and Detective has **2,210** of them. mutmut
-evaluates 8,657 mutants to answer them — **3.92 per question**. Its own output shows why:
-**4,212 of those 8,657 (49%) are in code with no test at all** — one fact, *"this code is
-untested,"* reported four thousand times.
+**Half of mutmut's universe is a single fact.** 4,212 of its 8,657 mutants are in code
+with no test at all — *"this is untested,"* reported four thousand times.
 
-Wesker's exhaustive mode is the same idea with tighter operators: 4,366 mutants, 1.98 per
-dimension. Anyone could build that. **DOF mode is the contribution — 2,210 mutants for
-2,210 dimensions. 1.00. Exactly one mutant per question, measured on a real repository.**
+Exhaustive mode is the ceiling: every mutant, 2.04 per question. **DOF mode is the claim —
+2,795 mutants, 2,795 questions, 1.00.** One mutant per question, on a real repository.
 
-That 1.00 is not a target that was tuned toward. Cover sets here are singletons, so greedy
-selection is *provably optimal* — not the (1−1/e) that bounds general submodular covers,
-but exact. The theorem says one mutant per dimension is achievable; the run says it was
-achieved. **A proof and its receipt.**
+That 1.00 was not tuned toward. Cover sets here are singletons, so greedy is **exactly**
+optimal — not the (1−1/e) that bounds general submodular covers. The theorem says
+one-per-dimension is achievable. The run says achieved.
 
-And it costs nothing in what you learn: DOF mode reproduces the exhaustive run's
-dimension-level verdict with **98.26% agreement and zero false "specified" claims** — it
-never tells you a behavior is pinned when it isn't. Where it differs, it *under*-claims.
-Run `--complete` and the naive result comes back unchanged; that mode is not a fallback,
-it's the receipt you're invited to check.
+And it costs nothing: DOF reproduces the exhaustive verdict with **98.26% agreement and
+zero false "specified" claims**. Where it differs it *under*-claims. Run `--complete` and
+the ceiling comes back unchanged — it isn't a fallback, it's the receipt.
 
 ---
 
@@ -151,14 +149,16 @@ Wesker costs
 
 $$O\big(\text{functions} \times \text{applicable mutants} \times \text{in-process toggle} \times \text{covering tests}\big).$$
 
-Measured on Detective (23 files, 209 functions), mutmut 3.6 against Wesker on the same
-package:
+Measured on Detective, mutmut 3.6 against Wesker over a BYTE-IDENTICAL target set — the
+same 25 files, 271 functions. (An earlier draft of this table read 3.92, because mutmut had
+been pointed at `Detective/` recursively and Wesker at `Detective/*.py`. Same story, wrong
+number; the mismatch inflated it by a quarter.)
 
 | Factor | mutmut 3 | Wesker | Ratio |
 |--------|----------|--------|-------|
-| Behavioral dimensions (the questions) | — | **2,210** | — |
-| Mutants written | 8,657 | 4,366 exhaustive · **2,210 DOF** | — |
-| **Mutants per dimension** | **3.92** | 1.98 exhaustive · **1.00 DOF** | **3.9×** |
+| Behavioral dimensions (the questions) | — | **2,795** | — |
+| Mutants written | 8,657 | 5,693 exhaustive · **2,795 DOF** | — |
+| **Mutants per dimension** | **3.10** | 2.04 exhaustive · **1.00 DOF** | **3.1×** |
 | Mutants in untested code | **4,212 (49%)** | — | one fact, 4,212 times |
 | Dimension-verdict agreement vs exhaustive | — | **98.26%**, zero false "specified" | — |
 

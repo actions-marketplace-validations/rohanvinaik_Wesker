@@ -3299,7 +3299,13 @@ def run_function_converged(
     )
     # func_key = 'rel/path.py::Qualname' — the (project-relative) source path callers know but do not
     # pass to evaluate_mutant (original_func is stubbed by some callers, so its co_filename is useless).
-    source_path = func_key.split("::", 1)[0] if "::" in func_key else None
+    # An EXPLICIT source_path wins: this line used to overwrite the parameter unconditionally, so a
+    # caller that passed one had it silently discarded — two individually-correct commits (the param,
+    # then the derivation) colliding where they met. No caller passes it today, which is exactly why
+    # it went unnoticed; the next one would have debugged the wrong thing.
+    source_path = source_path or (
+        func_key.split("::", 1)[0] if "::" in func_key else None
+    )
 
     # Test-impact scoping (shared with run_function_profiling — one implementation, so
     # the two paths cannot drift on soundness). Engages only when ``original_func`` is a
