@@ -189,8 +189,19 @@ def _discover_all_test_files(project_root: str) -> list[str]:
     discovers root-level and package-level tests through the legacy loader (otherwise a
     user whose tests live at the repo root gets a misleading 0% kill rate)."""
     skip = {
-        ".git", ".venv", "venv", "env", "__pycache__", ".tox", ".mypy_cache",
-        ".pytest_cache", "build", "dist", "node_modules", ".serena", ".lintgate",
+        ".git",
+        ".venv",
+        "venv",
+        "env",
+        "__pycache__",
+        ".tox",
+        ".mypy_cache",
+        ".pytest_cache",
+        "build",
+        "dist",
+        "node_modules",
+        ".serena",
+        ".lintgate",
     }
     root = Path(project_root)
     found: list[str] = []
@@ -242,7 +253,9 @@ def discover_tests(
 # ── Test callable loading ────────────────────────────────────────
 
 
-def load_test_callables(test_files: list[str], project_root: str | None = None) -> list[Any]:
+def load_test_callables(
+    test_files: list[str], project_root: str | None = None
+) -> list[Any]:
     """Load all test_* callables from test files, including class methods.
 
     Intra-project imports in a test (``from calc import add``) resolve only if the code's
@@ -251,7 +264,9 @@ def load_test_callables(test_files: list[str], project_root: str | None = None) 
     the legacy loader must do itself (else a fresh no-pytest user gets import errors and a
     misleading 0% kill rate)."""
     callables: list[Any] = []
-    for path in filter(None, [project_root, *(str(Path(tf).parent) for tf in test_files)]):
+    for path in filter(
+        None, [project_root, *(str(Path(tf).parent) for tf in test_files)]
+    ):
         ap = os.path.abspath(path)
         if ap not in sys.path:
             sys.path.insert(0, ap)
@@ -347,7 +362,9 @@ def discover_test_callables(
             # "." resolves to project_root inside the collector's chdir; the extra
             # roots are absolute so they collect regardless of cwd. No overlap with
             # "." when out-of-tree, so no double-collection.
-            collected = collect_pytest_callables(project_root, paths=["."] + extra if extra else None)
+            collected = collect_pytest_callables(
+                project_root, paths=["."] + extra if extra else None
+            )
         except Exception:
             collected = None
         if collected:

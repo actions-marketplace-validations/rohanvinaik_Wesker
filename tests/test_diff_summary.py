@@ -29,7 +29,11 @@ def test_mutant_diff_shows_the_change():
 def test_survivor_records_include_diff_summary():
     ns: dict = {}
     exec(_SRC, ns)  # noqa: S102
-    node = next(n for n in ast.parse(_SRC).body if isinstance(n, ast.FunctionDef) and n.name == "in_range")
+    node = next(
+        n
+        for n in ast.parse(_SRC).body
+        if isinstance(n, ast.FunctionDef) and n.name == "in_range"
+    )
     pr = run_function_profiling(
         node, "m::in_range", filter_categories(node), [ns["test_runs"]], ns["in_range"]
     )

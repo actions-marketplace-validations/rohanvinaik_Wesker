@@ -124,7 +124,9 @@ def test_budget_selects_one_mutant_per_dimension(src, category):
     d = dimension_budget(node, category)
     mutants = generate_mutants(node, {category}, max_per_category=None)
     dims = [m.dimension for m in mutants]
-    assert len(set(dims)) == d, f"expected {d} distinct dimensions, got {sorted(set(dims))}"
+    assert len(set(dims)) == d, (
+        f"expected {d} distinct dimensions, got {sorted(set(dims))}"
+    )
     assert len(dims) == len(set(dims)), f"a dimension was covered twice: {dims}"
 
 

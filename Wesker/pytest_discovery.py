@@ -23,6 +23,7 @@ after collection, so supplying those in-process is a follow-up. This backend is
 additive — the original loader stays as the fallback (see
 ``ci.discover_test_callables``).
 """
+
 from __future__ import annotations
 
 import contextlib
@@ -60,9 +61,10 @@ def _build_callables(items: list[Any]) -> list[Callable[..., Any]]:
     for it in items:
         cls = getattr(it, "cls", None)
         if isinstance(cls, type) and issubclass(cls, unittest.TestCase):
-            method = getattr(it, "originalname", None) or str(
-                getattr(it, "name", "")
-            ).split("[")[0]
+            method = (
+                getattr(it, "originalname", None)
+                or str(getattr(it, "name", "")).split("[")[0]
+            )
             if method:
                 callables.append(make_tc_runner(cls, method))
             continue
@@ -159,8 +161,9 @@ def collect_pytest_callables(
         os.chdir(project_root)
         # Suppress pytest's --collect-only node-id dump so it doesn't pollute
         # Wesker's own output.
-        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(
-            io.StringIO()
+        with (
+            contextlib.redirect_stdout(io.StringIO()),
+            contextlib.redirect_stderr(io.StringIO()),
         ):
             pytest.main(args, plugins=[plugin])
     except Exception:

@@ -31,10 +31,14 @@ def test_mutant_resolves_module_level_helper():
     ns: dict = {}
     exec(_MODULE_SRC, ns)  # noqa: S102
     target = ns["target"]  # live func; __globals__ has _double
-    test_target = ns["test_target"]  # its __globals__ is `ns`, so patching ns["target"] works
+    test_target = ns[
+        "test_target"
+    ]  # its __globals__ is `ns`, so patching ns["target"] works
 
     tree = ast.parse(_MODULE_SRC)
-    node = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "target")
+    node = next(
+        n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "target"
+    )
     cats = filter_categories(node)
 
     pr = run_function_profiling(node, "m.py::target", cats, [test_target], target)
@@ -42,7 +46,9 @@ def test_mutant_resolves_module_level_helper():
     assert pr.total_mutants > 0
     # The load-bearing guarantee: kills are real assertion kills, not NameError
     # crashes from a missing helper.
-    assertion_kills = [r for r in pr.killed_records if r.get("killed_by") == "assertion"]
+    assertion_kills = [
+        r for r in pr.killed_records if r.get("killed_by") == "assertion"
+    ]
     assert assertion_kills, (
         "expected assertion kills once the mutant can resolve the module helper; "
         f"got killed_by counts {[r.get('killed_by') for r in pr.killed_records]}"

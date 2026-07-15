@@ -41,7 +41,11 @@ def executable_lines(func_node: ast.FunctionDef | ast.AsyncFunctionDef) -> set[i
     test can meaningfully "reach".
     """
     body = list(func_node.body)
-    if body and isinstance(body[0], ast.Expr) and isinstance(body[0].value, ast.Constant):
+    if (
+        body
+        and isinstance(body[0], ast.Expr)
+        and isinstance(body[0].value, ast.Constant)
+    ):
         body = body[1:]  # drop a leading docstring
     lines: set[int] = set()
     for stmt in body:
@@ -106,7 +110,10 @@ def failing_on_baseline(
     # a `pytest.raises(SystemExit)` CLI test, prints, logging) so consumer-test
     # side-effects never pollute the engine's machine-readable output — the same
     # isolation evaluate_mutant's runner applies.
-    with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+    with (
+        contextlib.redirect_stdout(io.StringIO()),
+        contextlib.redirect_stderr(io.StringIO()),
+    ):
         for test_fn in test_functions:
             try:
                 test_fn()
@@ -139,7 +146,10 @@ def trace_line_coverage(
     # Isolate consumer-test stdout/stderr during the traced baseline pass (see
     # failing_on_baseline) so a test's prints/argparse banners never leak into the
     # engine's output.
-    with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+    with (
+        contextlib.redirect_stdout(io.StringIO()),
+        contextlib.redirect_stderr(io.StringIO()),
+    ):
         for test_fn in test_functions:
             name = getattr(test_fn, "__name__", "unknown")
             covered = _trace_one(test_fn, target_file, exec_lines)

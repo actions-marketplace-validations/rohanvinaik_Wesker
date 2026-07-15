@@ -3,8 +3,11 @@
 from Wesker.engine import coverage_floor
 import pytest
 
+
 @pytest.mark.detective
-@pytest.mark.parametrize("args, expected", [
+@pytest.mark.parametrize(
+    "args, expected",
+    [
         (((100, 5), 2, 1), 0.6321205588285577),
         (((3, 4), 0, 1), 1.0),
         (((100,), 2, 2), 0.8646647167633873),
@@ -13,10 +16,12 @@ import pytest
         (((0, 100), 2, 1), 0.6321205588285577),
         (((1,), 2, 0), 0.0),
         (((1,), 1, 2), 1.0),
-])
+    ],
+)
 def test_coverage_floor_golden(args, expected):
     """VALUE golden captures — pure + deterministic (8 inputs)."""
     assert coverage_floor(*args) == expected
+
 
 @pytest.mark.detective
 def test_coverage_floor_value_0():

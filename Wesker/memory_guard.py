@@ -140,8 +140,12 @@ def worker_count(
     cores = available_cores() if cores is None else max(1, cores)
     # Honour an explicit/env budget override, else the parallel (fleet) budget.
     explicit = resolve_budget()
-    budget = budget_bytes if budget_bytes is not None else (
-        explicit if explicit != default_budget_bytes() else parallel_budget_bytes()
+    budget = (
+        budget_bytes
+        if budget_bytes is not None
+        else (
+            explicit if explicit != default_budget_bytes() else parallel_budget_bytes()
+        )
     )
     by_mem = max(1, budget // max(1, peak))
     return max(1, min(cores, by_mem))
@@ -180,7 +184,11 @@ def telemetry(budget_bytes: int | None = None) -> str:
         return f"mem: {rss // _MB} MB used · budget OFF · system {total // _GB} GB"
     pct = round(100 * rss / budget) if budget else 0
     hot = pct >= 80
-    hint = "  ⚠ near budget — offload: `purge` to clear caches, or raise WESKER_MEM_BUDGET_MB" if hot else ""
+    hint = (
+        "  ⚠ near budget — offload: `purge` to clear caches, or raise WESKER_MEM_BUDGET_MB"
+        if hot
+        else ""
+    )
     return f"mem: {rss // _MB} MB / {budget // _MB} MB budget ({pct}%) · system {total // _GB} GB{hint}"
 
 

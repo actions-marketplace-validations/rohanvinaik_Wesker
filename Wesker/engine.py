@@ -763,7 +763,10 @@ def _count_arithmetic_target(node: ast.AST) -> int:
     """
     if isinstance(node, ast.BinOp) and type(node.op) in _ArithmeticMutator._BIN_SWAP:
         return 1
-    if isinstance(node, ast.AugAssign) and type(node.op) in _ArithmeticMutator._BIN_SWAP:
+    if (
+        isinstance(node, ast.AugAssign)
+        and type(node.op) in _ArithmeticMutator._BIN_SWAP
+    ):
         return 1
     if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.USub):
         return 1
@@ -810,7 +813,9 @@ def _content_mutant_id(category: MutationCategory, mutated_node: ast.AST) -> str
     makes a cross-invocation reference to "this mutant" (the audit→flag handoff) resolvable.
     """
     content = ast.dump(mutated_node, include_attributes=True)
-    digest = hashlib.sha1(content.encode("utf-8"), usedforsecurity=False).hexdigest()[:8]
+    digest = hashlib.sha1(content.encode("utf-8"), usedforsecurity=False).hexdigest()[
+        :8
+    ]
     return f"{category.value}_{digest}"
 
 
@@ -1031,10 +1036,7 @@ def _baseline_failures(
             test_fn, qualname, original_func
         )
         try:
-            if (
-                _run_test_with_timeout(test_fn, probe, patched, timeout_ms)
-                is not None
-            ):
+            if _run_test_with_timeout(test_fn, probe, patched, timeout_ms) is not None:
                 inert.add(id(test_fn))
         except Exception:  # noqa: BLE001 — an unrunnable baseline is itself inert
             inert.add(id(test_fn))
@@ -1098,7 +1100,9 @@ def _build_test_scope(
 
     # Filter 1 — bar tests that cannot distinguish anything from the kill loop.
     inert = _baseline_failures(test_functions, original_func, qualname)
-    usable = [t for t in test_functions if id(t) not in inert] if inert else test_functions
+    usable = (
+        [t for t in test_functions if id(t) not in inert] if inert else test_functions
+    )
 
     # Parametrized cases share a __name__, so one name maps to many callables.
     tests_by_name: dict[str, list[Callable[..., None]]] = {}
@@ -1830,7 +1834,9 @@ def evaluate_mutant(
         # mutant — a false all-crash 100% that hides whether the mutation's
         # behavior is actually caught. Degrades to an empty namespace (the prior
         # behavior) when the caller passes no original_func.
-        namespace: dict[str, Any] = dict(getattr(original_func, "__globals__", None) or {})
+        namespace: dict[str, Any] = dict(
+            getattr(original_func, "__globals__", None) or {}
+        )
         exec(code, namespace)  # noqa: S102  # nosec B102 — intentional: compiling AST mutants
         func_name = getattr(mutant.mutated_node, "name", None)
         mutated_obj = namespace.get(func_name) if func_name else None
@@ -1861,7 +1867,9 @@ def evaluate_mutant(
         # Run tests against mutated function
         killers: list[str] = []
         reasons: list[str] = []
-        first_reason: str | None = None  # provisional crash/timeout kill (no assertion yet)
+        first_reason: str | None = (
+            None  # provisional crash/timeout kill (no assertion yet)
+        )
         first_killer: str | None = None
         for test_fn in test_functions:
             remaining_ms = timeout_ms - _elapsed(start)
@@ -2052,7 +2060,10 @@ def _run_test_with_timeout(
     # prints, logging) so consumer-test side-effects never pollute the engine's
     # report. Set up in the main thread around start+join so restoration is
     # guaranteed even when the worker hangs and is abandoned as a timeout.
-    with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+    with (
+        contextlib.redirect_stdout(io.StringIO()),
+        contextlib.redirect_stderr(io.StringIO()),
+    ):
         thread.start()
         thread.join(timeout=timeout_ms / 1000.0)
 
@@ -2230,7 +2241,10 @@ def run_function_profiling(
         pregenerated
         if pregenerated is not None
         else generate_mutants(
-            func_node, categories, max_per_category=max_per_category, pass_index=pass_index
+            func_node,
+            categories,
+            max_per_category=max_per_category,
+            pass_index=pass_index,
         )
     )
     # Shard for parallel evaluation: generation is deterministic, so mutants[a:b] here is
@@ -2254,7 +2268,11 @@ def run_function_profiling(
     source_path = func_key.split("::", 1)[0] if "::" in func_key else None
 
     _tests_for, line_cov, exec_lines, failing = _build_test_scope(
-        func_node, test_functions, original_func, scope_tests, precomputed_line_data,
+        func_node,
+        test_functions,
+        original_func,
+        scope_tests,
+        precomputed_line_data,
         qualname,
     )
 

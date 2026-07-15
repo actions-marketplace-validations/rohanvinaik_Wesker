@@ -65,7 +65,11 @@ def test_every_mutant_line_is_in_the_denominator():
     lines = executable_lines(node)
     mutants = generate_mutants(node, cats, max_per_category=0)
     assert mutants, "expected mutants for this function"
-    orphans = [(m.category.value, m.mutated_line) for m in mutants if m.mutated_line not in lines]
+    orphans = [
+        (m.category.value, m.mutated_line)
+        for m in mutants
+        if m.mutated_line not in lines
+    ]
     assert not orphans, f"mutants on lines outside the denominator: {orphans}"
 
 
@@ -137,12 +141,22 @@ def test_scoped_and_unscoped_verdicts_agree():
 
     cats = {MutationCategory.VALUE, MutationCategory.ARITHMETIC, MutationCategory.SWAP}
     unscoped = run_function_profiling(
-        node, "<scoretest>::scoreit", cats, tests, original,
-        max_per_category=0, scope_tests=False,
+        node,
+        "<scoretest>::scoreit",
+        cats,
+        tests,
+        original,
+        max_per_category=0,
+        scope_tests=False,
     )
     scoped = run_function_profiling(
-        node, "<scoretest>::scoreit", cats, tests, original,
-        max_per_category=0, scope_tests=True,
+        node,
+        "<scoretest>::scoreit",
+        cats,
+        tests,
+        original,
+        max_per_category=0,
+        scope_tests=True,
     )
     assert scoped.total_mutants == unscoped.total_mutants
     assert scoped.total_killed == unscoped.total_killed, (
