@@ -18,8 +18,10 @@ import json
 import os
 import sys
 import time
+from contextvars import ContextVar
 import unittest
 from pathlib import Path
+from collections.abc import Callable, Iterable
 from typing import Any
 
 from Wesker.engine import (
@@ -323,6 +325,15 @@ def load_test_callables(
     return callables
 
 
+# The suite of a LIVE pytest session, when one is active (see `profile_codebase_live`).
+# Threaded as ambient context rather than a parameter because the live-session runner
+# INVERTS CONTROL: pytest calls us from inside `pytest_runtestloop`, so the callables
+# cannot be passed down through profile_codebase -> profile_file -> discover_*
+# without changing every signature Detective imports. Unset by default, so every
+# existing caller — Detective included — takes the ordinary discovery path unchanged.
+_LIVE_SUITE: ContextVar[list[Any] | None] = ContextVar("wesker_live_suite", default=None)
+
+
 def discover_test_callables(
     project_root: str,
     source_file: str,
@@ -354,6 +365,13 @@ def discover_test_callables(
     # entirely → silent fallback to the legacy loader → a DIFFERENT test set and
     # inconsistent survivor counts. Filtering by existence is correct by lifecycle:
     # skip the empty/not-yet-created dir early, include it once tests land there.
+    # A live pytest session outranks every backend: its items carry real fixtures,
+    # conftest and lifecycle, which no re-collection here can reproduce. The session
+    # already collected the whole suite, so the same list serves every file.
+    live = _LIVE_SUITE.get()
+    if live is not None:
+        return live
+
     extra = [os.path.abspath(d) for d in (extra_dirs or []) if os.path.isdir(d)]
     if backend in ("auto", "pytest"):
         try:
@@ -774,6 +792,116 @@ def profile_function_cached(
 # ── Codebase profiling with formatted output ─────────────────────
 
 
+def live_suite_active() -> bool:
+    """True when a LIVE pytest session is currently supplying the test suite.
+
+    Consumers need this to decide whether work can leave the process. The live suite is
+    a set of closures over LIVE pytest items — bound to this interpreter's session, its
+    fixtures and its conftest — so it cannot cross a ``spawn`` boundary. A worker
+    started from inside a live session re-discovers with the collect-only backend, which
+    silently drops every fixture-taking test; the shard then reports those mutants as
+    survivors and the parent merges the lie into an otherwise-correct result.
+
+    ``Detective.engine.profile`` already refuses to fan out when the caller passed
+    explicit callables, for exactly this reason ("workers re-discover; callables can't
+    cross spawn"). This predicate extends that same rule to the live suite.
+    """
+    return _LIVE_SUITE.get() is not None
+
+
+def run_with_live_suite(
+    project_root: str,
+    fn: Callable[[], Any],
+    target_files: Iterable[str] | None = None,
+    paths: list[str] | None = None,
+) -> Any:
+    """Run ``fn()`` inside a LIVE pytest session — the public seam for any consumer.
+
+    THE POINT: a caller wraps its entry point ONCE and every Wesker API it calls
+    underneath transparently upgrades. ``discover_test_callables`` returns the live
+    suite (fixtures, conftest, setup/teardown, parametrization — nothing skipped), and
+    the suite-global baseline is computed once instead of per function. No signatures
+    change; no caller passes callables around; nobody outside this module needs to know
+    a ContextVar exists.
+
+    This exists because the session CANNOT be handed out and left open — pytest owns
+    the loop, so the work must happen INSIDE it. That inversion of control is the one
+    thing a consumer cannot paper over itself, and re-deriving it per consumer is how
+    the same bug lands in three places. ``Detective``'s profiler, for one, calls
+    ``discover_test_callables`` directly; without this it silently drops every
+    fixture-taking test in the target suite.
+
+    ``target_files`` are the source files about to be mutated. Given, the session
+    baseline is traced once for all of them (see :class:`~Wesker.engine.SessionBaseline`).
+    Omitted, only the live suite is provided and the per-function baseline stands — still
+    correct, just slower.
+
+    Returns ``fn()``'s value, or ``None`` when no live session could be started (pytest
+    missing, collection failed, nothing collected). ``None`` is a DISTINCT outcome and
+    callers must treat it as one: falling back silently to the collect-only path is the
+    exact failure this seam exists to end.
+    """
+    from Wesker.engine import _SESSION_BASELINE, build_session_baseline
+    from Wesker.pytest_runner import run_in_session
+
+    resolved = {
+        os.path.abspath(t if os.path.isabs(t) else os.path.join(project_root, t))
+        for t in (target_files or ())
+    }
+
+    def _body(callables: list[Any], _session: Any) -> Any:
+        suite_token = _LIVE_SUITE.set(callables)
+        base_token = (
+            _SESSION_BASELINE.set(build_session_baseline(callables, resolved))
+            if resolved
+            else None
+        )
+        try:
+            return fn()
+        finally:
+            if base_token is not None:
+                _SESSION_BASELINE.reset(base_token)
+            _LIVE_SUITE.reset(suite_token)
+
+    return run_in_session(project_root, _body, paths=paths)
+
+
+def profile_codebase_live(
+    project_root: str,
+    targets: list[str],
+    paths: list[str] | None = None,
+    **kwargs: Any,
+) -> dict | None:
+    """:func:`profile_codebase`, executed inside a LIVE pytest session.
+
+    This is Wesker-as-a-mutation-tester: the whole profile runs within
+    ``pytest_runtestloop``, so every mutant is judged by pytest itself — real
+    fixtures, conftest, parametrization, setup/teardown, markers, and pytest's own
+    pass/fail verdict. Still one collection and no subprocess per mutant, so the
+    in-process cost model (and every speed claim resting on it) is unchanged.
+
+    WHY IT MATTERS: the ordinary path collects with ``--collect-only``, which tears
+    the session down immediately, leaving items whose fixtures can never be
+    supplied — so ``pytest_discovery`` SKIPS every fixture-taking test. A mutant that
+    only such tests could kill is then scored a survivor, and on a suite where
+    collection fails outright the silent fall back to the legacy loader can invert
+    the error and manufacture kills instead. Neither number is about the suite.
+
+    A thin wrapper over :func:`run_with_live_suite`, which is the reusable seam —
+    other consumers (Detective) wrap their own entry points with it rather than
+    re-deriving the inversion of control.
+
+    Returns ``None`` when no live session could be started. Callers MUST treat that as
+    a distinct outcome and say so. ``profile_codebase`` remains available and unchanged.
+    """
+    return run_with_live_suite(
+        project_root,
+        lambda: profile_codebase(project_root, targets, **kwargs),
+        target_files=targets,
+        paths=paths,
+    )
+
+
 def profile_codebase(
     project_root: str,
     targets: list[str],
@@ -811,6 +939,7 @@ def profile_codebase(
     total_killed = 0
     total_mutants = 0
     total_equivalent = 0
+    total_truncated = 0
     total_universe = 0
     total_dof = 0
     total_dof_covered = 0
@@ -848,6 +977,12 @@ def profile_codebase(
         total_dof += file_dof
         total_dof_covered += file_dof_covered
         total_functions += len(results)
+        # A function whose budget ran out was only PARTIALLY evaluated: its unevaluated
+        # mutants are absent from both numerator and denominator, so the ratio is a
+        # sample of the cheap-to-reach mutants, not a mutation score. Aggregated here
+        # because the per-function flag never reached the report — a truncated run and a
+        # complete one published byte-identical badges.
+        total_truncated += sum(1 for r in results if r.get("budget_exhausted"))
 
         # Aggregate per-category stats for the report (feeds next run's priors)
         for r in results:
@@ -920,6 +1055,10 @@ def profile_codebase(
         "dof_pct": round(100 * total_dof_covered / max(total_dof, 1)),
         "kill_pct": kill_pct,
         "total_functions": total_functions,
+        # Functions whose per-file budget ran out before every selected mutant was
+        # evaluated. Non-zero means ``kill_pct`` is a PARTIAL result: raise
+        # ``budget_ms_per_file`` before quoting it as a mutation score.
+        "total_truncated": total_truncated,
         "passes": passes,
         "elapsed_ms": round(elapsed),
         "per_file": per_file,

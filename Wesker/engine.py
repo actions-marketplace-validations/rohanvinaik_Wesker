@@ -15,12 +15,15 @@ import math
 import time
 import types
 from dataclasses import dataclass, field
+from contextvars import ContextVar
 from enum import Enum
 from typing import TYPE_CHECKING, Any
 
+from .line_coverage import coverage_from_trace as _coverage_from_trace
 from .line_coverage import executable_lines as _executable_lines
 from .line_coverage import failing_on_baseline as _failing_on_baseline
 from .line_coverage import trace_line_coverage as _trace_line_coverage
+from .line_coverage import trace_suite as _trace_suite
 from .memory_guard import over_budget as _over_budget
 from .memory_guard import reclaim as _reclaim
 from .memory_guard import resolve_budget as _resolve_budget
@@ -988,6 +991,80 @@ def _live_dimension_count(keys: list[str]) -> int:
     return len({k for k in keys if not _is_dead(k)})
 
 
+class SessionBaseline:
+    """The suite-global half of the baseline, computed ONCE per session.
+
+    Three passes ran per FUNCTION and two of them provably cannot vary by function:
+
+      * ``failing_on_baseline`` calls a bare ``test_fn()``; ``original_func`` only gates
+        a ``__code__`` check. Its answer is a property of the SUITE.
+      * ``_baseline_failures`` patches the original OVER ITSELF — a no-op — so it also
+        just asks "does this test pass?".
+      * ``trace_line_coverage`` traces the whole suite and then keeps one function's
+        lines. The TRACE is global; only the intersection is per-function.
+
+    So the cost was ``O(3 × suite × functions)`` before any mutant ran. Hoisted here it
+    is ``O(3 × suite)`` once, plus a set-intersection per function. Measured on Prism
+    (445 tests): 28.6s of baseline PER FUNCTION, 89% of wall clock, and enough to eat a
+    10s per-file budget whole — that function then reported 0 mutants, i.e. the budget
+    was spent entirely on recomputing a constant.
+
+    ONLY VALID FOR ZERO-ARG CALLABLES, which is why this is opt-in and set exclusively
+    by the live-session path. ``_baseline_failures`` is suite-global only because the
+    patch is a no-op AND the call convention does not vary; under the LEGACY runner the
+    unpatched path calls ``test_fn(original)``, whose convention depends on ``qualname``
+    per function, so the answer is not a constant there. Live-session callables are
+    keyword-only zero-arg wrappers, so both hold.
+    """
+
+    __slots__ = ("traced", "failing", "inert", "n_tests")
+
+    def __init__(
+        self,
+        traced: dict[str, dict[str, set[int]]],
+        failing: list[str],
+        inert: set[int],
+        n_tests: int,
+    ) -> None:
+        self.traced = traced
+        self.failing = failing
+        self.inert = inert
+        self.n_tests = n_tests
+
+
+# Set only by the live-session path; None everywhere else, so every existing caller
+# (Detective included) keeps the exact per-function behaviour it has today.
+_SESSION_BASELINE: ContextVar[SessionBaseline | None] = ContextVar(
+    "wesker_session_baseline", default=None
+)
+
+
+def build_session_baseline(
+    test_functions: list[Callable[..., None]],
+    target_files: set[str],
+    timeout_ms: float = 5000,
+) -> SessionBaseline:
+    """Run the suite-global baseline passes ONCE. See :class:`SessionBaseline`.
+
+    ``inert`` is computed by running each test AS-IS (no patch): with the original code
+    in place that is precisely "does this test fail regardless of any mutation?", which
+    is what bars it from kill attribution.
+    """
+    traced = _trace_suite(test_functions, target_files)
+    failing: list[str] = []
+    inert: set[int] = set()
+    for test_fn in test_functions:
+        outcome = _run_test_with_timeout(test_fn, None, True, timeout_ms)
+        if outcome is not None:
+            inert.add(id(test_fn))
+            if outcome == "assertion":
+                # An assertion that fails on correct code is a WRONG EXPECTATION — the
+                # narrower thing failing_on_baseline reports to a human. Other outcomes
+                # are ambiguous and are barred from attribution without accusation.
+                failing.append(getattr(test_fn, "__name__", "unknown"))
+    return SessionBaseline(traced, failing, inert, len(test_functions))
+
+
 def _baseline_failures(
     test_functions: list[Callable[..., None]],
     original_func: Callable[..., Any] | None,
@@ -1082,27 +1159,42 @@ def _build_test_scope(
     unscoped — the two agreed, but on an inflated number. Barring it from attribution
     makes both honest, and the two still agree.
 
+    Baseline data comes from three places, in precedence order: an explicit
+    ``precomputed_line_data``; a live-session :class:`SessionBaseline` (computed once
+    for the whole suite — see that class for why the per-function passes were redundant);
+    or, failing both, the per-function passes themselves.
+
     Returns ``(_tests_for, line_cov, exec_lines, failing)`` so callers can also report
     the line-coverage axis. Lives here, used by both ``run_function_profiling`` and
     ``run_function_converged``, so the two can never drift apart on soundness.
     """
     exec_lines = sorted(_executable_lines(func_node))
+    session = _SESSION_BASELINE.get()
+    inert: set[int] = set()
     if precomputed_line_data is not None:
         # An adaptive-probe caller already ran this baseline over the same tests+function;
         # reuse it so a probe + follow-up run don't trace twice. Deterministic, so the
         # reused map is identical to what a fresh trace would produce here.
         line_cov, failing = precomputed_line_data
+        inert = _baseline_failures(test_functions, original_func, qualname)
+    elif session is not None:
+        # Suite-global baseline, already paid for once. Only the per-function
+        # intersection is left, and it is a set operation over data in hand.
+        target_file = getattr(
+            getattr(original_func, "__code__", None), "co_filename", None
+        )
+        line_cov = _coverage_from_trace(session.traced, target_file or "", set(exec_lines))
+        failing = session.failing
+        inert = session.inert
     elif original_func is not None:
         line_cov = _trace_line_coverage(test_functions, original_func, set(exec_lines))
         failing = _failing_on_baseline(test_functions, original_func)
+        inert = _baseline_failures(test_functions, original_func, qualname)
     else:
         line_cov, failing = {}, []
 
     # Filter 1 — bar tests that cannot distinguish anything from the kill loop.
-    inert = _baseline_failures(test_functions, original_func, qualname)
-    usable = (
-        [t for t in test_functions if id(t) not in inert] if inert else test_functions
-    )
+    usable = [t for t in test_functions if id(t) not in inert] if inert else test_functions
 
     # Parametrized cases share a __name__, so one name maps to many callables.
     tests_by_name: dict[str, list[Callable[..., None]]] = {}

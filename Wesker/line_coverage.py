@@ -124,6 +124,91 @@ def failing_on_baseline(
     return failing
 
 
+def _trace_one_multi(
+    test_fn: Callable[..., None], target_files: set[str]
+) -> dict[str, set[int]]:
+    """Every line ``test_fn()`` executes in ANY of ``target_files``: ``{file: lines}``.
+
+    Identical machinery to :func:`_trace_one` — the dispatch already decides per FRAME
+    whether to trace, so watching N files costs the same single pass as watching one.
+    Nothing is intersected with a function's executable lines here: that filter is the
+    only per-function part, and it is a set operation over data already in hand.
+    """
+    hits: dict[str, set[int]] = {}
+
+    def local(frame, event, _arg):
+        if event == "line":
+            hits.setdefault(frame.f_code.co_filename, set()).add(frame.f_lineno)
+        return local
+
+    def dispatch(frame, event, _arg):
+        if event == "call" and frame.f_code.co_filename in target_files:
+            return local
+        return None
+
+    previous = sys.gettrace()
+    sys.settrace(dispatch)
+    try:
+        test_fn()
+    except BaseException:  # noqa: BLE001 — a failing/raising test still reached lines
+        pass
+    finally:
+        sys.settrace(previous)
+    return hits
+
+
+def trace_suite(
+    test_functions: list[Callable[..., None]], target_files: set[str]
+) -> dict[str, dict[str, set[int]]]:
+    """Trace the WHOLE suite ONCE: ``{test_name: {file: lines}}``.
+
+    WHY: ``trace_line_coverage`` traces the entire suite and then keeps only one
+    function's lines, so profiling F functions traced the suite F times to answer F
+    questions that one pass already answers. That is ``O(suite × functions)`` before a
+    single mutant runs — invisible on a 0.3s suite, ruinous on a ten-minute one
+    (measured: 28.6s of baseline per function on a 445-test suite, 89% of wall clock).
+
+    The trace is function-INDEPENDENT: what a test executes does not depend on which
+    function we intend to mutate. Only the final intersection with a function's
+    executable lines is per-function, and that is free. So this is the same
+    "refuse work that provably cannot change a result" reduction the engine already
+    applies to mutants, applied to the baseline.
+
+    Union across duplicate test names (parametrized cases share a ``__name__``), to
+    match the keying ``trace_line_coverage`` uses.
+    """
+    out: dict[str, dict[str, set[int]]] = {}
+    if not target_files:
+        return out
+    with (
+        contextlib.redirect_stdout(io.StringIO()),
+        contextlib.redirect_stderr(io.StringIO()),
+    ):
+        for test_fn in test_functions:
+            name = getattr(test_fn, "__name__", "unknown")
+            per_file = _trace_one_multi(test_fn, target_files)
+            bucket = out.setdefault(name, {})
+            for f, lines in per_file.items():
+                bucket[f] = bucket.get(f, set()) | lines
+    return out
+
+
+def coverage_from_trace(
+    traced: dict[str, dict[str, set[int]]], target_file: str, exec_lines: set[int]
+) -> dict[str, list[int]]:
+    """One function's view of a :func:`trace_suite` result — the per-function filter.
+
+    Returns exactly what :func:`trace_line_coverage` would have returned for that
+    function, so it is a drop-in for callers holding a suite trace.
+    """
+    if not target_file or not exec_lines:
+        return {}
+    return {
+        name: sorted(files.get(target_file, frozenset()) & exec_lines)
+        for name, files in traced.items()
+    }
+
+
 def trace_line_coverage(
     test_functions: list[Callable[..., None]],
     original_func: Callable[..., Any],

@@ -97,7 +97,7 @@ def main(argv: list[str] | None = None) -> int:
             print("nothing to purge — clean state")
         return 0
 
-    from Wesker.ci import profile_codebase
+    from Wesker.ci import profile_codebase, profile_codebase_live
 
     # Discover targets
     files = _discover_python_files(args.targets)
@@ -111,8 +111,9 @@ def main(argv: list[str] | None = None) -> int:
     if not args.quiet and not args.json_output:
         print(f"Wesker — profiling {len(files)} files\n")
 
-    # Run mutation profiling
-    result = profile_codebase(
+    # Run mutation profiling — pytest judges every mutant (real fixtures, conftest,
+    # parametrization), so the kill rate is a standards-compliant mutation score.
+    result = profile_codebase_live(
         ".",
         files,
         budget_ms_per_file=args.budget,
@@ -120,6 +121,27 @@ def main(argv: list[str] | None = None) -> int:
         passes=args.passes,
         verbose=not args.quiet and not args.json_output,
     )
+    execution_mode = "pytest-live"
+    if result is None:
+        # Degrade only OUT LOUD, and on stderr so it survives --json-output being
+        # piped: the legacy runner cannot execute fixture-taking tests, so its number
+        # is not comparable to a standard mutation tester's.
+        execution_mode = "legacy-direct-call"
+        print(
+            "WARNING: no live pytest session — falling back to the legacy direct-call "
+            "runner.\n         Fixture-taking tests cannot run; this kill rate is NOT "
+            "a standards-\n         compliant mutation score.",
+            file=sys.stderr,
+        )
+        result = profile_codebase(
+            ".",
+            files,
+            budget_ms_per_file=args.budget,
+            max_per_category=args.max_per_category,
+            passes=args.passes,
+            verbose=not args.quiet and not args.json_output,
+        )
+    result["execution_mode"] = execution_mode
 
     # MC/DC if requested
     mcdc_result = None

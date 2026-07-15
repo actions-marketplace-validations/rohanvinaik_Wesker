@@ -34,7 +34,7 @@ from pathlib import Path
 
 # Ensure scripts/ is on the path for wesker_engine/wesker_filter imports
 
-from Wesker.ci import profile_codebase  # noqa: E402
+from Wesker.ci import profile_codebase, profile_codebase_live  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
@@ -462,7 +462,7 @@ def main():
     print(f"\nTargets: {len(targets)} files")
 
     # 1. Mutation profiling (in-process, multi-pass convergence)
-    passes = config.get("convergence_passes", 3)
+    passes = config.get("convergence_passes", 1)
     max_per_cat = config.get("max_per_category")
     budget_note = (
         "DOF-derived budget"
@@ -473,13 +473,52 @@ def main():
         f"\n[1/4] Running in-process mutation profiling ({passes} pass"
         f"{'' if passes == 1 else 'es'}, {budget_note})..."
     )
-    mutation = profile_codebase(
+    # Judge every mutant with pytest itself — real fixtures, conftest, parametrization,
+    # setup/teardown, and pytest's own pass/fail verdict. The legacy path calls test
+    # functions directly, which SKIPS every fixture-taking test (so a mutant only such
+    # a test could kill is scored a survivor) and, where collection fails outright,
+    # scores their missing-fixture crashes as kills — a fabricated 100%. A CI badge
+    # must not be able to report either number without saying so.
+    mutation = profile_codebase_live(
         ".",
         targets,
         budget_ms_per_file=15000,
         max_per_category=max_per_cat,
         passes=passes,
     )
+    execution_mode = "pytest-live"
+    if mutation is None:
+        # Degrade only OUT LOUD. Projects without pytest are still supported — the
+        # silent version of this fallback is precisely what let a fixture-driven repo
+        # publish a fabricated kill rate, so the mode travels with the numbers.
+        execution_mode = "legacy-direct-call"
+        print(
+            "  !! WARNING: no live pytest session (pytest missing, or collection\n"
+            "     failed/collected nothing). Falling back to the LEGACY direct-call\n"
+            "     runner: fixture-taking tests cannot run, so this kill rate is NOT\n"
+            "     a standards-compliant mutation score. Fix collection to restore it.",
+            file=sys.stderr,
+        )
+        mutation = profile_codebase(
+            ".",
+            targets,
+            budget_ms_per_file=15000,
+            max_per_category=max_per_cat,
+            passes=passes,
+        )
+    mutation["execution_mode"] = execution_mode
+    print(f"  Execution: {execution_mode}")
+    truncated = mutation.get("total_truncated", 0)
+    if truncated:
+        # A truncated run's unevaluated mutants are missing from BOTH sides of the
+        # ratio, so the percentage below is a sample of whatever was cheap to reach —
+        # not a mutation score. Say so where the number is produced.
+        print(
+            f"  !! WARNING: {truncated} function(s) hit the per-file budget and were\n"
+            f"     only PARTIALLY evaluated — the kill rate below is a partial result.\n"
+            f"     Raise budget_ms_per_file before quoting it as a mutation score.",
+            file=sys.stderr,
+        )
     equiv = mutation.get("total_equivalent", 0)
     universe = mutation.get("total_universe", 0)
     equiv_note = f" ({equiv} equivalent)" if equiv else ""
@@ -572,6 +611,15 @@ def main():
         "MUTATION_UNIVERSE": mutation.get("total_universe", 0),
         "MUTATION_KILL_PCT": mutation["kill_pct"],
         "MUTATION_PASSES": mutation.get("passes", 1),
+        # How the mutants were JUDGED. Exported because it qualifies every number
+        # above it: "pytest-live" is a standards-compliant mutation score (pytest ran
+        # the suite, fixtures and all); "legacy-direct-call" cannot run fixture-taking
+        # tests and is therefore NOT comparable to mutmut/cosmic-ray. A consumer that
+        # badges the kill rate without reading this is publishing an unqualified claim.
+        "EXECUTION_MODE": mutation.get("execution_mode", "unknown"),
+        # Functions cut short by the per-file budget. Non-zero disqualifies
+        # MUTATION_KILL_PCT as a mutation score — it is then a partial sample.
+        "MUTATION_TRUNCATED": mutation.get("total_truncated", 0),
         # DOF coverage — exact (singleton covers), so it badges as a measured
         # fraction of the behavioral-dimension space, not a sampling estimate.
         "DOF_TOTAL": mutation.get("total_dof", 0),
