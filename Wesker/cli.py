@@ -66,11 +66,15 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--max-per-category",
         type=int,
-        default=5,
-        help="Max mutants per category per pass (0=exhaustive)",
+        default=None,
+        help="Max mutants per category per pass "
+        "(default: derived per function from its degrees of freedom; 0=exhaustive)",
     )
     parser.add_argument(
-        "--passes", type=int, default=3, help="Convergence passes (different seed each)"
+        "--passes",
+        type=int,
+        default=1,
+        help="Convergence passes (extra passes deepen within covered dimensions)",
     )
     parser.add_argument("--exclude", nargs="*", default=[], help="Files to exclude")
     parser.add_argument("--quiet", action="store_true", help="Minimal output")
@@ -140,6 +144,15 @@ def main(argv: list[str] | None = None) -> int:
             print(
                 f"Kill rate: {result['kill_pct']}% ({result['total_killed']}/{result['total_mutants']})"
             )
+            # DOF coverage — the claim a bounded run can actually make. Under
+            # singleton cover sets the greedy reaches min(picks, D) of D dimensions
+            # exactly, so this is measured coverage, not an estimate.
+            if result.get("total_dof"):
+                print(
+                    f"DOF coverage: {result['dof_pct']}% "
+                    f"({result['total_dof_covered']}/{result['total_dof']} dimensions) "
+                    f"via {result['total_mutants']}/{result['total_universe']} mutants"
+                )
             print(f"Functions: {result['total_functions']}")
             if result.get("total_equivalent"):
                 print(f"Equivalent: {result['total_equivalent']}")

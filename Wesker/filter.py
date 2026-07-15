@@ -37,6 +37,7 @@ class _FunctionSignals:
     has_arithmetic: bool = False
     has_logical: bool = False
     has_deletable_stmt: bool = False
+    has_return_value: bool = False
 
 
 def _classify_signal_node(node: ast.AST, signals: _FunctionSignals) -> None:
@@ -72,6 +73,11 @@ def _classify_signal_node(node: ast.AST, signals: _FunctionSignals) -> None:
         signals.has_logical = True
     elif isinstance(node, ast.Expr) and not isinstance(node.value, ast.Constant):
         signals.has_deletable_stmt = True
+    # In lockstep with ``_count_state_return_target`` / ``_StateMutator.visit_Return``:
+    # a return_none target is a ``return`` WITH a value (a bare ``return`` already
+    # returns None, so replacing it is a no-op, not a degree of freedom).
+    elif isinstance(node, ast.Return) and node.value is not None:
+        signals.has_return_value = True
 
 
 def _collect_signals(func_node: ast.FunctionDef) -> _FunctionSignals:
@@ -98,7 +104,19 @@ def filter_categories(
         relevant.add(MutationCategory.SWAP)
     if sig.has_comparisons:
         relevant.add(MutationCategory.BOUNDARY)
-    if not is_pure and (sig.has_self_assigns or sig.has_global_nonlocal):
+    # STATE carries two orthogonal sub-modes, and only ONE of them is about state:
+    #   - remove_assign  — a real state mutation; needs a state-WRITING impure function.
+    #   - return_none    — "does any test notice if this returns None?", a pure VALUE
+    #                      distinction, and the most basic question you can ask of a
+    #                      function whose behaviour IS its return value.
+    # Gating the whole category on state-writing hid return_none from every function that
+    # does not assign to self/global — i.e. almost all of them, pure or not (a filesystem
+    # helper is impure yet writes no state). Each sub-mode is selected against its own
+    # target count in ``_generate_state_mutants``, so a function with returns but no state
+    # writes picks up return_none ONLY: remove_assign counts zero and contributes nothing.
+    if sig.has_return_value or (
+        not is_pure and (sig.has_self_assigns or sig.has_global_nonlocal)
+    ):
         relevant.add(MutationCategory.STATE)
     if sig.has_isinstance:
         relevant.add(MutationCategory.TYPE)

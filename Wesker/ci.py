@@ -374,6 +374,39 @@ def discover_test_callables(
 # ── AST utilities ────────────────────────────────────────────────
 
 
+def resolve_original_func(full_path: str, qualname: str) -> Any:
+    """The LIVE function object for ``(source file, qualname)``, or None.
+
+    Test-impact scoping needs the original callable: its ``__code__.co_filename`` is
+    the authoritative identity the tracer attributes coverage to. The discovered tests
+    have already imported the module under test (that is how they call it), so the
+    live object is reachable from ``sys.modules`` — matched by FILE rather than by a
+    guessed dotted name, which stays correct under src-layouts, namespace packages and
+    same-named siblings. Walks the qualname so ``Class.method`` resolves too.
+
+    Returns None when the module was never imported or the attribute path does not
+    resolve; the caller then simply does not scope (full test set — always sound).
+    """
+    target = os.path.abspath(full_path)
+    for mod in list(sys.modules.values()):
+        f = getattr(mod, "__file__", None)
+        if not f:
+            continue
+        try:
+            if os.path.abspath(f) != target:
+                continue
+        except (OSError, ValueError):  # pragma: no cover — exotic __file__
+            continue
+        obj: Any = mod
+        for part in qualname.split("."):
+            obj = getattr(obj, part, None)
+            if obj is None:
+                break
+        if obj is not None and callable(obj):
+            return obj
+    return None
+
+
 def walk_functions(
     tree: ast.Module,
 ) -> list[tuple[str, ast.FunctionDef | ast.AsyncFunctionDef]]:
@@ -423,8 +456,8 @@ def profile_file(
     project_root: str,
     source_file: str,
     budget_ms: float = 10000,
-    max_per_category: int = 5,
-    passes: int = 3,
+    max_per_category: int | None = None,
+    passes: int = 1,
     cached_state: dict | None = None,
     full_matrix: bool = False,
     test_discovery: str = "auto",
@@ -484,7 +517,10 @@ def profile_file(
             func_key,
             cats,
             tests,
-            None,
+            # The live callable, so test-impact scoping can trace a coverage baseline
+            # against it. None when it cannot be resolved — scoping then simply does
+            # not engage (full test set, sound but slower).
+            resolve_original_func(full_path, qualname),
             budget_ms=budget_ms,
             max_per_category=max_per_category,
             passes=passes,
@@ -505,8 +541,8 @@ def profile_function(
     source_file: str,
     function_name: str,
     budget_ms: float = 10000,
-    max_per_category: int = 5,
-    passes: int = 3,
+    max_per_category: int | None = None,
+    passes: int = 1,
     cached_state: dict | None = None,
     full_matrix: bool = False,
     test_discovery: str = "auto",
@@ -551,7 +587,7 @@ def profile_function(
             qualname = qn
             break
 
-    if func_node is None:
+    if func_node is None or qualname is None:
         return None
 
     cats = filter_categories(func_node)
@@ -573,7 +609,9 @@ def profile_function(
         func_key,
         cats,
         tests,
-        None,
+        # See profile_file: the live callable enables test-impact scoping; None just
+        # means the full test set is used.
+        resolve_original_func(full_path, qualname),
         budget_ms=budget_ms,
         max_per_category=max_per_category,
         passes=passes,
@@ -639,8 +677,8 @@ def profile_function_cached(
     source_file: str,
     function_name: str,
     budget_ms: float = 10000,
-    max_per_category: int = 5,
-    passes: int = 3,
+    max_per_category: int | None = None,
+    passes: int = 1,
 ) -> dict | None:
     """Profile a function with per-function caching.
 
@@ -723,8 +761,8 @@ def profile_codebase(
     project_root: str,
     targets: list[str],
     budget_ms_per_file: float = 10000,
-    max_per_category: int = 5,
-    passes: int = 3,
+    max_per_category: int | None = None,
+    passes: int = 1,
     *,
     verbose: bool = True,
 ) -> dict:
@@ -736,11 +774,16 @@ def profile_codebase(
     categories with historically higher survival rates.
 
     Args:
-        passes: Number of convergence passes per function. Each pass uses
-            a different seed, sampling different mutants. Higher values give
-            stronger statistical guarantees but cost more time.
-        max_per_category: Mutants sampled per category per pass. Total unique
-            mutants tested ≈ passes × max_per_category per category.
+        max_per_category: Per-category mutant budget. ``None`` (the default) is
+            DOF mode: the budget is derived per function from its own degrees of
+            freedom (``engine.dimension_budget``), so one pass covers every
+            behavioral dimension exactly once — no constant to tune, and no
+            budget spent re-covering a dimension already pinned. ``0`` tests
+            every mutant (exhaustive); a positive int pins an explicit budget.
+        passes: Convergence passes per function. In DOF mode one pass already
+            reaches full DOF coverage, so extra passes deepen WITHIN covered
+            dimensions (a second mutant per dimension, a third, …) rather than
+            reaching new ones — they buy kill evidence, not coverage.
     """
     # Layer 2: load historical priors from previous run
     cached_state = _load_cached_state(project_root)
@@ -752,6 +795,8 @@ def profile_codebase(
     total_mutants = 0
     total_equivalent = 0
     total_universe = 0
+    total_dof = 0
+    total_dof_covered = 0
     total_functions = 0
     per_file: dict[str, dict] = {}
     global_cats: dict[str, dict] = {}
@@ -777,10 +822,14 @@ def profile_codebase(
         file_total = sum(r.get("total_mutants", 0) for r in results)
         file_equiv = sum(r.get("total_equivalent", 0) for r in results)
         file_universe = sum(r.get("universe_size", 0) for r in results)
+        file_dof = sum(r.get("dof_total", 0) for r in results)
+        file_dof_covered = sum(r.get("dof_covered", 0) for r in results)
         total_killed += file_killed
         total_mutants += file_total
         total_equivalent += file_equiv
         total_universe += file_universe
+        total_dof += file_dof
+        total_dof_covered += file_dof_covered
         total_functions += len(results)
 
         # Aggregate per-category stats for the report (feeds next run's priors)
@@ -817,6 +866,8 @@ def profile_codebase(
                 "total": file_total,
                 "equivalent": file_equiv,
                 "universe": file_universe,
+                "dof": file_dof,
+                "dof_covered": file_dof_covered,
                 "kill_pct": kill_pct,
                 "elapsed_ms": round(file_ms),
             }
@@ -847,6 +898,9 @@ def profile_codebase(
         "total_mutants": total_mutants,
         "total_equivalent": total_equivalent,
         "total_universe": total_universe,
+        "total_dof": total_dof,
+        "total_dof_covered": total_dof_covered,
+        "dof_pct": round(100 * total_dof_covered / max(total_dof, 1)),
         "kill_pct": kill_pct,
         "total_functions": total_functions,
         "passes": passes,

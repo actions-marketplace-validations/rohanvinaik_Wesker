@@ -53,16 +53,19 @@ def _load_config() -> dict:
         exclude: list[str] — files to exclude from mutation profiling
         mcdc_targets: list[list[str]] — [[file, function], ...] for MC/DC
         project_name: str — display name (defaults to pyproject.toml [project].name)
-        max_per_category: int — mutants per category per pass (default 5)
-        convergence_passes: int — number of convergence passes (default 3)
+        max_per_category: int — mutants per category per pass. Unset (the default)
+            derives the budget per function from its own degrees of freedom, so a
+            single pass covers every behavioral dimension; 0 = exhaustive.
+        convergence_passes: int — number of convergence passes (default 1: DOF
+            coverage is complete after one pass; more only deepen within dimensions)
     """
     config: dict = {
         "source_dir": "",
         "exclude": [],
         "mcdc_targets": [],
         "project_name": "Project",
-        "max_per_category": 5,
-        "convergence_passes": 3,
+        "max_per_category": None,
+        "convergence_passes": 1,
     }
 
     pyproject = Path("pyproject.toml")
@@ -460,9 +463,15 @@ def main():
 
     # 1. Mutation profiling (in-process, multi-pass convergence)
     passes = config.get("convergence_passes", 3)
-    max_per_cat = config.get("max_per_category", 5)
+    max_per_cat = config.get("max_per_category")
+    budget_note = (
+        "DOF-derived budget"
+        if max_per_cat is None
+        else ("exhaustive" if max_per_cat == 0 else f"{max_per_cat}/cat")
+    )
     print(
-        f"\n[1/4] Running in-process mutation profiling ({passes} passes, {max_per_cat}/cat)..."
+        f"\n[1/4] Running in-process mutation profiling ({passes} pass"
+        f"{'' if passes == 1 else 'es'}, {budget_note})..."
     )
     mutation = profile_codebase(
         ".",
@@ -484,6 +493,11 @@ def main():
         f"({mutation['kill_pct']}%) across {mutation['total_functions']} functions"
         f"{equiv_note}{coverage_note}"
     )
+    if mutation.get("total_dof"):
+        print(
+            f"  DOF: {mutation['total_dof_covered']}/{mutation['total_dof']} dimensions "
+            f"({mutation['dof_pct']}%) covered by {mutation['total_mutants']}/{universe} mutants"
+        )
     for f, d in sorted(mutation["per_file"].items()):
         status = "OK" if d["kill_pct"] == 100 else f"{d['kill_pct']}%"
         file_note = (
@@ -558,6 +572,11 @@ def main():
         "MUTATION_UNIVERSE": mutation.get("total_universe", 0),
         "MUTATION_KILL_PCT": mutation["kill_pct"],
         "MUTATION_PASSES": mutation.get("passes", 1),
+        # DOF coverage — exact (singleton covers), so it badges as a measured
+        # fraction of the behavioral-dimension space, not a sampling estimate.
+        "DOF_TOTAL": mutation.get("total_dof", 0),
+        "DOF_COVERED": mutation.get("total_dof_covered", 0),
+        "DOF_PCT": mutation.get("dof_pct", 0),
         "MEAN_SIGMA": mean_sigma,
         "TEST_COUNT": test_count,
         "SOURCE_LOC": source_loc,

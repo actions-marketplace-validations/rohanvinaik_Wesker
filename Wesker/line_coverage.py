@@ -24,13 +24,21 @@ from typing import Any, Callable
 
 
 def executable_lines(func_node: ast.FunctionDef | ast.AsyncFunctionDef) -> set[int]:
-    """The statement lines of a function body — the line-coverage denominator.
+    """Every line a function body's code occupies — the line-coverage denominator.
 
-    A line is *executable* when a statement begins on it; that is exactly the
-    granularity ``sys.settrace`` reports a "line" event for, so the covered set
-    (from tracing) and this set are keyed the same way. The ``def`` line itself and
-    a leading docstring are excluded: neither is behavior a test can meaningfully
-    "reach".
+    This must span EVERY line a mutation can land on, not just the line a statement
+    starts on. CPython reports a "line" event per executing sub-expression, so a
+    multi-line statement traces at 1010, 1011, 1012, … while it *begins* only at
+    1010; and a mutator records its fire site as the mutated NODE's own line
+    (``_BaseMutator._mark_applied``), which is likewise a sub-expression line. A
+    statement-start-only denominator drops those lines from the traced numerator
+    (``_trace_one`` intersects with this set), leaving ~a quarter of all mutants
+    keyed to a line no coverage entry can ever mention — and test-impact scoping
+    then finds zero covering tests and reports them as survivors no matter how
+    good the suite is. Spanning full statement extents keys the two together.
+
+    The ``def`` line and a leading docstring are excluded: neither is behavior a
+    test can meaningfully "reach".
     """
     body = list(func_node.body)
     if body and isinstance(body[0], ast.Expr) and isinstance(body[0].value, ast.Constant):
@@ -38,8 +46,11 @@ def executable_lines(func_node: ast.FunctionDef | ast.AsyncFunctionDef) -> set[i
     lines: set[int] = set()
     for stmt in body:
         for descendant in ast.walk(stmt):
-            if isinstance(descendant, ast.stmt):
-                lines.add(descendant.lineno)
+            start = getattr(descendant, "lineno", None)
+            if start is None:
+                continue
+            end = getattr(descendant, "end_lineno", None) or start
+            lines.update(range(start, end + 1))
     return lines
 
 

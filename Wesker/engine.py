@@ -60,6 +60,11 @@ class Mutant:
     # line a test must EXECUTE to observe this mutant — the key to test-impact scoping.
     # None when the mutator could not report it (falls back to running the full suite).
     mutated_line: int | None = None
+    # The behavioral dimension this mutant pins (``VALUE:int``, ``ARITHMETIC:Add``, …) —
+    # the cover set of the greedy selection, which is a SINGLETON. Carried so a run can
+    # report DOF coverage exactly (distinct dimensions reached / this function's DOF)
+    # instead of inferring it from the selection. "" when unrecorded (greedy=False).
+    dimension: str = ""
 
 
 @dataclass
@@ -178,6 +183,15 @@ class ProfilingResult:
     elapsed_ms: float = 0.0
     total_equivalent: int = 0
     universe_size: int = 0
+    # --- DOF coverage: the claim a bounded run can actually make ------------------
+    # ``universe_size`` counts mutation TARGETS; these count the distinct behavioral
+    # DIMENSIONS those targets pin. Because each target's cover set is a singleton,
+    # the greedy round-robin covers min(picks, D) of D exactly — so dof_covered /
+    # dof_total is a measured, exact coverage fraction, not an estimate or a bound.
+    # It states which DIMENSIONS were reached, NOT that untested mutants would die:
+    # two sites sharing a dimension are still distinct behaviors.
+    dof_total: int = 0
+    dof_covered: int = 0
     # Second completeness axis, from a traced baseline pass over the unmutated
     # function: which target lines each test covers, and the executable-line
     # denominator. Empty when no baseline pass ran (backward-compatible).
@@ -242,6 +256,13 @@ class ProfilingResult:
             "total_survived": self.total_survived,
             "total_equivalent": self.total_equivalent,
             "universe_size": self.universe_size,
+            "dof_total": self.dof_total,
+            "dof_covered": self.dof_covered,
+            "dof_pct": (
+                round(100 * self.dof_covered / self.dof_total)
+                if self.dof_total > 0
+                else 100
+            ),
             "survival_rate": round(self.survival_rate, 3),
             "effective_kill_pct": effective_kill_pct,
             "coverage_depth": self.coverage_depth,
@@ -795,7 +816,7 @@ def _content_mutant_id(category: MutationCategory, mutated_node: ast.AST) -> str
 
 def _generate_state_mutants(
     func_node: ast.FunctionDef,
-    max_per_category: int,
+    max_per_category: int | None,
     greedy: bool = True,
     pass_index: int = 0,
 ) -> list[Mutant]:
@@ -822,14 +843,18 @@ def _generate_state_mutants(
 
     for mode, desc, counter in sub_modes:
         target_count = sum(counter(node) for node in ast.walk(func_node))
-        limit = (
-            min(target_count, max_per_category)
-            if max_per_category > 0
-            else target_count
+        # Each sub-mode is selected against its own budget; in DOF mode that is
+        # the sub-mode's own degrees of freedom (distinct state fields, or the
+        # single return_none dimension).
+        keys = _record_state_dimensions(func_node, mode) if greedy else []
+        budget = (
+            _live_dimension_count(keys)
+            if max_per_category is None
+            else max_per_category
         )
+        limit = min(target_count, budget) if budget > 0 else target_count
 
-        if greedy and max_per_category > 0 and target_count > limit:
-            keys = _record_state_dimensions(func_node, mode)
+        if greedy and budget > 0 and target_count > limit:
             selected = _select_greedy(keys, target_count, limit, pass_index)
         else:
             selected = list(range(limit))
@@ -852,6 +877,7 @@ def _generate_state_mutants(
                         mutant_id=mid,
                         target_index=i,
                         mutated_line=transformer.mutated_lineno,
+                        dimension=keys[i] if i < len(keys) else "",
                     )
                 )
 
@@ -952,6 +978,198 @@ def _record_state_dimensions(func_node: ast.FunctionDef, mode: str) -> list[str]
     return mutator.keys
 
 
+def _live_dimension_count(keys: list[str]) -> int:
+    """Distinct behavioral dimensions among candidate sites (dead sites excluded)."""
+    return len({k for k in keys if not _is_dead(k)})
+
+
+def _baseline_failures(
+    test_functions: list[Callable[..., None]],
+    original_func: Callable[..., Any] | None,
+    qualname: str | None,
+    timeout_ms: float = 5000,
+) -> set[int]:
+    """``id()`` of every test that FAILS against the UNMUTATED function, under
+    ``evaluate_mutant``'s own call convention.
+
+    Such a test fails no matter what the mutation does, so crediting it with a kill
+    measures the harness, not the suite. It cannot distinguish correct code from a
+    mutant and must be barred from attribution entirely.
+
+    Keyed by identity, not name: parametrized cases share a ``__name__``, and only
+    some of them may be runnable.
+
+    WHY this exists next to ``failing_on_baseline`` rather than inside it: the two
+    answer different questions and must not be merged. ``failing_on_baseline`` asks
+    "is this test's EXPECTATION wrong?" and counts only ``AssertionError`` on a bare
+    ``test_fn()``, staying deliberately conservative because its answer is shown to a
+    human as "your test may be broken". This asks "can this test distinguish anything
+    AT ALL?" — any outcome other than pass disqualifies it, because a test that
+    cannot run cannot detect. Conflating them either accuses innocent tests or
+    credits inert ones.
+
+    Measured on prism/economics.py::analyze (131 mutants): TestAnalyze.test_basic_output
+    was credited with 123 crash "kills" while calling ``analyze`` exactly ZERO times —
+    it is a bound method needing ``(tmp_path, monkeypatch)`` fixtures, so it raised
+    TypeError before reaching the function under test, identically on the original.
+    """
+    if original_func is None or not qualname:
+        return set()
+    func_name = qualname.split(".")[-1]
+    # A baseline is only meaningful against the GENUINE original. Several callers
+    # deliberately STUB original_func (e.g. ``lambda *_a: None``) when they only want
+    # the mutation loop; running the suite against a stub makes every real test "fail
+    # on baseline", drops the entire suite, and reports the resulting survivors as an
+    # honest result. Identity check, matching the convention the tracer already uses:
+    # the callable must actually be the function we are mutating.
+    probe = _unwrap_descriptor(original_func)
+    if getattr(probe, "__name__", None) != func_name:
+        return set()
+    inert: set[int] = set()
+    for test_fn in test_functions:
+        patched, saved, patch_target = _patch_mutant_into_test(
+            test_fn, qualname, original_func
+        )
+        try:
+            if (
+                _run_test_with_timeout(test_fn, probe, patched, timeout_ms)
+                is not None
+            ):
+                inert.add(id(test_fn))
+        except Exception:  # noqa: BLE001 — an unrunnable baseline is itself inert
+            inert.add(id(test_fn))
+        finally:
+            _unpatch_mutant(patched, saved, patch_target, func_name)
+    return inert
+
+
+def _build_test_scope(
+    func_node: ast.FunctionDef,
+    test_functions: list[Callable[..., None]],
+    original_func: Callable[..., Any] | None,
+    scope_tests: bool,
+    precomputed_line_data: tuple[dict[str, list[int]], list[str]] | None = None,
+    qualname: str | None = None,
+) -> tuple[
+    Callable[[Mutant], list[Callable[..., None]]],
+    dict[str, list[int]],
+    list[int],
+    list[str],
+]:
+    """Build the mutant -> covering-tests resolver shared by both profiling entry points.
+
+    Two independent filters, in order:
+
+    1. ATTRIBUTION. A test that fails against the UNMUTATED original fails regardless
+       of any mutation, so it cannot distinguish a mutant from correct code. Such a
+       test is dropped from the kill loop entirely (see ``_baseline_failures``). This
+       is the honesty guard: without it, one unrunnable test manufactures a 100% kill
+       rate. It applies to the scoped AND unscoped paths — they share this resolver,
+       so a defect here cannot hide on one side.
+
+    2. SCOPING. A test can only kill a mutant if it EXECUTES the mutated line, so
+       evaluating each mutant against just the tests covering that line yields
+       identical verdicts at a fraction of the cost. Verdict-EXACTNESS rests on:
+
+         * an empty covering set is only meaningful for a line the coverage data COULD
+           have described. A line outside the traced denominator means "no data", not
+           "no test", and must fall back to the full set.
+
+    Filter 1 is what makes filter 2 sound without a compensation hack. A fails-on-
+    baseline test used to be force-joined to EVERY scoped set, so that scoped matched
+    unscoped — the two agreed, but on an inflated number. Barring it from attribution
+    makes both honest, and the two still agree.
+
+    Returns ``(_tests_for, line_cov, exec_lines, failing)`` so callers can also report
+    the line-coverage axis. Lives here, used by both ``run_function_profiling`` and
+    ``run_function_converged``, so the two can never drift apart on soundness.
+    """
+    exec_lines = sorted(_executable_lines(func_node))
+    if precomputed_line_data is not None:
+        # An adaptive-probe caller already ran this baseline over the same tests+function;
+        # reuse it so a probe + follow-up run don't trace twice. Deterministic, so the
+        # reused map is identical to what a fresh trace would produce here.
+        line_cov, failing = precomputed_line_data
+    elif original_func is not None:
+        line_cov = _trace_line_coverage(test_functions, original_func, set(exec_lines))
+        failing = _failing_on_baseline(test_functions, original_func)
+    else:
+        line_cov, failing = {}, []
+
+    # Filter 1 — bar tests that cannot distinguish anything from the kill loop.
+    inert = _baseline_failures(test_functions, original_func, qualname)
+    usable = [t for t in test_functions if id(t) not in inert] if inert else test_functions
+
+    # Parametrized cases share a __name__, so one name maps to many callables.
+    tests_by_name: dict[str, list[Callable[..., None]]] = {}
+    for _tf in usable:
+        tests_by_name.setdefault(getattr(_tf, "__name__", "unknown"), []).append(_tf)
+    covering_by_line: dict[int, list[Callable[..., None]]] = {}
+    if scope_tests and line_cov:
+        for tname, lines in line_cov.items():
+            fns = tests_by_name.get(tname, [])
+            for ln in lines:
+                covering_by_line.setdefault(ln, []).extend(fns)
+
+    exec_line_set = set(exec_lines)
+
+    def _tests_for(mutant: Mutant) -> list[Callable[..., None]]:
+        if not scope_tests or not line_cov or mutant.mutated_line is None:
+            return usable  # cannot scope safely — run the full usable set
+        if mutant.mutated_line not in exec_line_set:
+            return usable  # no data for this line — cannot scope safely
+        return covering_by_line.get(mutant.mutated_line, [])
+
+    return _tests_for, line_cov, exec_lines, failing
+
+
+def dimension_budget(
+    func_node: ast.FunctionDef,
+    category: MutationCategory,
+    docstring_positions: set[tuple[int, int]] | None = None,
+) -> int:
+    """The DOF-derived per-category budget: this function's degrees of freedom.
+
+    A category's cover sets are SINGLETONS — each target site pins exactly one
+    behavioral dimension (``VALUE:int``, ``ARITHMETIC:Add``, …), recorded by the
+    category's own mutator in record mode. Under singleton covers the greedy
+    round-robin of :func:`_greedy_dimension_order` covers ``min(m, D)`` of ``D``
+    dimensions after ``m`` picks, so ``m = D`` covers every dimension EXACTLY —
+    greedy is optimal here, not merely within ``(1−1/e)``.
+
+    ``D`` is therefore the budget at which one pass reaches full DOF coverage,
+    and any larger budget buys no additional dimension. It is the natural budget
+    the theory names; a hardcoded constant is either short of it (partial DOF) or
+    past it (redundant mutants within an already-covered dimension).
+
+    STATE is generated as two independent sub-modes with separate target indices,
+    each selected against its own budget, so its DOF is the sum of the two.
+    Static: AST walk only, no compilation, no execution.
+    """
+    if category is MutationCategory.STATE:
+        return sum(
+            _live_dimension_count(_record_state_dimensions(func_node, mode))
+            for mode in ("remove_assign", "return_none")
+        )
+    return _live_dimension_count(
+        _record_dimensions(func_node, category, docstring_positions)
+    )
+
+
+def dof_universe(
+    func_node: ast.FunctionDef,
+    categories: set[MutationCategory],
+) -> int:
+    """Total degrees of freedom of a function — the DOF-coverage denominator.
+
+    The behavioral-dimension analogue of :func:`estimate_universe_size`: that
+    counts mutation *targets*, this counts the distinct *dimensions* those targets
+    pin. Reported alongside the mutant universe so a run states what fraction of
+    the DOF space it covered.
+    """
+    return sum(dimension_budget(func_node, cat) for cat in categories)
+
+
 def _greedy_dimension_order(keys: list[str]) -> list[int]:
     """Greedy submodular order over target indices by their dimension keys.
 
@@ -1013,7 +1231,7 @@ def _select_greedy(
 def generate_mutants(
     func_node: ast.FunctionDef,
     categories: set[MutationCategory],
-    max_per_category: int = 0,
+    max_per_category: int | None = 0,
     seed: int | None = None,
     category_order: list[MutationCategory] | None = None,
     greedy: bool = True,
@@ -1023,8 +1241,12 @@ def generate_mutants(
 
     Args:
         func_node: The function AST node to mutate.
-        categories: Set of mutation categories to generate.
-        max_per_category: Max mutants per category (0 = unlimited).
+        max_per_category: Max mutants per category. ``None`` (DOF mode) derives
+              the budget per category from the function itself —
+              :func:`dimension_budget`, the count of distinct behavioral
+              dimensions — so one pass covers every dimension exactly once and
+              no budget is spent re-covering one. ``0`` = unlimited (exhaustive);
+              a positive int pins an explicit budget.
         seed: Legacy deterministic shuffle seed. Only consulted when
               ``greedy=False`` (see below); retained for backward compatibility
               and the exhaustive/random-sampling fallback. ``None`` preserves
@@ -1065,16 +1287,19 @@ def generate_mutants(
             continue
 
         target_count = _count_targets(func_node, cat)
-        limit = (
-            min(target_count, max_per_category)
-            if max_per_category > 0
-            else target_count
+        # DOF mode (max_per_category is None): the budget IS this category's
+        # degrees of freedom, so one pass covers every dimension exactly once.
+        keys = _record_dimensions(func_node, cat, ds_pos) if greedy else []
+        budget = (
+            _live_dimension_count(keys)
+            if max_per_category is None
+            else max_per_category
         )
+        limit = min(target_count, budget) if budget > 0 else target_count
 
-        if max_per_category > 0 and target_count > limit:
+        if budget > 0 and target_count > limit:
             if greedy:
                 # Layer 2: greedy submodular selection by behavioral dimension.
-                keys = _record_dimensions(func_node, cat, ds_pos)
                 selected = _select_greedy(keys, target_count, limit, pass_index)
             elif seed is not None:
                 # Legacy fallback: deterministic pseudo-random shuffle.
@@ -1106,6 +1331,7 @@ def generate_mutants(
                         mutant_id=mid,
                         target_index=i,
                         mutated_line=transformer.mutated_lineno,
+                        dimension=keys[i] if i < len(keys) else "",
                     )
                 )
 
@@ -1666,6 +1892,35 @@ def evaluate_mutant(
                     patched,
                     remaining_ms,
                 )
+                # A failure is only a KILL if the mutation CAUSED it. When the mutant
+                # could not be patched into the test's namespace, the unpatched path
+                # INJECTS it as a positional argument — a contract only Wesker's own
+                # inline tests observe. A discovered test with an unfilled fixture
+                # parameter receives the mutant AS the fixture and fails on garbage;
+                # that failure is about the fixture, not the mutation. Confirm by
+                # re-running with the ORIGINAL injected identically: if it fails the
+                # same way, the test cannot distinguish the two and detected nothing.
+                #
+                # Measured on prism/economics.py::analyze: without this,
+                # test_nudge_contains_tool_count (another module; never references
+                # `analyze`; needs a `tmp_state` fixture) was credited with 118 of 131
+                # "assertion kills" — a 100% kill rate that was almost entirely this
+                # artifact. failing_on_baseline cannot catch it: it calls test_fn()
+                # with no argument, which raises TypeError, and it only counts
+                # AssertionError. Only on failure, so a passing suite pays nothing.
+                if result is not None and not patched and original_func is not None:
+                    result = (
+                        None
+                        if _outcome_on_original(
+                            test_fn,
+                            original_func,
+                            module_saved,
+                            func_name,
+                            max(timeout_ms - _elapsed(start), 1.0),
+                        )
+                        == result
+                        else result
+                    )
                 if result is not None:
                     tname = getattr(test_fn, "__name__", "unknown")
                     if record_all_killers:
@@ -1712,6 +1967,47 @@ def evaluate_mutant(
         for _mod, _orig in module_saved:
             try:
                 setattr(_mod, func_name, _orig)
+            except Exception:
+                pass
+
+
+def _outcome_on_original(
+    test_fn: Callable[..., None],
+    original_func: Callable[..., Any],
+    module_saved: list[tuple[Any, Any]],
+    func_name: str | None,
+    remaining_ms: float,
+) -> str | None:
+    """Re-run ``test_fn`` against the ORIGINAL and return its outcome — the attribution
+    control for a test the mutant could not be patched INTO.
+
+    The module-qualified bindings must be restored for this call, not merely the injected
+    argument. Injection is a contract only Wesker's own inline tests observe; a DISCOVERED
+    test calls through its module and ignores the injected value, so with ``module_saved``
+    still installed both runs execute the MUTANT, agree trivially, and a real kill is
+    discarded. That is not hypothetical: a parametrized case is bound through a wrapper
+    whose ``__globals__`` carry no target binding, so ``patched`` is False for EVERY
+    parametrized test — every kill they earn would be nullified, silently, in any suite
+    that uses ``@pytest.mark.parametrize``.
+
+    The live patched objects are captured and re-installed verbatim afterwards, which keeps
+    the descriptor shape ``_patch_module_qualified`` built for class-method owners.
+    """
+    live: list[tuple[Any, Any]] = []
+    for target, saved in module_saved:
+        try:
+            live.append((target, _get_raw_attr(target, func_name)))
+            setattr(target, func_name, saved)
+        except Exception:
+            continue
+    try:
+        return _run_test_with_timeout(
+            test_fn, _unwrap_descriptor(original_func), False, remaining_ms
+        )
+    finally:
+        for target, current in live:
+            try:
+                setattr(target, func_name, current)
             except Exception:
                 pass
 
@@ -1944,49 +2240,10 @@ def run_function_profiling(
     if mutant_slice is not None:
         mutants = mutants[mutant_slice[0] : mutant_slice[1]]
 
-    # Baseline line-coverage pass over the UNMUTATED function — the second
-    # completeness axis. Each test runs once against the original under a tracer;
-    # the mutation loop below stays untraced (and fast). Degrades to empty when the
-    # original is unavailable, so existing callers/output are unchanged.
-    exec_lines = sorted(_executable_lines(func_node))
-    if precomputed_line_data is not None:
-        # An adaptive-probe caller already ran this baseline over the same tests+function;
-        # reuse it so a probe + follow-up run don't trace line coverage twice. Deterministic,
-        # so the reused map is identical to what a fresh trace would produce here.
-        line_cov, failing = precomputed_line_data
-    else:
-        line_cov = _trace_line_coverage(test_functions, original_func, set(exec_lines))
-        failing = _failing_on_baseline(test_functions, original_func)
-
-    # Test-impact scoping. A test can only kill a mutant if it EXECUTES the mutated
-    # line, so evaluating each mutant against just the tests covering its line yields
-    # identical verdicts at a fraction of the cost. Kept verdict-EXACT vs the full run:
-    # a failing-on-baseline test kills every mutant it runs (it fails regardless), and the
-    # full path runs it against all mutants — so those tests are added to EVERY scoped set.
-    # Scoping is skipped (full set used) when line data is unavailable or a mutant did not
-    # report its line. Parametrized cases share a __name__, so one name maps to many fns.
-    tests_by_name: dict[str, list[Callable[..., None]]] = {}
-    for _tf in test_functions:
-        tests_by_name.setdefault(getattr(_tf, "__name__", "unknown"), []).append(_tf)
-    always_run = [fn for name in failing for fn in tests_by_name.get(name, [])]
-    covering_by_line: dict[int, list[Callable[..., None]]] = {}
-    if scope_tests and line_cov:
-        for tname, lines in line_cov.items():
-            fns = tests_by_name.get(tname, [])
-            for ln in lines:
-                covering_by_line.setdefault(ln, []).extend(fns)
-
-    def _tests_for(mutant: Mutant) -> list[Callable[..., None]]:
-        if not scope_tests or not line_cov or mutant.mutated_line is None:
-            return test_functions  # cannot scope safely — run the full set
-        covering = covering_by_line.get(mutant.mutated_line, [])
-        return covering + always_run if always_run else covering
-
-    results_by_cat: dict[MutationCategory, CategoryResult] = {}
-    kill_matrix: dict[str, list[str]] = {}
-    survivor_records: list[dict] = []
-    killed_records: list[dict] = []
-    budget_exhausted = False
+    # Baseline line-coverage pass over the UNMUTATED function (the second completeness
+    # axis) plus the test-impact scoping resolver built from it. Each test runs once
+    # against the original under a tracer; the mutation loop below stays untraced (and
+    # fast). Degrades to the full test set when the original/line data is unavailable.
     qualname = (
         func_key.split("::", 1)[1]
         if "::" in func_key
@@ -1995,6 +2252,17 @@ def run_function_profiling(
     # func_key = 'rel/path.py::Qualname' — the (project-relative) source path callers know but do not
     # pass to evaluate_mutant (original_func is stubbed by some callers, so its co_filename is useless).
     source_path = func_key.split("::", 1)[0] if "::" in func_key else None
+
+    _tests_for, line_cov, exec_lines, failing = _build_test_scope(
+        func_node, test_functions, original_func, scope_tests, precomputed_line_data,
+        qualname,
+    )
+
+    results_by_cat: dict[MutationCategory, CategoryResult] = {}
+    kill_matrix: dict[str, list[str]] = {}
+    survivor_records: list[dict] = []
+    killed_records: list[dict] = []
+    budget_exhausted = False
 
     mem_budget = _resolve_budget(mem_budget_mb)
     total_m = len(mutants)
@@ -2297,25 +2565,56 @@ def run_function_converged(
     test_functions: list[Callable[..., None]],
     original_func: Callable[..., Any] | None,  # kept for API symmetry
     budget_ms: float = 5000,
-    max_per_category: int = 5,
+    max_per_category: int | None = None,
     per_mutant_timeout_ms: float = 500,
-    passes: int = 3,
+    passes: int = 1,
     category_order: list[MutationCategory] | None = None,
     full_matrix: bool = False,
     source_path: str | None = None,
+    scope_tests: bool = False,
 ) -> ProfilingResult:
     """Multi-pass convergence with integrated equivalence detection.
+
+    ``scope_tests`` defaults to False here — preserving this path's historical
+    behaviour — but that default is NOT an endorsement: the two settings disagree
+    wildly and WHICH ONE IS RIGHT IS UNRESOLVED. Measured on
+    prism/economics.py::analyze (identical 130-mutant set, budget not exhausted):
+
+        scope_tests=False -> 130 killed (110 by assertion)   33.6s
+        scope_tests=True  ->   2 killed                       1.8s
+
+    The unscoped number is demonstrably inflated. 107 of those "assertion kills" are
+    credited to ``test_nudge_contains_tool_count``, which lives in
+    tests/test_compaction_trigger.py, imports only ``prism.compaction_trigger``, and
+    never references ``analyze``. It takes a ``tmp_state`` fixture the direct-call
+    contract cannot supply, so it fails the same way for every mutant AND for the
+    unmutated original — a test that cannot distinguish anything is credited with
+    killing everything. ``trace_line_coverage`` correctly records 0 covered lines for
+    it, which is why scoping drops it.
+
+    ``failing_on_baseline`` is the guard meant to catch exactly this, but it reports
+    0/421 here: it only counts ``AssertionError``, and a missing-fixture test raises
+    ``TypeError`` first. So the guard never fires and the kill is attributed anyway.
+
+    The real defect is upstream of scoping: a test that fails identically on the
+    UNMUTATED function must never be credited with a kill, whatever the reason it
+    fails. Until that holds, neither setting can be trusted — do not tune this flag
+    to make a number look better.
 
     Returns ``ProfilingResult`` with full kill matrix, survivor/killed
     records, and gateability — compatible with downstream consumers
     (gap classifiers, convergence engines, cross-channel gates).
 
-    Each pass p takes the next window of the greedy behavioral-dimension
-    order (Layer 2), so ``max_per_category`` fresh mutants are drawn per
-    category per pass, extending the (1−1/e)-optimal coverage prefix rather
-    than re-rolling a random subset. Across N passes, tests exactly up to
-    N × max_per_category unique mutants per category. Surviving mutants are
-    checked for semantic equivalence via boundary input evaluation.
+    ``max_per_category=None`` (the default) is DOF mode: each category's budget
+    is the function's own :func:`dimension_budget`, so a SINGLE pass covers every
+    behavioral dimension exactly once — full DOF coverage at the fewest mutants
+    that can achieve it. Additional passes then deepen WITHIN already-covered
+    dimensions (a second mutant per dimension, a third, …), which buys kill
+    evidence but no new DOF; hence ``passes=1`` by default. A positive
+    ``max_per_category`` pins an explicit per-pass budget instead, and each pass p
+    takes the next window of the greedy order, extending the coverage prefix
+    rather than re-rolling a random subset. Surviving mutants are checked for
+    semantic equivalence via boundary input evaluation.
 
     When ``category_order`` is provided (from Layer 2 predictive priors),
     mutants are generated in priority order within each pass. If budget
@@ -2328,6 +2627,8 @@ def run_function_converged(
     """
     start = time.monotonic()
     universe = estimate_universe_size(func_node, categories)
+    dof_total = dof_universe(func_node, categories)
+    dims_covered: set[str] = set()
     qualname = (
         func_key.split("::", 1)[1]
         if "::" in func_key
@@ -2336,6 +2637,14 @@ def run_function_converged(
     # func_key = 'rel/path.py::Qualname' — the (project-relative) source path callers know but do not
     # pass to evaluate_mutant (original_func is stubbed by some callers, so its co_filename is useless).
     source_path = func_key.split("::", 1)[0] if "::" in func_key else None
+
+    # Test-impact scoping (shared with run_function_profiling — one implementation, so
+    # the two paths cannot drift on soundness). Engages only when ``original_func`` is a
+    # real callable to trace against; callers that stub it get the full test set, which
+    # is always sound, just slower.
+    _tests_for, line_cov, exec_lines, failing = _build_test_scope(
+        func_node, test_functions, original_func, scope_tests, None, qualname
+    )
 
     seen: dict[str, MutantResult] = {}
     kill_matrix: dict[str, list[str]] = {}
@@ -2358,14 +2667,17 @@ def run_function_converged(
             if _elapsed(start) > budget_ms:
                 break
 
+            # Only the tests that EXECUTE this mutant's line can kill it; the rest
+            # behave identically under the mutation, so running them is pure cost.
+            scoped = _tests_for(mutant)
             result = evaluate_mutant(
                 mutant,
-                test_functions,
+                scoped,
                 original_func,  # type: ignore[arg-type]
                 # Full-matrix mode runs every test, so budget for the whole
                 # suite (~50ms/test) rather than the first-killer per-mutant cap.
                 timeout_ms=(
-                    max(per_mutant_timeout_ms, 50.0 * len(test_functions))
+                    max(per_mutant_timeout_ms, 50.0 * len(scoped))
                     if full_matrix
                     else per_mutant_timeout_ms
                 ),
@@ -2385,6 +2697,8 @@ def run_function_converged(
                     )
 
             seen[mutant.mutant_id] = result
+            if mutant.dimension and not _is_dead(mutant.dimension):
+                dims_covered.add(f"{mutant.category.value}\x00{mutant.dimension}")
 
             # Build kill matrix and records for downstream consumers
             record = {
@@ -2459,6 +2773,8 @@ def run_function_converged(
         total_equivalent=equiv,
         universe_size=universe,
         survival_rate=survived / total if total > 0 else 0.0,
+        dof_total=dof_total,
+        dof_covered=len(dims_covered),
         coverage_depth=depth,
         is_gateable=depth == "profiled",
         per_category=per_cat,
