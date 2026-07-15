@@ -5,6 +5,9 @@ dist/
 build/
 .wesker/
 .wesker-report.json
+# Detective's analysis artifacts — Wesker is dogfooded with it (ARCHITECTURE §11),
+# which drops reports/caches here. Regeneratable; never part of the package.
+.detective/
 .coverage
 coverage.xml
 .venv/
