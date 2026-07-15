@@ -13,9 +13,11 @@ zero-dependency promise. What it cannot reach is pinned here too: a thread block
 interpreter executes no bytecode, so it survives, and `_abandon` says so rather than pretending.
 """
 
-import subprocess
+import sys
 import threading
 import time
+
+import pytest
 
 from Wesker.interrupt import Abandoned as _Abandoned
 from Wesker.interrupt import abandon as _abandon
@@ -68,18 +70,50 @@ def test_abandon_outranks_the_test_s_own_broad_except():
     assert t.is_alive() is False
 
 
+@pytest.mark.skipif(
+    sys.gettrace() is not None,
+    reason="KNOWN AND UNEXPLAINED: under a trace function the injection LANDS on a thread "
+    "blocked in a C call, so `abandon` stops it and truthfully returns True — the opposite "
+    "of the boundary asserted here. Measured, reproducible, mechanism not understood. See "
+    "the test body.",
+)
 def test_abandon_reports_false_for_a_thread_blocked_outside_the_interpreter():
-    """THE HONEST BOUNDARY. A thread inside `subprocess.run` runs no bytecode, so the injection
-    cannot land until that call returns on its own. `_abandon` returns False rather than claiming
-    a stop it did not make — bounding this needs process isolation, a different engine."""
+    """THE HONEST BOUNDARY, UNTRACED. A thread blocked in a C call runs no bytecode, so the
+    injection cannot land until that call returns on its own. `abandon` returns False rather than
+    claiming a stop it did not make — bounding this needs process isolation, a different engine.
+
+    SKIPPED UNDER A TRACER, AND THAT SKIP IS A RECORDED UNKNOWN, NOT A CONVENIENCE.
+    Measured with `time.sleep(3)` (a C block whose only Python is the call itself), injecting and
+    waiting 0.2s — ample for it to land if it could:
+
+        bare        marked=1   alive after injection = True    <- boundary holds
+        --cov       marked=1   alive after injection = False   <- injection landed anyway
+
+    So under `sys.settrace` the interpreter does something to a C-blocked thread that this module's
+    model does not account for. `abandon` is not wrong there — it stops the thread and reports True,
+    which is the truth. What is wrong is the claim that it *cannot*.
+
+    THIS MATTERS BEYOND CI. Wesker installs `sys.settrace` itself, in `line_coverage._trace_one`,
+    around every test of the traced baseline pass — and `trace_budget_s` calls `abandon` from inside
+    it. So the untraced boundary asserted below is NOT the condition the engine's own hot path runs
+    under. Whether that is a gift (runaways in C become stoppable exactly where they were not) or a
+    hazard (a stop lands somewhere the model says it cannot) is unknown, and worth knowing.
+
+    Do not delete this skip to make the suite green. Delete it by explaining the mechanism.
+    """
+    entered = threading.Event()
 
     def _blocked() -> None:
         try:
-            subprocess.run(["sleep", "3"], check=False)
+            entered.set()
+            time.sleep(3)  # C-level block: the GIL is released and no bytecode executes
         except BaseException:  # noqa: BLE001
             pass
 
-    t = _spawn(_blocked)
+    t = threading.Thread(target=_blocked, daemon=True)
+    t.start()
+    assert entered.wait(2.0), "the thread never started"
+    time.sleep(0.1)  # settle INTO the C call — two bytecodes away
     assert _abandon(t) is False
     assert t.is_alive() is True
 

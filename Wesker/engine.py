@@ -669,7 +669,9 @@ class _ExceptionMutator(_BaseMutator):
         if self.current == self.target:
             repl = ast.Name(id=_swapped_exc(name), ctx=ast.Load())
             if isinstance(node.exc, ast.Call):
-                node.exc = ast.Call(func=repl, args=node.exc.args, keywords=node.exc.keywords)
+                node.exc = ast.Call(
+                    func=repl, args=node.exc.args, keywords=node.exc.keywords
+                )
             else:
                 node.exc = ast.Call(func=repl, args=[], keywords=[])
             self._mark_applied(node)
@@ -891,9 +893,7 @@ def _deletable_stmt_ids(func_node: ast.AST) -> set[tuple[int, int]]:
                 # So deletion is always safe regardless of what we can prove here.
                 out.add(_pos(st))
             elif isinstance(st, (ast.Assign, ast.AnnAssign)):
-                targets = (
-                    st.targets if isinstance(st, ast.Assign) else [st.target]
-                )
+                targets = st.targets if isinstance(st, ast.Assign) else [st.target]
                 names: list[str] = []
                 binds_nothing = True
                 for t in targets:

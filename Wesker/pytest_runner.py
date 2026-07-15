@@ -238,7 +238,10 @@ def run_in_session(
 
     class _Driver:
         def pytest_runtestloop(self, session):  # type: ignore[no-untyped-def]
-            if session.testsfailed and not session.config.option.continue_on_collection_errors:
+            if (
+                session.testsfailed
+                and not session.config.option.continue_on_collection_errors
+            ):
                 return None  # let pytest handle collection errors normally
             box["ran"] = True
             calls = session_callables(session, capture)

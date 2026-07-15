@@ -8,16 +8,70 @@ from Wesker.engine import _deletable_stmt_ids
 
 
 @pytest.mark.detective
-@pytest.mark.parametrize("args, expected", [
-        ((ast.parse("def _f(x, y):\n    total = x + y\n    total = abs(total)\n    if total > 10:\n        raise ValueError('big')\n    return round(total, 2)").body[0],), {(3, 4)}),
-        ((ast.parse('def _f():\n    pass').body[0],), set()),
-        ((ast.parse('def _f(items, x):\n    items.append(x)\n    return len(items)').body[0],), {(2, 4)}),
-        ((ast.parse('def _f(x):\n    try:\n        return int(x)\n    except ValueError:\n        return 0').body[0],), set()),
-        ((ast.parse('class C:\n    def _f(self, v):\n        self.v = v\n        return self.v').body[0].body[0],), {(3, 8)}),
-        ((ast.parse('def _f(xs, n):\n    a, b = 1, 2\n    a, b = b, a\n    *rest, last = xs\n    c: int = n\n    c: int = n + 1\n    return (a, b, rest, last, c)').body[0],), {(6, 4), (3, 4)}),
-        ((ast.parse('def _f(x):\n    try:\n        y = int(x)\n    except (TypeError, ValueError):\n        y = 0\n    else:\n        y = y + 1\n    finally:\n        pass\n    for i in range(2):\n        y = y + i\n    else:\n        y = y * 2\n    while y > 100:\n        y = y - 1\n    return y').body[0],), set()),
-        ((ast.parse('def _f(p, /, q=1, *args, r=2, **kwargs):\n    q = abs(q)\n    return (p, q, args, r, kwargs)').body[0],), {(2, 4)}),
-])
+@pytest.mark.parametrize(
+    "args, expected",
+    [
+        (
+            (
+                ast.parse(
+                    "def _f(x, y):\n    total = x + y\n    total = abs(total)\n    if total > 10:\n        raise ValueError('big')\n    return round(total, 2)"
+                ).body[0],
+            ),
+            {(3, 4)},
+        ),
+        ((ast.parse("def _f():\n    pass").body[0],), set()),
+        (
+            (
+                ast.parse(
+                    "def _f(items, x):\n    items.append(x)\n    return len(items)"
+                ).body[0],
+            ),
+            {(2, 4)},
+        ),
+        (
+            (
+                ast.parse(
+                    "def _f(x):\n    try:\n        return int(x)\n    except ValueError:\n        return 0"
+                ).body[0],
+            ),
+            set(),
+        ),
+        (
+            (
+                ast.parse(
+                    "class C:\n    def _f(self, v):\n        self.v = v\n        return self.v"
+                )
+                .body[0]
+                .body[0],
+            ),
+            {(3, 8)},
+        ),
+        (
+            (
+                ast.parse(
+                    "def _f(xs, n):\n    a, b = 1, 2\n    a, b = b, a\n    *rest, last = xs\n    c: int = n\n    c: int = n + 1\n    return (a, b, rest, last, c)"
+                ).body[0],
+            ),
+            {(6, 4), (3, 4)},
+        ),
+        (
+            (
+                ast.parse(
+                    "def _f(x):\n    try:\n        y = int(x)\n    except (TypeError, ValueError):\n        y = 0\n    else:\n        y = y + 1\n    finally:\n        pass\n    for i in range(2):\n        y = y + i\n    else:\n        y = y * 2\n    while y > 100:\n        y = y - 1\n    return y"
+                ).body[0],
+            ),
+            set(),
+        ),
+        (
+            (
+                ast.parse(
+                    "def _f(p, /, q=1, *args, r=2, **kwargs):\n    q = abs(q)\n    return (p, q, args, r, kwargs)"
+                ).body[0],
+            ),
+            {(2, 4)},
+        ),
+    ],
+)
 def test__deletable_stmt_ids_golden(args, expected):
     """VALUE golden captures — pure + deterministic (8 inputs)."""
     assert _deletable_stmt_ids(*args) == expected
