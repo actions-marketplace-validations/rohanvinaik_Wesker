@@ -796,8 +796,20 @@ class _LogicalMutator(_BaseMutator):
         return self.generic_visit(node)
 
 
-def _deletable_stmt_ids(func_node: ast.AST) -> set[int]:
-    """``id()`` of every statement in ``func_node`` whose deletion cannot raise NameError.
+def _deletable_stmt_ids(func_node: ast.AST) -> set[tuple[int, int]]:
+    """The SOURCE POSITION ``(lineno, col_offset)`` of every statement in ``func_node``
+    whose deletion cannot raise NameError.
+
+    POSITIONS, NOT ``id()``. An ``id()`` is a memory address: it is unique per run and
+    meaningless across runs, so this function's return value could never be asserted
+    against. Detective made that concrete — it could prove 29 of its mutants killable and
+    still write only ``assert _deletable_stmt_ids(...) == set()``, because the empty set
+    is the one answer stable enough to pin; every input with a deletable statement was
+    correctly dropped as non-deterministic. A function whose output cannot be written down
+    cannot be specified, and no amount of test generation fixes that from the outside.
+    A source position is stable across runs and identical in a ``deepcopy``, which is
+    exactly the property the caller needs (see :class:`_StmtMutator`) — so nothing is
+    lost and the contract becomes observable.
 
     STATEMENT DELETION (SDL) is the highest-value operator per the deletion-operator
     literature (Delamaro & Offutt): it is cheap, and it catches what operator-REPLACEMENT
@@ -832,9 +844,14 @@ def _deletable_stmt_ids(func_node: ast.AST) -> set[int]:
             x = 1
         x = 2      # NOT deletable — x is unbound when flag is False
 
-    stays out of the universe rather than becoming a spurious crash-kill.
+    stays out of the universe rather than becoming a spurious crash-kill. The same rule
+    means a rebinding inside a nested block is only seen when its first binding is in
+    that block too — deliberately narrow, since proving otherwise needs flow analysis.
     """
-    out: set[int] = set()
+    out: set[tuple[int, int]] = set()
+
+    def _pos(stmt: ast.stmt) -> tuple[int, int]:
+        return (getattr(stmt, "lineno", -1), getattr(stmt, "col_offset", -1))
 
     def _names(target: ast.AST) -> tuple[list[str], bool]:
         """(bound names, binds_nothing) for one assignment target."""
@@ -868,11 +885,11 @@ def _deletable_stmt_ids(func_node: ast.AST) -> set[int]:
         for st in stmts:
             if isinstance(st, ast.Expr):
                 if not isinstance(st.value, ast.Constant):
-                    out.add(id(st))  # docstring / bare literal has no side effect
+                    out.add(_pos(st))  # docstring / bare literal has no side effect
             elif isinstance(st, ast.AugAssign):
                 # ``x += 1`` REQUIRES x to already exist, or the original itself raises.
                 # So deletion is always safe regardless of what we can prove here.
-                out.add(id(st))
+                out.add(_pos(st))
             elif isinstance(st, (ast.Assign, ast.AnnAssign)):
                 targets = (
                     st.targets if isinstance(st, ast.Assign) else [st.target]
@@ -886,9 +903,9 @@ def _deletable_stmt_ids(func_node: ast.AST) -> set[int]:
                 if getattr(st, "value", None) is None:
                     pass  # bare annotation (``x: int``) — no runtime effect to delete
                 elif binds_nothing:
-                    out.add(id(st))  # x[k]=v / x.attr=v — the aliasing case
+                    out.add(_pos(st))  # x[k]=v / x.attr=v — the aliasing case
                 elif names and all(n in local for n in names):
-                    out.add(id(st))  # rebinding — the SDL case
+                    out.add(_pos(st))  # rebinding — the SDL case
                 local.update(names)
             # Nested blocks see the bindings established BEFORE them at this level.
             for block in _blocks(st):
@@ -961,7 +978,7 @@ class _StmtMutator(_BaseMutator):
 
     def __init__(self, target: int, *args, **kwargs) -> None:  # type: ignore[no-untyped-def]
         super().__init__(target, *args, **kwargs)
-        self._deletable: set[int] | None = None
+        self._deletable: set[tuple[int, int]] | None = None
 
     def visit(self, node: ast.AST) -> ast.AST:
         # The first node handed to a run IS the function; analyse it once, here, so both
@@ -973,7 +990,13 @@ class _StmtMutator(_BaseMutator):
         return super().visit(node)
 
     def _consider(self, node: ast.stmt) -> ast.AST:
-        if self.applied or self._deletable is None or id(node) not in self._deletable:
+        # Keyed by SOURCE POSITION, not id(): this mutator visits a deepcopy, whose nodes
+        # are different objects from the ones analysed but carry identical positions.
+        # (An id() set happened to work here — the analysis ran on this same copy — but it
+        # made the analysis's RETURN VALUE un-assertable, so the operator could not be
+        # specified. Positions cost nothing and are observable.)
+        pos = (getattr(node, "lineno", -1), getattr(node, "col_offset", -1))
+        if self.applied or self._deletable is None or pos not in self._deletable:
             return node
         if self.current == self.target:
             self._mark_applied(node)

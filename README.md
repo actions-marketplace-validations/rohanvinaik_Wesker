@@ -1,6 +1,6 @@
 # Wesker
 
-**Mutation testing at CI speed — with exhaustive-grade soundness and a provably optimal test budget.**
+**One mutant per behavioral dimension — provably optimal, and measured at exactly 1.00 on a real repository.**
 
 <p align="center">
   <a href="https://github.com/rohanvinaik/Wesker/actions/workflows/ci.yml"><img src="https://github.com/rohanvinaik/Wesker/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
@@ -13,7 +13,7 @@
   <a href="https://github.com/rohanvinaik/Wesker/actions/workflows/spec-badges.yml"><img src="https://raw.githubusercontent.com/rohanvinaik/Wesker/badges/.github/badges/mcdc.svg" alt="MC/DC"></a>
 </p>
 
-`7 semantic categories · (1−1/e)-optimal selection · Fully deterministic`
+`8 semantic categories · 1.00 mutants per behavioral dimension · Fully deterministic`
 
 <div align="center">
 
@@ -24,23 +24,51 @@ $$\mathrm{SC}(f)=1 \quad\Longleftrightarrow\quad \underbrace{\log_2\bigl\lvert\,
 
 </div>
 
-Mutation testing is the gold standard for measuring what your tests actually pin down: change the code, and see whether a test complains. Every mutation that slips through silently is a behavior your suite never constrained — a gap line coverage cannot see. DeMillo, Lipton, and Sayward formalized this in 1978, and for 48 years it has been too slow for routine use. The established tools — mutmut, cosmic-ray, PIT, Stryker — faithfully implement the original cost model and inherit its price: on real code, a full run takes hours.
+Mutation testing is the gold standard for measuring what your tests actually pin down: change the code, and see whether a test complains. Every mutation that slips through silently is a behavior your suite never constrained — a gap line coverage cannot see. DeMillo, Lipton, and Sayward formalized this in 1978.
 
-Wesker restructures the computation. A 100-function project profiles in under ten seconds, at the same soundness as an exhaustive run — it simply refuses to do work that provably cannot change a result.
+The cost has always been the objection, and the established tools have gotten fast: mutmut 3 pools workers and clears thousands of mutants a minute on a quick suite. But speed was only ever half the problem. The other half is that the *denominator is an artifact*. Enumerate every change an operator can express and you count the same gap many times over — most loudly in code with no tests at all, where every mutant survives and each one restates the identical fact. The number that comes out is weighted by the operator's enumeration, not by your code's behavior.
+
+Wesker counts the questions instead of the phrasings. It refuses to do work that provably
+cannot change a result, and spends what remains on one mutant per behavioral dimension —
+which is not a heuristic but the optimum, and the run below shows it reached exactly.
 
 ```
-Wesker — Prism Specification Metrics (3 passes, 5/cat)
+Detective — 23 files, 209 functions                     mutants   per dimension
 
-  [1/13] sources.py      212/212 [212/235] 904ms
-  [2/13] behavior.py       82/82 [82/173]  309ms
-  [3/13] economics.py      35/35 [35/118]  277ms
-  ...
-  [13/13] engine.py        84/84 [84/94]   197ms
+  behavioral dimensions (the distinct questions)          2,210            —
 
-Kill rate: 100% (1229/1229) | Universe: 2195 | 109 functions | 4.1s
+  mutmut 3      every mutant its operators can write      8,657         3.92
+  Wesker        exhaustive — the same thing, our operators 4,366         1.98
+  Wesker        DOF mode — one mutant per dimension        2,210         1.00
 ```
 
-1229 mutants across 7 categories, 109 functions, 13 files — a 100% kill rate in 4.1 seconds. Wesker tested 56% of the 2,195-mutant universe and killed every one; the rest is one flag away (`max_per_category=0` runs it exhaustively, identical to classical mutation testing). Those mutants were not sampled at random. They were **selected** — and that selection is where Wesker's speed stops being an engineering trick and becomes a theorem.
+**2,210 questions. mutmut asks them 8,657 times.**
+
+A mutation tester asks: *does your suite notice if I change this?* Some changes ask the
+same question. If a return value is unconstrained, the operator can express that one gap
+forty different ways and hand you forty survivors — forty copies of one fact. Your score
+is then weighted by how many ways the operator happened to enumerate each gap, which is a
+property of the operator, not of your code.
+
+Count the questions instead of the phrasings and Detective has **2,210** of them. mutmut
+evaluates 8,657 mutants to answer them — **3.92 per question**. Its own output shows why:
+**4,212 of those 8,657 (49%) are in code with no test at all** — one fact, *"this code is
+untested,"* reported four thousand times.
+
+Wesker's exhaustive mode is the same idea with tighter operators: 4,366 mutants, 1.98 per
+dimension. Anyone could build that. **DOF mode is the contribution — 2,210 mutants for
+2,210 dimensions. 1.00. Exactly one mutant per question, measured on a real repository.**
+
+That 1.00 is not a target that was tuned toward. Cover sets here are singletons, so greedy
+selection is *provably optimal* — not the (1−1/e) that bounds general submodular covers,
+but exact. The theorem says one mutant per dimension is achievable; the run says it was
+achieved. **A proof and its receipt.**
+
+And it costs nothing in what you learn: DOF mode reproduces the exhaustive run's
+dimension-level verdict with **98.26% agreement and zero false "specified" claims** — it
+never tells you a behavior is pinned when it isn't. Where it differs, it *under*-claims.
+Run `--complete` and the naive result comes back unchanged; that mode is not a fallback,
+it's the receipt you're invited to check.
 
 ---
 
@@ -54,7 +82,7 @@ Each surviving mutant is a specific alteration that changes behavior and goes un
 
 ---
 
-## Seven categories tell you *what kind* of gap you have
+## Eight categories tell you *what kind* of gap you have
 
 Not just "a mutant survived," but *which behavioral dimension* the tests leave unconstrained:
 
@@ -67,10 +95,18 @@ Not just "a mutant survived," but *which behavioral dimension* the tests leave u
 | **SWAP** | Argument order in calls | Tests can't distinguish argument positions |
 | **STATE** | `self.x = …`→dropped, `return x`→`return None` | Tests don't verify side effects or return values |
 | **TYPE** | `isinstance(x, T)`→`True` | Tests don't exercise type guards |
+| **STMT** | Deletes a statement: `items.append(y)`, `cfg[k] = v`, `total = abs(total)` | Tests don't notice the statement's effect at all |
+| **EXCEPTION** | Raised type, handler body→`pass`, caught type→`BaseException` | Tests don't pin what raises, what's caught, or what a handler does |
 
 The category **is** the diagnosis. A VALUE survivor says *assert the exact value, not just the shape*. A BOUNDARY survivor says *test at the boundary, not near it*. An ARITHMETIC survivor says *verify the computation, not just that it returns a number*. The fix is always specific — never "write more tests."
 
-Together these cover the standard operator set from the literature — AOR, ROR, COR, UOI — plus domain operators for state mutation and type guards.
+Together these cover the standard operator set from the literature — AOR, ROR (complete: boundary shift, direction reversal, equality collapse, and both predicate constants), COR, UOI — plus **SDL**, which the deletion-operator literature (Delamaro & Offutt) ranks among the highest-value operators precisely because it catches what operator-*replacement* structurally cannot, and domain operators for state, type guards and exception behavior.
+
+STMT and EXCEPTION exist because the gaps they cover all fail in the same direction — **the refactor passes and the behavior changed**:
+
+- `total = abs(total)` — no operator deleted a *rebinding*, so that mutant was not a survivor; it was outside the universe, uncounted.
+- `def f(cfg): cfg[k] = v` — mutating a caller's object had no operator at all (STATE only ever targeted `self.x`), so a refactor that copies instead of aliasing passed every return-value assertion a suite had.
+- Extraction across a `try` boundary changes what raises where — and nothing pinned it.
 
 ---
 
@@ -82,7 +118,9 @@ The cost drops multiplicatively across three layers. Each is provably safe: no i
 
 Traditional tools spawn a subprocess per mutant, rewrite source files on disk, and invoke the test runner externally — roughly 400 ms of overhead per mutant before a single test executes. For 200 mutants, that is 80 seconds of pure startup cost.
 
-Wesker compiles mutant ASTs in memory, patches them into a sandboxed namespace through the test's `__globals__`, and evaluates in-process. No subprocess, no disk I/O, no file rewrites. Per-mutant overhead falls from ~400 ms to ~1 ms.
+Wesker compiles mutant ASTs in memory, patches them into a sandboxed namespace through the test's `__globals__`, and evaluates in-process. No subprocess, no disk I/O, no file rewrites.
+
+This is a real reduction against a *subprocess-per-mutant* tool, and a modest one against a modern pooled runner: mutmut 3 forks a worker pool and reaches ~9 ms/mutant, so the honest gain here is single-digit, not the ~400× a subprocess cost model would imply. The layer that carries the result is not this one — it is Layer 4.
 
 This follows the **meta-mutant dispatch** pattern validated by mutest-rs (Lévai & McMinn, ICST 2023) and mu2's `MutationClassLoader` (Vikram & Padhye, ISSTA 2023). The soundness argument is direct: the mutated function is compiled from the same AST a file-rewriting tool would produce, and evaluated by the same assertion. The execution path differs; the observable semantics are identical.
 
@@ -113,14 +151,33 @@ Wesker costs
 
 $$O\big(\text{functions} \times \text{applicable mutants} \times \text{in-process toggle} \times \text{covering tests}\big).$$
 
-| Factor | Traditional (mutmut) | Wesker | Reduction |
-|--------|---------------------|--------|-----------|
-| Mutants per function | 50–200 | 15–35 (greedy-selected) | 3–10× |
-| Per-mutant overhead | ~400 ms (subprocess) | ~1 ms (in-process) | ~400× |
-| Tests per mutant | Full suite (100–500) | Covering tests (3–15) | 10–30× |
-| **Wall-clock, 100 functions** | **30–120 min** | **4–15 s** | **100–1000×** |
+Measured on Detective (23 files, 209 functions), mutmut 3.6 against Wesker on the same
+package:
 
-A 30-minute batch job becomes a 10-second step. That is what makes mutation testing a per-commit check instead of a nightly one.
+| Factor | mutmut 3 | Wesker | Ratio |
+|--------|----------|--------|-------|
+| Behavioral dimensions (the questions) | — | **2,210** | — |
+| Mutants written | 8,657 | 4,366 exhaustive · **2,210 DOF** | — |
+| **Mutants per dimension** | **3.92** | 1.98 exhaustive · **1.00 DOF** | **3.9×** |
+| Mutants in untested code | **4,212 (49%)** | — | one fact, 4,212 times |
+| Dimension-verdict agreement vs exhaustive | — | **98.26%**, zero false "specified" | — |
+
+**The reduction is in redundancy, not in rigour.** Wesker does not test fewer things — it
+tests each thing once. Half of mutmut's universe is a single fact ("this code has no
+tests") restated four thousand times; most of the rest is one gap phrased several ways.
+Neither is a property of your code.
+
+The honest ledger, since the numbers above are the ones that matter and these are not:
+
+- **We are not faster per mutant.** mutmut 3 runs a forking worker pool and did all 8,657
+  in 81s on this repo — about 9 ms/mutant. In-process evaluation removes subprocess
+  overhead, but a modern pooled runner has largely removed it too. Any claim of a ~400×
+  per-mutant advantage would be measured against a tool that no longer exists.
+- **Suite time is the real variable.** Detective's suite runs in 0.3s, the best case for
+  a per-mutant runner. The covering-tests reduction (Layer 3) compounds as suite time
+  grows, so the gap widens on slow suites and narrows to nothing on fast ones.
+- **The claim is knowledge per mutant, not mutants per second.** 1.00 is not a speed
+  record; it is the proof that no mutant was spent twice on the same question.
 
 ---
 
