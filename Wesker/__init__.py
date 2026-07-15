@@ -9,7 +9,7 @@ verification.
 # Keep in lockstep with pyproject's `version` — this is restated, so it drifts silently:
 # it read 0.1.0 for the whole of the 0.3.0 release, and would have shipped 0.4.0 still
 # claiming 0.1.0. Bump both, or neither.
-__version__ = "0.4.0"
+__version__ = "0.5.0"
 
 from .engine import (
     BoundaryInput,

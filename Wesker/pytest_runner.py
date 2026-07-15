@@ -211,6 +211,15 @@ def run_in_session(
     entire report into a StringIO and appear to do nothing at all. The caller's real
     streams are therefore captured before the redirect and restored around ``body``.
 
+    ``body``'s exceptions PROPAGATE — they are never converted to a ``None`` return.
+    ``None`` means exactly one thing: no live session could be started. Conflating that
+    with "the body raised" is a real defect, not a nicety: ``pytest.main`` swallows a
+    ``SystemExit`` raised inside the loop hook, so a caller's argument-validation error
+    surfaced here as "no live pytest session", which sent the caller down its LOUD
+    fallback path — printing a false warning, silently re-running the whole command with
+    weaker discovery, and only then reporting the real error. An exception from the body
+    is the body's business; this seam's only verdict is session-or-no-session.
+
     Returns ``None`` when pytest is unavailable, collection fails, or nothing is
     collected — so a caller can fall back to the legacy path exactly as before. The
     fallback must be LOUD at the call site: silently degrading to a different, weaker
@@ -233,14 +242,19 @@ def run_in_session(
                 return None  # let pytest handle collection errors normally
             box["ran"] = True
             calls = session_callables(session, capture)
-            if quiet:
-                with (
-                    contextlib.redirect_stdout(real_stdout),
-                    contextlib.redirect_stderr(real_stderr),
-                ):
+            try:
+                if quiet:
+                    with (
+                        contextlib.redirect_stdout(real_stdout),
+                        contextlib.redirect_stderr(real_stderr),
+                    ):
+                        box["result"] = body(calls, session)
+                else:
                     box["result"] = body(calls, session)
-            else:
-                box["result"] = body(calls, session)
+            except BaseException as exc:  # noqa: BLE001 — captured to re-raise below
+                # pytest.main would otherwise absorb this (SystemExit especially) and the
+                # caller would see an indistinguishable None. Stash and re-raise outside.
+                box["exc"] = exc
             return True  # the loop is ours; pytest must not also run the suite
 
     args = ["-q", "-p", "no:cacheprovider", "--no-header"]
@@ -266,6 +280,8 @@ def run_in_session(
         with contextlib.suppress(Exception):
             os.chdir(cwd)
 
+    if "exc" in box:
+        raise box["exc"]  # the body's failure is the caller's, not a missing session
     if not box.get("ran"):
         return None
     return box.get("result")

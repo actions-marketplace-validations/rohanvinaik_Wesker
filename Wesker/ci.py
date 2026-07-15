@@ -331,7 +331,9 @@ def load_test_callables(
 # cannot be passed down through profile_codebase -> profile_file -> discover_*
 # without changing every signature Detective imports. Unset by default, so every
 # existing caller — Detective included — takes the ordinary discovery path unchanged.
-_LIVE_SUITE: ContextVar[list[Any] | None] = ContextVar("wesker_live_suite", default=None)
+_LIVE_SUITE: ContextVar[list[Any] | None] = ContextVar(
+    "wesker_live_suite", default=None
+)
 
 
 def discover_test_callables(
@@ -814,6 +816,7 @@ def run_with_live_suite(
     fn: Callable[[], Any],
     target_files: Iterable[str] | None = None,
     paths: list[str] | None = None,
+    trace_progress: Callable[[int, int, float], None] | None = None,
 ) -> Any:
     """Run ``fn()`` inside a LIVE pytest session — the public seam for any consumer.
 
@@ -836,6 +839,12 @@ def run_with_live_suite(
     Omitted, only the live suite is provided and the per-function baseline stands — still
     correct, just slower.
 
+    ``trace_progress(done, total, elapsed_ms)`` reports that baseline trace. It matters MOST
+    here: this is the earliest thing that happens, it traces the WHOLE suite, and it runs before
+    the consumer's own reporting can print anything at all — so without it a large suite spends
+    minutes at 100% CPU emitting nothing, which reads as a wedged tool rather than a working one.
+    A consumer that reports its own progress must pass this too, or its first phase is invisible.
+
     Returns ``fn()``'s value, or ``None`` when no live session could be started (pytest
     missing, collection failed, nothing collected). ``None`` is a DISTINCT outcome and
     callers must treat it as one: falling back silently to the collect-only path is the
@@ -852,7 +861,11 @@ def run_with_live_suite(
     def _body(callables: list[Any], _session: Any) -> Any:
         suite_token = _LIVE_SUITE.set(callables)
         base_token = (
-            _SESSION_BASELINE.set(build_session_baseline(callables, resolved))
+            _SESSION_BASELINE.set(
+                build_session_baseline(
+                    callables, resolved, trace_progress=trace_progress
+                )
+            )
             if resolved
             else None
         )

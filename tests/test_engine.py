@@ -90,14 +90,27 @@ def test_record_dimensions_keys_carry_construct_kind():
         """
     )
     keys = _record_dimensions(func, MutationCategory.BOUNDARY, set())
-    # Orderings carry two dimensions — boundary shift + direction reversal;
-    # equality carries only the flip.
+    # Full ROR. An ordering carries FIVE dimensions: boundary shift, direction
+    # reversal, equality collapse (does the suite pin a RANGE or only a point?), and
+    # the two predicate constants (does the branch matter at all?). Equality has no
+    # ordering to reverse and no range to collapse, so it carries the flip + constants.
+    # Each is a distinct question, so each must be its own greedy dimension: collapsing
+    # them would let one kill mark the operator settled while another question goes
+    # unasked.
     assert keys == [
         "BOUNDARY:Lt",
         "BOUNDARY:Lt~dir",
+        "BOUNDARY:Lt~eq",
+        "BOUNDARY:Lt~true",
+        "BOUNDARY:Lt~false",
         "BOUNDARY:Gt",
         "BOUNDARY:Gt~dir",
+        "BOUNDARY:Gt~eq",
+        "BOUNDARY:Gt~true",
+        "BOUNDARY:Gt~false",
         "BOUNDARY:Eq",
+        "BOUNDARY:Eq~true",
+        "BOUNDARY:Eq~false",
     ]
 
 

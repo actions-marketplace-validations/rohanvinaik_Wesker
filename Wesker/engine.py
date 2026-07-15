@@ -19,6 +19,7 @@ from contextvars import ContextVar
 from enum import Enum
 from typing import TYPE_CHECKING, Any
 
+from .interrupt import abandon as _abandon
 from .line_coverage import coverage_from_trace as _coverage_from_trace
 from .line_coverage import executable_lines as _executable_lines
 from .line_coverage import failing_on_baseline as _failing_on_baseline
@@ -32,6 +33,26 @@ if TYPE_CHECKING:
     from collections.abc import Callable
 
 
+# The default per-test TRACE budget, in seconds. A backstop, NOT a target: it is generous enough
+# that no honest test should ever meet it (the untraced per-test timeout beside it is 5s, and
+# tracing costs a callback per executed line), so meeting it is evidence of the pathological case
+# — a test whose traced cost is effectively unbounded. Bounded by DEFAULT because the failure it
+# replaces is a SILENT HANG with no output and no diagnosis, which reads as a broken tool rather
+# than a slow test; a cut is always reported by name, so the loud-and-wrong outcome is preferred
+# to the quiet-and-wrong one. Pass None to opt out and restore the historical unbounded pass.
+DEFAULT_TRACE_BUDGET_S = 50.0
+
+# The default budget for the WHOLE traced baseline pass. Independent of the per-test cap above,
+# because they bound different things and neither implies the other: a per-test cap × N tests is
+# still N× unbounded, and on a 2000-test suite the 50s cap alone permits a day of tracing. Five
+# minutes is not arbitrary — it is this project's own stated intolerable case ("the whole-file
+# audit that ran 5 min with zero output", `_stream_progress`); a baseline that outruns it is not a
+# slow measurement but a dead-looking tool, and the tests it did not reach are reported by name so
+# a partial baseline is never mistaken for a complete one. Pass None for the historical unbounded
+# pass.
+DEFAULT_TRACE_SESSION_BUDGET_S = 300.0
+
+
 class MutationCategory(str, Enum):
     """Semantic mutation category (§6.4 dispatch table)."""
 
@@ -43,6 +64,10 @@ class MutationCategory(str, Enum):
     ARITHMETIC = "ARITHMETIC"
     LOGICAL = "LOGICAL"
     STMT = "STMT"
+    # Exception behavior: raised type, handler swallowing, handler widening. Carries
+    # three orthogonal sub-modes (see _ExceptionMutator) counted against their own
+    # target sets, the same shape STATE uses.
+    EXCEPTION = "EXCEPTION"
 
 
 @dataclass
@@ -186,6 +211,11 @@ class ProfilingResult:
     elapsed_ms: float = 0.0
     total_equivalent: int = 0
     universe_size: int = 0
+    # Tests whose TRACED baseline pass hit `trace_budget_s` and was CUT. Their line coverage is
+    # under-counted, so this travels WITH the result: an unreported cut is indistinguishable from
+    # "no test reaches this line", which turns a timing accident into a false completeness verdict
+    # — the one thing a completeness tool must never do quietly.
+    trace_truncated: list[str] = field(default_factory=list)
     # --- DOF coverage: the claim a bounded run can actually make ------------------
     # ``universe_size`` counts mutation TARGETS; these count the distinct behavioral
     # DIMENSIONS those targets pin. Because each target's cover set is a singleton,
@@ -397,9 +427,26 @@ class _ValueMutator(_BaseMutator):
 
 
 class _BoundaryMutator(_BaseMutator):
-    """Comparison-operator mutation: off-by-one (< → <=), equality flip
-    (== → !=), identity/membership flip (is → is not, in → not in), and
-    direction reversal on orderings (< → >, <= → >=)."""
+    """Relational-operator mutation (ROR), complete for a comparison.
+
+    Four independent questions per operator, each its own behavioral dimension:
+
+      * BOUNDARY shift (``<`` -> ``<=``) — is the endpoint pinned?
+      * DIRECTION reversal (``<`` -> ``>``) — is the ordering pinned?
+      * EQUALITY collapse (``<`` -> ``==``) — is the RANGE pinned, or only the point?
+        A suite testing one value either side of a threshold kills the shift and the
+        reversal while never distinguishing "less than" from "exactly equal".
+      * PREDICATE constant (``x < y`` -> ``True`` / ``False``) — does the branch matter
+        at all? This is the classic ROR pair, and it is the one that catches a condition
+        no test ever drives both ways: dead branches, defensive guards nothing exercises.
+
+    Identity/membership operators (``is``, ``in``) take the flip only — there is no
+    ordering to reverse and no meaningful equality collapse.
+
+    ``_alternatives`` is the single source of truth: the mutator and
+    ``_count_boundary_target`` both read it, so the target count and the visit order
+    cannot drift.
+    """
 
     # Boundary / predicate flip — the always-present alternative for every
     # comparison operator.
@@ -427,13 +474,25 @@ class _BoundaryMutator(_BaseMutator):
         ast.GtE: ast.LtE,
     }
 
+    # Equality collapse — a THIRD alternative on orderings: does the suite pin a RANGE,
+    # or merely a point? Absent, an ordering whose tests only probe equality looks pinned.
+    _EQUALITY = {
+        ast.Lt: ast.Eq,
+        ast.Gt: ast.Eq,
+        ast.LtE: ast.Eq,
+        ast.GtE: ast.Eq,
+    }
+
     @staticmethod
-    def _alternatives(op: ast.cmpop) -> list[tuple[type, str]]:
-        """Ordered (replacement-op class, dimension label) for one comparison
-        operator — the boundary/flip swap always, plus a direction reversal for
-        orderings. Single source of truth for the mutation dimensions, so the
-        mutator and ``_count_boundary_target`` cannot drift."""
-        alts: list[tuple[type, str]] = []
+    def _alternatives(op: ast.cmpop) -> list[tuple[Any, str]]:
+        """Ordered (replacement, dimension label) for one comparison operator.
+
+        A replacement is either a ``cmpop`` CLASS (swap the operator) or a ``bool``
+        (replace the whole comparison with that constant). Single source of truth for
+        the mutation dimensions, so the mutator and ``_count_boundary_target`` cannot
+        drift.
+        """
+        alts: list[tuple[Any, str]] = []
         name = type(op).__name__
         boundary = _BoundaryMutator._SWAP.get(type(op))
         if boundary is not None:
@@ -441,6 +500,14 @@ class _BoundaryMutator(_BaseMutator):
         direction = _BoundaryMutator._DIRECTION.get(type(op))
         if direction is not None:
             alts.append((direction, f"BOUNDARY:{name}~dir"))
+        equality = _BoundaryMutator._EQUALITY.get(type(op))
+        if equality is not None:
+            alts.append((equality, f"BOUNDARY:{name}~eq"))
+        if boundary is not None:
+            # Predicate constants — only where an operator is recognised at all, so an
+            # exotic comparison stays a single dead dimension rather than sprouting two.
+            alts.append((True, f"BOUNDARY:{name}~true"))
+            alts.append((False, f"BOUNDARY:{name}~false"))
         return alts
 
     def visit_Compare(self, node: ast.Compare) -> ast.AST:
@@ -456,12 +523,19 @@ class _BoundaryMutator(_BaseMutator):
                 self.current += 1
                 continue
             # One dimension per alternative; apply the one the target selects.
-            for repl_cls, label in alts:
-                if not self.applied and self.current == self.target:
-                    new_ops[pos] = repl_cls()
-                    self._mark_applied(node)
+            for repl, label in alts:
+                selected = not self.applied and self.current == self.target
                 self._note(label)
                 self.current += 1
+                if not selected:
+                    continue
+                if isinstance(repl, bool):
+                    # Replace the ENTIRE comparison — a chained compare collapses too,
+                    # which is correct: the predicate's value is what the branch reads.
+                    self._mark_applied(node)
+                    return ast.Constant(value=repl)
+                new_ops[pos] = repl()
+                self._mark_applied(node)
         node.ops = new_ops
         return self.generic_visit(node)
 
@@ -529,6 +603,106 @@ class _TypeMutator(_BaseMutator):
             self._note(f"TYPE:{_isinstance_type_name(node)}")
             self.current += 1
         return self.generic_visit(node)
+
+
+def _exc_type_name(node: ast.AST | None) -> str:
+    """Readable name for a raised/caught exception expression."""
+    if node is None:
+        return "bare"
+    if isinstance(node, ast.Call):
+        return _exc_type_name(node.func)
+    if isinstance(node, ast.Name):
+        return node.id
+    if isinstance(node, ast.Attribute):
+        return node.attr
+    if isinstance(node, ast.Tuple):
+        return ",".join(_exc_type_name(e) for e in node.elts)
+    return type(node).__name__
+
+
+def _swapped_exc(name: str) -> str:
+    """A DIFFERENT builtin exception to raise instead of ``name``.
+
+    A builtin, because the mutant's namespace is seeded from the source module's globals:
+    a sentinel class of our own would not resolve there and the mutant would die of
+    NameError — a crash kill that measures our plumbing, not the suite.
+    """
+    return "TypeError" if name == "ValueError" else "ValueError"
+
+
+class _ExceptionMutator(_BaseMutator):
+    """Exception-behavior mutation — the operator class Wesker had none of.
+
+    Nothing else in the taxonomy touches exceptions: no operator changes a raised type,
+    swallows a handler, or widens what is caught. That is the gap that bites REFACTORING
+    hardest, because moving code across a ``try`` boundary changes exactly this and
+    nothing in the universe pins it — the extracted block that used to raise inside the
+    ``try`` now raises inside a helper called from somewhere else. A suite can be at
+    100% and not notice.
+
+    Three independent questions, each its own greedy dimension:
+
+      * ``raise X(...)`` -> ``raise <other builtin>(...)`` — does any test pin the TYPE?
+        A suite asserting ``pytest.raises(ValueError)`` kills it; one asserting
+        ``pytest.raises(Exception)`` does not, and should not — it genuinely did not
+        pin the type.
+      * ``except X: <body>`` -> ``except X: pass`` — does any test notice the handler
+        stopped doing its work? This is exception SWALLOWING, the failure mode where an
+        error is silently discarded.
+      * ``except X:`` -> ``except BaseException:`` — does any test notice the handler
+        now catches strictly more? A refactor that widens a catch swallows errors that
+        used to propagate.
+
+    A handler whose body is already ``pass`` is skipped for the swallow mode: replacing
+    ``pass`` with ``pass`` is an equivalent mutant by construction, and generating it
+    would inflate the universe with a guaranteed survivor.
+    """
+
+    def __init__(self, target: int, mode: str = "raise_type", *a, **k) -> None:  # type: ignore[no-untyped-def]
+        super().__init__(target, *a, **k)
+        self.mode = mode
+
+    def visit_Raise(self, node: ast.Raise) -> ast.AST:
+        if self.mode != "raise_type" or self.applied or node.exc is None:
+            return self.generic_visit(node)
+        name = _exc_type_name(node.exc)
+        if self.current == self.target:
+            repl = ast.Name(id=_swapped_exc(name), ctx=ast.Load())
+            if isinstance(node.exc, ast.Call):
+                node.exc = ast.Call(func=repl, args=node.exc.args, keywords=node.exc.keywords)
+            else:
+                node.exc = ast.Call(func=repl, args=[], keywords=[])
+            self._mark_applied(node)
+            return node
+        self._note(f"EXCEPTION:raise:{name}")
+        self.current += 1
+        return self.generic_visit(node)
+
+    def visit_ExceptHandler(self, node: ast.ExceptHandler) -> ast.AST:
+        if self.applied:
+            return self.generic_visit(node)
+        name = _exc_type_name(node.type)
+        if self.mode == "handler_swallow":
+            if not _handler_is_noop(node):
+                if self.current == self.target:
+                    node.body = [ast.Pass()]
+                    self._mark_applied(node)
+                    return node
+                self._note(f"EXCEPTION:swallow:{name}")
+                self.current += 1
+        elif self.mode == "handler_broaden" and node.type is not None:
+            if self.current == self.target:
+                node.type = ast.Name(id="BaseException", ctx=ast.Load())
+                self._mark_applied(node)
+                return node
+            self._note(f"EXCEPTION:broaden:{name}")
+            self.current += 1
+        return self.generic_visit(node)
+
+
+def _handler_is_noop(node: ast.ExceptHandler) -> bool:
+    """True when a handler's body is already a no-op, so swallowing it changes nothing."""
+    return len(node.body) == 1 and isinstance(node.body[0], ast.Pass)
 
 
 class _ArithmeticMutator(_BaseMutator):
@@ -622,36 +796,203 @@ class _LogicalMutator(_BaseMutator):
         return self.generic_visit(node)
 
 
-def _stmt_label(node: ast.Expr) -> str:
-    """Dimension label for a deletable expression-statement — the callee name for a
-    call (so distinct side effects are distinct greedy dimensions), else the kind."""
-    if isinstance(node.value, ast.Call):
-        return _callee_name(node.value)
-    return type(node.value).__name__
+def _deletable_stmt_ids(func_node: ast.AST) -> set[int]:
+    """``id()`` of every statement in ``func_node`` whose deletion cannot raise NameError.
+
+    STATEMENT DELETION (SDL) is the highest-value operator per the deletion-operator
+    literature (Delamaro & Offutt): it is cheap, and it catches what operator-REPLACEMENT
+    structurally cannot. Replacing an operator asks "is this operator right?"; deleting a
+    statement asks "does this statement do anything the suite can see?" — the question a
+    refactor most often gets wrong.
+
+    Three shapes qualify, and the single rule behind them is "binds nothing new":
+
+      * ``ast.Expr`` (a discarded-value call: ``log.info(x)``, ``items.append(y)``) —
+        binds nothing, always deletable.
+      * ``x[k] = v`` / ``x.attr = v`` — a Subscript/Attribute target binds NO name, so
+        deletion is always safe. This is the ALIASING case: ``def f(cfg): cfg[k] = v``
+        mutates a caller's object, and no other operator generates "drop that write" —
+        STATE only ever targeted ``self.x``. A refactor that copies instead of aliasing
+        passes every return-value assertion a suite has.
+      * ``x = expr`` / ``x += expr`` where ``x`` is ALREADY bound — rebinding, not
+        binding, so the name survives deletion with its earlier value. This is the
+        ``total = abs(total)`` case.
+
+    Excluded: a FIRST binding (``x = ...`` where ``x`` is new). Deleting it makes every
+    later use a NameError — a mutant that always crashes is killed by any test that runs
+    the line, so it measures reachability, not specification, and it inflates the
+    universe with trivial kills. The prior implementation excluded ALL bound names for
+    this reason; that is right for a first binding and wrong for a rebinding, which is
+    exactly the case worth testing.
+
+    Conservative on conditional binding: a name counts as bound only if it is a parameter
+    or was bound by an EARLIER statement in the SAME block. So::
+
+        if flag:
+            x = 1
+        x = 2      # NOT deletable — x is unbound when flag is False
+
+    stays out of the universe rather than becoming a spurious crash-kill.
+    """
+    out: set[int] = set()
+
+    def _names(target: ast.AST) -> tuple[list[str], bool]:
+        """(bound names, binds_nothing) for one assignment target."""
+        if isinstance(target, ast.Name):
+            return [target.id], False
+        if isinstance(target, (ast.Subscript, ast.Attribute)):
+            return [], True  # mutates an existing object; binds no name
+        if isinstance(target, (ast.Tuple, ast.List)):
+            names: list[str] = []
+            nothing = True
+            for el in target.elts:
+                n, only_mut = _names(el)
+                names.extend(n)
+                nothing = nothing and only_mut
+            return names, nothing and not names
+        return [], False  # Starred and friends: don't reason, don't delete
+
+    def _blocks(stmt: ast.stmt) -> list[list[ast.stmt]]:
+        found: list[list[ast.stmt]] = []
+        for attr in ("body", "orelse", "finalbody"):
+            b = getattr(stmt, attr, None)
+            if isinstance(b, list) and b:
+                found.append(b)
+        for handler in getattr(stmt, "handlers", []) or []:
+            if getattr(handler, "body", None):
+                found.append(handler.body)
+        return found
+
+    def _walk_block(stmts: list[ast.stmt], bound: set[str]) -> None:
+        local = set(bound)
+        for st in stmts:
+            if isinstance(st, ast.Expr):
+                if not isinstance(st.value, ast.Constant):
+                    out.add(id(st))  # docstring / bare literal has no side effect
+            elif isinstance(st, ast.AugAssign):
+                # ``x += 1`` REQUIRES x to already exist, or the original itself raises.
+                # So deletion is always safe regardless of what we can prove here.
+                out.add(id(st))
+            elif isinstance(st, (ast.Assign, ast.AnnAssign)):
+                targets = (
+                    st.targets if isinstance(st, ast.Assign) else [st.target]
+                )
+                names: list[str] = []
+                binds_nothing = True
+                for t in targets:
+                    n, only_mut = _names(t)
+                    names.extend(n)
+                    binds_nothing = binds_nothing and only_mut
+                if getattr(st, "value", None) is None:
+                    pass  # bare annotation (``x: int``) — no runtime effect to delete
+                elif binds_nothing:
+                    out.add(id(st))  # x[k]=v / x.attr=v — the aliasing case
+                elif names and all(n in local for n in names):
+                    out.add(id(st))  # rebinding — the SDL case
+                local.update(names)
+            # Nested blocks see the bindings established BEFORE them at this level.
+            for block in _blocks(st):
+                _walk_block(block, local)
+
+    params: set[str] = set()
+    args = getattr(func_node, "args", None)
+    if args is not None:
+        for a in (
+            list(getattr(args, "posonlyargs", []))
+            + list(args.args)
+            + list(getattr(args, "kwonlyargs", []))
+        ):
+            params.add(a.arg)
+        for extra in (args.vararg, args.kwarg):
+            if extra is not None:
+                params.add(extra.arg)
+    _walk_block(list(getattr(func_node, "body", [])), params)
+    return out
+
+
+def _stmt_label(node: ast.stmt) -> str:
+    """Dimension label for a deletable statement.
+
+    Distinct side effects must be distinct greedy dimensions, so the label names WHAT is
+    being dropped, not merely that something was: the callee for a call
+    (``STMT:append``), the mutated container/attribute for a write (``STMT:cfg[]``,
+    ``STMT:obj.attr``), the rebound name for a rebinding (``STMT:=total``). Collapsing
+    these to one label would let greedy cover ``log.info(x)`` and call the dimension
+    settled while ``items.append(y)`` on the next line goes untested.
+    """
+    if isinstance(node, ast.Expr):
+        if isinstance(node.value, ast.Call):
+            return _callee_name(node.value)
+        return type(node.value).__name__
+    if isinstance(node, ast.AugAssign):
+        return f"aug:{_assign_target_label(node.target)}"
+    targets = node.targets if isinstance(node, ast.Assign) else [node.target]  # type: ignore[attr-defined]
+    return "=" + ",".join(_assign_target_label(t) for t in targets)
+
+
+def _assign_target_label(target: ast.AST) -> str:
+    """Stable name for an assignment target, used as its dimension key."""
+    if isinstance(target, ast.Name):
+        return target.id
+    if isinstance(target, ast.Attribute):
+        return f"{_assign_target_label(target.value)}.{target.attr}"
+    if isinstance(target, ast.Subscript):
+        return f"{_assign_target_label(target.value)}[]"
+    if isinstance(target, (ast.Tuple, ast.List)):
+        return "(" + ",".join(_assign_target_label(e) for e in target.elts) + ")"
+    return type(target).__name__
 
 
 class _StmtMutator(_BaseMutator):
-    """Delete an expression-statement — a discarded-value call like ``log.info(x)``
-    or ``items.append(y)`` — by replacing it with ``pass``, asking whether the
-    statement's side effect is observable.
+    """Statement deletion (SDL) — replace a statement with ``pass`` and ask whether any
+    test notices the side effect is gone.
 
-    Only ``ast.Expr`` statements whose value is a real expression are targeted:
-    deleting a bound name (``x = ...``) would be a syntactic crash (NameError), not a
-    behavioral degree of freedom, so it is excluded (enumeration fidelity); a bare
-    constant ``Expr`` (docstring / no-op literal) has no side effect and is skipped.
+    Targets exactly the statements :func:`_deletable_stmt_ids` proves cannot raise
+    NameError when removed: discarded-value calls (``items.append(y)``), writes through
+    an existing object (``cfg[k] = v``, ``obj.attr = v``), and rebindings
+    (``total = abs(total)``, ``total += x``). See that function for why a FIRST binding
+    is excluded and why conditional binding is treated conservatively.
+
+    Deletability is derived from the tree this mutator is handed, not passed in: the
+    engine visits a deepcopy of the function, so precomputed node ``id()``s from the
+    original would not match. ``_count_stmt_target`` runs the SAME analysis, so the
+    counter and the mutator cannot drift.
     """
 
-    def visit_Expr(self, node: ast.Expr) -> ast.AST:
-        if self.applied:
+    def __init__(self, target: int, *args, **kwargs) -> None:  # type: ignore[no-untyped-def]
+        super().__init__(target, *args, **kwargs)
+        self._deletable: set[int] | None = None
+
+    def visit(self, node: ast.AST) -> ast.AST:
+        # The first node handed to a run IS the function; analyse it once, here, so both
+        # record mode and mutate mode see an identical target set in identical order.
+        if self._deletable is None and isinstance(
+            node, (ast.FunctionDef, ast.AsyncFunctionDef)
+        ):
+            self._deletable = _deletable_stmt_ids(node)
+        return super().visit(node)
+
+    def _consider(self, node: ast.stmt) -> ast.AST:
+        if self.applied or self._deletable is None or id(node) not in self._deletable:
             return node
-        if isinstance(node.value, ast.Constant):
-            return node  # docstring / bare literal — nothing to delete
         if self.current == self.target:
             self._mark_applied(node)
             return ast.Pass()
         self._note(f"STMT:{_stmt_label(node)}")
         self.current += 1
         return node
+
+    def visit_Expr(self, node: ast.Expr) -> ast.AST:
+        return self._consider(node)
+
+    def visit_Assign(self, node: ast.Assign) -> ast.AST:
+        return self._consider(node)
+
+    def visit_AugAssign(self, node: ast.AugAssign) -> ast.AST:
+        return self._consider(node)
+
+    def visit_AnnAssign(self, node: ast.AnnAssign) -> ast.AST:
+        return self._consider(node)
 
 
 # ── Mutant Generation ─────────────────────────────────────────────
@@ -685,6 +1026,18 @@ def _count_targets(func_node: ast.FunctionDef, category: MutationCategory) -> in
     if category == MutationCategory.VALUE:
         ds_pos = _docstring_positions(func_node)
         return sum(_count_value_target(node, ds_pos) for node in ast.walk(func_node))
+    # STMT deletability depends on what is bound BEFORE a statement, which no per-node
+    # counter can see. Same analysis the mutator runs, so the two cannot drift.
+    if category == MutationCategory.STMT:
+        return len(_deletable_stmt_ids(func_node))
+    # EXCEPTION's sub-modes each have their own target space, and their skip rules
+    # (bare re-raise, already-``pass`` handler, untyped ``except:``) live in the
+    # mutator — so count by running it, not by re-encoding the rules here.
+    if category == MutationCategory.EXCEPTION:
+        return sum(
+            _count_exception_targets(func_node, mode)
+            for mode, _desc in _EXCEPTION_SUB_MODES
+        )
     return sum(counter(node) for node in ast.walk(func_node))
 
 
@@ -786,11 +1139,16 @@ def _count_logical_target(node: ast.AST) -> int:
 
 
 def _count_stmt_target(node: ast.AST) -> int:
-    """Count deletable statements — non-constant expression-statements (side-effecting
-    calls). Must stay in lockstep with ``_StmtMutator``: docstrings / bare literals
-    are not side effects, and bound names are excluded (deletion would just crash)."""
-    if isinstance(node, ast.Expr) and not isinstance(node.value, ast.Constant):
-        return 1
+    """Per-node STMT counter — NOT used for STMT.
+
+    STMT deletability is a FUNCTION-level property (is this name already bound?), so it
+    cannot be decided from a node in isolation the way every other category's counter can.
+    ``_count_targets`` therefore special-cases STMT and calls :func:`_deletable_stmt_ids`
+    over the whole function, exactly as ``_StmtMutator`` does — one analysis, so the
+    counter and the mutator cannot disagree about how many targets exist.
+
+    Retained only so the ``_TARGET_COUNTERS`` dispatch stays total.
+    """
     return 0
 
 
@@ -803,6 +1161,9 @@ _TARGET_COUNTERS: dict[MutationCategory, Callable[[ast.AST], int]] = {
     MutationCategory.ARITHMETIC: _count_arithmetic_target,
     MutationCategory.LOGICAL: _count_logical_target,
     MutationCategory.STMT: _count_stmt_target,
+    # Like STMT, a stub: EXCEPTION is counted per sub-mode in _count_targets, which
+    # cannot be expressed as a per-node function. Present so the dispatch stays total.
+    MutationCategory.EXCEPTION: lambda _node: 0,
 }
 
 
@@ -986,6 +1347,89 @@ def _record_state_dimensions(func_node: ast.FunctionDef, mode: str) -> list[str]
     return mutator.keys
 
 
+def _record_exception_dimensions(func_node: ast.FunctionDef, mode: str) -> list[str]:
+    """Dimension keys for one EXCEPTION sub-mode, in transformer-visit order."""
+    tree = copy.deepcopy(func_node)
+    mutator = _ExceptionMutator(-1, mode)
+    mutator.keys = []
+    mutator.visit(tree)
+    return mutator.keys
+
+
+def _count_exception_targets(func_node: ast.FunctionDef, mode: str) -> int:
+    """Targets for one EXCEPTION sub-mode. Counted by RUNNING the mutator in record
+    mode, so the counter and the transformer cannot drift — the skip rules (a bare
+    ``raise``, an already-``pass`` handler, an untyped ``except:``) live in one place."""
+    return len(_record_exception_dimensions(func_node, mode))
+
+
+_EXCEPTION_SUB_MODES = (
+    ("raise_type", "replace raised exception type"),
+    ("handler_swallow", "swallow exception handler body"),
+    ("handler_broaden", "widen caught exception type"),
+)
+
+
+def _generate_exception_mutants(
+    func_node: ast.FunctionDef,
+    max_per_category: int | None,
+    greedy: bool = True,
+    pass_index: int = 0,
+) -> list[Mutant]:
+    """Generate EXCEPTION mutants across all three sub-modes.
+
+    Same shape as :func:`_generate_state_mutants`: each sub-mode has its OWN target
+    index space and its own budget, because a shared index would misalign against the
+    transformer (mode ``handler_swallow`` visiting target 3 is a different statement
+    from mode ``raise_type`` visiting target 3). In DOF mode each sub-mode's budget is
+    its own degrees of freedom, so a function that raises but catches nothing spends
+    nothing on handler modes: they count zero and contribute nothing.
+    """
+    mutants: list[Mutant] = []
+    cat = MutationCategory.EXCEPTION
+
+    for mode, desc in _EXCEPTION_SUB_MODES:
+        keys = _record_exception_dimensions(func_node, mode) if greedy else []
+        target_count = (
+            len(keys) if greedy else _count_exception_targets(func_node, mode)
+        )
+        budget = (
+            _live_dimension_count(keys)
+            if max_per_category is None
+            else max_per_category
+        )
+        limit = min(target_count, budget) if budget > 0 else target_count
+
+        if greedy and budget > 0 and target_count > limit:
+            selected = _select_greedy(keys, target_count, limit, pass_index)
+        else:
+            selected = list(range(limit))
+
+        for i in selected:
+            mutated_tree = copy.deepcopy(func_node)
+            transformer = _ExceptionMutator(i, mode)
+            mutated_node = transformer.visit(mutated_tree)
+            ast.fix_missing_locations(mutated_node)
+
+            if transformer.applied:
+                mid = _content_mutant_id(cat, mutated_node)
+                mutants.append(
+                    Mutant(
+                        category=cat,
+                        original_node=func_node,
+                        mutated_node=mutated_node,
+                        description=f"{mid}: {desc}",
+                        location=getattr(func_node, "lineno", 0),
+                        mutant_id=mid,
+                        target_index=i,
+                        mutated_line=transformer.mutated_lineno,
+                        dimension=keys[i] if i < len(keys) else "",
+                    )
+                )
+
+    return mutants
+
+
 def _live_dimension_count(keys: list[str]) -> int:
     """Distinct behavioral dimensions among candidate sites (dead sites excluded)."""
     return len({k for k in keys if not _is_dead(k)})
@@ -1015,9 +1459,14 @@ class SessionBaseline:
     unpatched path calls ``test_fn(original)``, whose convention depends on ``qualname``
     per function, so the answer is not a constant there. Live-session callables are
     keyword-only zero-arg wrappers, so both hold.
+
+    ``truncated`` names the tests a ``trace_budget_s`` CUT mid-trace. Their coverage is
+    under-counted by construction, so it must be reported rather than folded in silently: a
+    budget-shortened trace is indistinguishable downstream from "no test reaches this line",
+    which would turn a timing accident into a false completeness verdict.
     """
 
-    __slots__ = ("traced", "failing", "inert", "n_tests")
+    __slots__ = ("traced", "failing", "inert", "n_tests", "truncated")
 
     def __init__(
         self,
@@ -1025,11 +1474,13 @@ class SessionBaseline:
         failing: list[str],
         inert: set[int],
         n_tests: int,
+        truncated: set[str] | None = None,
     ) -> None:
         self.traced = traced
         self.failing = failing
         self.inert = inert
         self.n_tests = n_tests
+        self.truncated = truncated or set()
 
 
 # Set only by the live-session path; None everywhere else, so every existing caller
@@ -1043,14 +1494,32 @@ def build_session_baseline(
     test_functions: list[Callable[..., None]],
     target_files: set[str],
     timeout_ms: float = 5000,
+    trace_budget_s: float | None = DEFAULT_TRACE_BUDGET_S,
+    trace_progress: Callable[[int, int, float], None] | None = None,
+    trace_session_budget_s: float | None = DEFAULT_TRACE_SESSION_BUDGET_S,
 ) -> SessionBaseline:
     """Run the suite-global baseline passes ONCE. See :class:`SessionBaseline`.
 
     ``inert`` is computed by running each test AS-IS (no patch): with the original code
     in place that is precisely "does this test fail regardless of any mutation?", which
     is what bars it from kill attribution.
+
+    ``trace_budget_s`` caps EACH test's traced pass; the names it cuts land on
+    ``SessionBaseline.truncated`` for the caller to report. The run passes below already have
+    ``timeout_ms``; the TRACE pass had no bound at all, and it is the slower of the two by far
+    (a callback per line). Because this baseline is computed once and reused by every function,
+    one heavy test stalls the whole session before a single mutant runs — the failure mode is a
+    silent hang, not a slow answer. ``None`` = unbounded = the historical behavior.
     """
-    traced = _trace_suite(test_functions, target_files)
+    truncated: set[str] = set()
+    traced = _trace_suite(
+        test_functions,
+        target_files,
+        trace_budget_s,
+        truncated,
+        trace_progress,
+        trace_session_budget_s,
+    )
     failing: list[str] = []
     inert: set[int] = set()
     for test_fn in test_functions:
@@ -1062,7 +1531,7 @@ def build_session_baseline(
                 # narrower thing failing_on_baseline reports to a human. Other outcomes
                 # are ambiguous and are barred from attribution without accusation.
                 failing.append(getattr(test_fn, "__name__", "unknown"))
-    return SessionBaseline(traced, failing, inert, len(test_functions))
+    return SessionBaseline(traced, failing, inert, len(test_functions), truncated)
 
 
 def _baseline_failures(
@@ -1129,6 +1598,10 @@ def _build_test_scope(
     scope_tests: bool,
     precomputed_line_data: tuple[dict[str, list[int]], list[str]] | None = None,
     qualname: str | None = None,
+    trace_budget_s: float | None = None,
+    truncated: set[str] | None = None,
+    trace_progress: Callable[[int, int, float], None] | None = None,
+    trace_session_budget_s: float | None = None,
 ) -> tuple[
     Callable[[Mutant], list[Callable[..., None]]],
     dict[str, list[int]],
@@ -1183,18 +1656,34 @@ def _build_test_scope(
         target_file = getattr(
             getattr(original_func, "__code__", None), "co_filename", None
         )
-        line_cov = _coverage_from_trace(session.traced, target_file or "", set(exec_lines))
+        line_cov = _coverage_from_trace(
+            session.traced, target_file or "", set(exec_lines)
+        )
         failing = session.failing
         inert = session.inert
+        if truncated is not None:
+            truncated |= (
+                session.truncated
+            )  # the suite-level cut is this function's cut too
     elif original_func is not None:
-        line_cov = _trace_line_coverage(test_functions, original_func, set(exec_lines))
+        line_cov = _trace_line_coverage(
+            test_functions,
+            original_func,
+            set(exec_lines),
+            trace_budget_s,
+            truncated,
+            trace_progress,
+            trace_session_budget_s,
+        )
         failing = _failing_on_baseline(test_functions, original_func)
         inert = _baseline_failures(test_functions, original_func, qualname)
     else:
         line_cov, failing = {}, []
 
     # Filter 1 — bar tests that cannot distinguish anything from the kill loop.
-    usable = [t for t in test_functions if id(t) not in inert] if inert else test_functions
+    usable = (
+        [t for t in test_functions if id(t) not in inert] if inert else test_functions
+    )
 
     # Parametrized cases share a __name__, so one name maps to many callables.
     tests_by_name: dict[str, list[Callable[..., None]]] = {}
@@ -1238,14 +1727,22 @@ def dimension_budget(
     the theory names; a hardcoded constant is either short of it (partial DOF) or
     past it (redundant mutants within an already-covered dimension).
 
-    STATE is generated as two independent sub-modes with separate target indices,
-    each selected against its own budget, so its DOF is the sum of the two.
+    STATE and EXCEPTION are generated as independent sub-modes with separate target
+    indices, each selected against its own budget, so their DOF is the sum over
+    sub-modes. A category listed here MUST match its generator's sub-mode list, or the
+    budget disagrees with what is generated: too low silently truncates the category's
+    coverage, too high spends budget on mutants that do not exist.
     Static: AST walk only, no compilation, no execution.
     """
     if category is MutationCategory.STATE:
         return sum(
             _live_dimension_count(_record_state_dimensions(func_node, mode))
             for mode in ("remove_assign", "return_none")
+        )
+    if category is MutationCategory.EXCEPTION:
+        return sum(
+            _live_dimension_count(_record_exception_dimensions(func_node, mode))
+            for mode, _desc in _EXCEPTION_SUB_MODES
         )
     return _live_dimension_count(
         _record_dimensions(func_node, category, docstring_positions)
@@ -1381,6 +1878,15 @@ def generate_mutants(
                 )
             )
             continue
+        # EXCEPTION, like STATE, carries independent sub-modes with separate target
+        # index spaces, so it cannot go through the single-transformer path below.
+        if cat == MutationCategory.EXCEPTION:
+            mutants.extend(
+                _generate_exception_mutants(
+                    func_node, max_per_category, greedy=greedy, pass_index=pass_index
+                )
+            )
+            continue
 
         target_count = _count_targets(func_node, cat)
         # DOF mode (max_per_category is None): the budget IS this category's
@@ -1468,7 +1974,11 @@ def _make_transformer(
     if category == MutationCategory.LOGICAL:
         return _LogicalMutator(index), "replace logical operator"
     if category == MutationCategory.STMT:
-        return _StmtMutator(index), "delete expression-statement"
+        return _StmtMutator(index), "delete statement"
+    if category == MutationCategory.EXCEPTION:
+        # Reached only by a caller doing single-transformer generation; the normal path
+        # routes EXCEPTION through _generate_exception_mutants (independent sub-modes).
+        return _ExceptionMutator(index, "raise_type"), "replace raised exception type"
     msg = f"Unknown category: {category}"
     raise ValueError(msg)
 
@@ -2122,6 +2632,9 @@ def _run_test_with_timeout(
 
     Returns the kill reason ("assertion", "crash", "timeout") if killed,
     or None if the test passed (mutant survived this test).
+
+    The timeout bounds the WAIT and, via `interrupt.abandon`, the thread itself — see there for what
+    that can and cannot reach.
     """
     import contextlib
     import io
@@ -2160,8 +2673,13 @@ def _run_test_with_timeout(
         thread.join(timeout=timeout_ms / 1000.0)
 
     if thread.is_alive():
-        # Thread is stuck — treat as timeout kill.
-        # Daemon thread will be cleaned up on process exit.
+        # Timed out. STOP the runaway rather than abandoning it: the verdict was already decided
+        # (below), so what is left is the thread itself, and a daemon thread is only reclaimed at
+        # PROCESS exit — i.e. never, across a run. Every timeout used to leave one live thread
+        # burning a core for the rest of the session, so later mutants timed out BECAUSE earlier
+        # ones were still running and the failure compounded. Its abandoned writes also landed on
+        # the real stdout once the redirect above exited, corrupting the engine's own report.
+        _abandon(thread)
         return "timeout"
 
     return result_box[0]
@@ -2298,6 +2816,9 @@ def run_function_profiling(
     mutant_slice: tuple[int, int] | None = None,
     precomputed_line_data: tuple[dict[str, list[int]], list[str]] | None = None,
     pregenerated: list[Mutant] | None = None,
+    trace_budget_s: float | None = DEFAULT_TRACE_BUDGET_S,
+    trace_progress: Callable[[int, int, float], None] | None = None,
+    trace_session_budget_s: float | None = DEFAULT_TRACE_SESSION_BUDGET_S,
 ) -> ProfilingResult:
     """Profiling mode — generate mutants (exhaustive by default), evaluate with budget.
 
@@ -2359,6 +2880,7 @@ def run_function_profiling(
     # pass to evaluate_mutant (original_func is stubbed by some callers, so its co_filename is useless).
     source_path = func_key.split("::", 1)[0] if "::" in func_key else None
 
+    _trace_truncated: set[str] = set()
     _tests_for, line_cov, exec_lines, failing = _build_test_scope(
         func_node,
         test_functions,
@@ -2366,6 +2888,10 @@ def run_function_profiling(
         scope_tests,
         precomputed_line_data,
         qualname,
+        trace_budget_s,
+        _trace_truncated,
+        trace_progress,
+        trace_session_budget_s,
     )
 
     results_by_cat: dict[MutationCategory, CategoryResult] = {}
@@ -2486,6 +3012,7 @@ def run_function_profiling(
         executable_lines=exec_lines,
         failing_tests=failing,
         tests_discovered=len(test_functions),
+        trace_truncated=sorted(_trace_truncated),
     )
 
 
@@ -2682,6 +3209,9 @@ def run_function_converged(
     full_matrix: bool = False,
     source_path: str | None = None,
     scope_tests: bool = False,
+    trace_budget_s: float | None = DEFAULT_TRACE_BUDGET_S,
+    trace_progress: Callable[[int, int, float], None] | None = None,
+    trace_session_budget_s: float | None = DEFAULT_TRACE_SESSION_BUDGET_S,
 ) -> ProfilingResult:
     """Multi-pass convergence with integrated equivalence detection.
 
@@ -2752,8 +3282,18 @@ def run_function_converged(
     # the two paths cannot drift on soundness). Engages only when ``original_func`` is a
     # real callable to trace against; callers that stub it get the full test set, which
     # is always sound, just slower.
+    _trace_truncated: set[str] = set()
     _tests_for, line_cov, exec_lines, failing = _build_test_scope(
-        func_node, test_functions, original_func, scope_tests, None, qualname
+        func_node,
+        test_functions,
+        original_func,
+        scope_tests,
+        None,
+        qualname,
+        trace_budget_s,
+        _trace_truncated,
+        trace_progress,
+        trace_session_budget_s,
     )
 
     seen: dict[str, MutantResult] = {}
@@ -2893,4 +3433,5 @@ def run_function_converged(
         killed_records=killed_records,
         budget_exhausted=budget_exhausted,
         elapsed_ms=_elapsed(start),
+        trace_truncated=sorted(_trace_truncated),
     )

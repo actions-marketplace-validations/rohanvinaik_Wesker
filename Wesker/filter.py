@@ -38,6 +38,7 @@ class _FunctionSignals:
     has_logical: bool = False
     has_deletable_stmt: bool = False
     has_return_value: bool = False
+    has_exception: bool = False
 
 
 def _classify_signal_node(node: ast.AST, signals: _FunctionSignals) -> None:
@@ -73,6 +74,12 @@ def _classify_signal_node(node: ast.AST, signals: _FunctionSignals) -> None:
         signals.has_logical = True
     elif isinstance(node, ast.Expr) and not isinstance(node.value, ast.Constant):
         signals.has_deletable_stmt = True
+    # A bare ``raise`` (re-raise) carries no type to swap, so it is not a target — in
+    # lockstep with ``_ExceptionMutator.visit_Raise``, which skips ``exc is None``.
+    elif isinstance(node, ast.Raise) and node.exc is not None:
+        signals.has_exception = True
+    elif isinstance(node, ast.ExceptHandler):
+        signals.has_exception = True
     # In lockstep with ``_count_state_return_target`` / ``_StateMutator.visit_Return``:
     # a return_none target is a ``return`` WITH a value (a bare ``return`` already
     # returns None, so replacing it is a no-op, not a degree of freedom).
@@ -85,6 +92,16 @@ def _collect_signals(func_node: ast.FunctionDef) -> _FunctionSignals:
     signals = _FunctionSignals(param_count=len(func_node.args.args))
     for node in ast.walk(func_node):
         _classify_signal_node(node, signals)
+    # STMT deletability is a FUNCTION-level property (is this name already bound before
+    # this statement?), so the per-node classifier above cannot decide it — it can only
+    # see the ``ast.Expr`` case. Asking the engine keeps ONE definition of "deletable":
+    # a divergence here would gate the category off for a function whose only deletable
+    # statements are rebindings or aliased writes, silently dropping them from the
+    # universe while the engine stood ready to mutate them.
+    from Wesker.engine import _deletable_stmt_ids
+
+    if _deletable_stmt_ids(func_node):
+        signals.has_deletable_stmt = True
     return signals
 
 
@@ -126,6 +143,11 @@ def filter_categories(
         relevant.add(MutationCategory.LOGICAL)
     if sig.has_deletable_stmt:
         relevant.add(MutationCategory.STMT)
+    # NOT gated on purity: raising and catching are behavior regardless of whether the
+    # function is otherwise side-effect free, and a "pure" function that raises still
+    # owes its callers a pinned exception type.
+    if sig.has_exception:
+        relevant.add(MutationCategory.EXCEPTION)
 
     return relevant
 
