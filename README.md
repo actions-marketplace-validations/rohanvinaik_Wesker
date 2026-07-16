@@ -280,7 +280,7 @@ As a GitHub Action — one step, and survivors land on the diff as code-scanning
 ```yaml
 - uses: actions/checkout@v4
   with: {fetch-depth: 0}
-- uses: rohanvinaik/Wesker@v0.5.0
+- uses: rohanvinaik/Wesker@v0.5.1
   with:
     base-ref: ${{ github.event.pull_request.base.sha }}
     sarif: .wesker/wesker.sarif

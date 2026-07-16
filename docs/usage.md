@@ -95,7 +95,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0        # the diff scope needs the merge base
-      - uses: rohanvinaik/Wesker@v0.5.0
+      - uses: rohanvinaik/Wesker@v0.5.1
         with:
           base-ref: ${{ github.event.pull_request.base.sha }}
           sarif: .wesker/wesker.sarif
@@ -118,7 +118,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: rohanvinaik/Wesker@v0.5.0
+      - uses: rohanvinaik/Wesker@v0.5.1
         id: spec
         with:
           budget: "30000"
