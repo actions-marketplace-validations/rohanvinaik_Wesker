@@ -30,6 +30,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -38,6 +39,17 @@ _DETECTIVE_PKG = "detective-spec"
 
 
 # ── Diff scoping ─────────────────────────────────────────────────
+
+# A git revision, per git-check-ref-format plus the range/parent operators a caller may pass:
+# SHAs, `main`, `HEAD~1`, `v1.2^2`, `origin/main`. Notably it cannot begin with '-', so a value
+# can never arrive at git's argv as an option instead of a revision.
+_SAFE_REV = re.compile(r"[A-Za-z0-9_][A-Za-z0-9._/~^-]*")
+
+# A SARIF output path: a relative path of ordinary segments, ending in .sarif. The per-segment
+# lookahead is what does the work — a plain `[A-Za-z0-9._-]+` class contains '.', so it happily
+# matches '..' and `../../../etc/x.sarif` sails through. No leading '/' and no '..' segment
+# means the path cannot leave the directory it is resolved against.
+_SAFE_OUT_PATH = re.compile(r"(?:(?!\.\./)[A-Za-z0-9._-]+/)*[A-Za-z0-9._-]+\.sarif")
 
 
 def _git(args: list[str], cwd: str) -> str | None:
@@ -66,15 +78,22 @@ def changed_files(base_ref: str, project_root: str = ".") -> list[str] | None:
     honestly means "this PR changed no Python". The caller must not silently treat the first
     as the second: "I could not tell what changed" and "nothing changed" imply opposite actions.
     """
-    # A ref may not begin with '-': git forbids it, and argv does not distinguish a ref from a
-    # flag. Without this, `--base-ref=--upload-pack=...` reaches git as an OPTION rather than a
-    # revision. There is no shell here (subprocess takes a list), so this is argument
-    # injection, not command injection — but the fix is the same and it costs one comparison.
-    if base_ref.startswith("-"):
+    # ALLOWLIST, not a rejection test. argv does not distinguish a ref from a flag, so a
+    # `base_ref` of `--upload-pack=...` reaches git as an OPTION rather than a revision. There
+    # is no shell here (subprocess takes a list), so this is argument injection rather than
+    # command injection — but the value is rebuilt from a matched pattern rather than merely
+    # inspected, so nothing unvalidated reaches the command either way.
+    #
+    # The pattern is what git itself permits in a revision (git-check-ref-format), plus the
+    # range/parent operators a caller may legitimately pass: SHAs, `main`, `HEAD~1`, `v1.2^2`,
+    # `origin/main`. A ref may not begin with '-', and git forbids it too.
+    match = _SAFE_REV.fullmatch(base_ref)
+    if match is None:
         return None
-    out = _git(["diff", "--name-only", f"{base_ref}...HEAD"], project_root)
+    safe_ref = match.group(0)
+    out = _git(["diff", "--name-only", f"{safe_ref}...HEAD"], project_root)
     if out is None:
-        out = _git(["diff", "--name-only", base_ref], project_root)
+        out = _git(["diff", "--name-only", safe_ref], project_root)
     if out is None:
         return None
     return [
@@ -393,10 +412,17 @@ def main(argv: list[str] | None = None) -> int:
         # can be `../../../anywhere` is a path-traversal write with `parents=True` behind it —
         # this runs on a CI runner with a checkout and a token, so "the caller chose the path"
         # is not a reason to skip the check.
-        sarif_path = Path(args.sarif)
-        workspace = Path.cwd().resolve()
-        if not sarif_path.resolve().is_relative_to(workspace):
-            return _fail(f"--sarif must stay inside the workspace: {args.sarif}")
+        # ALLOWLIST. `--sarif` names an output file, and an output file that can be
+        # `../../../anywhere` is a path-traversal write with `parents=True` behind it. This
+        # runs on a CI runner with a checkout and a token, so "the caller chose the path" is
+        # not a reason to skip the check. The path is rebuilt from the matched pattern, so the
+        # value reaching the filesystem is one this function constructed, not one it was given.
+        sarif_match = _SAFE_OUT_PATH.fullmatch(args.sarif)
+        if sarif_match is None:
+            return _fail(
+                f"--sarif must be a relative .sarif path inside the workspace: {args.sarif}"
+            )
+        sarif_path = Path(sarif_match.group(0))
         sarif_path.parent.mkdir(parents=True, exist_ok=True)
         sarif_path.write_text(
             json.dumps(to_sarif(report, version=_version()), indent=2)
