@@ -103,9 +103,15 @@ runs:
     # So this does not swallow errors — and Wesker's suite-health gate catches it regardless.
     - name: Install project
       shell: bash
+      # Through env, not template interpolation. Interpolating the input directly into the
+      # script left an EMPTY `then` block whenever it was unset — its default — so bash failed
+      # to parse and the action died in setup for every caller using the documented defaults.
+      # Reading it as a variable also keeps a caller's string out of the script's own syntax.
+      env:
+        WESKER_INSTALL: ${{ inputs.install }}
       run: |
-        if [ -n "${{ inputs.install }}" ]; then
-          ${{ inputs.install }}
+        if [ -n "$WESKER_INSTALL" ]; then
+          eval "$WESKER_INSTALL"
         else
           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
           if [ -f pyproject.toml ]; then
