@@ -92,19 +92,59 @@ def _reset_item(item: Any) -> None:
     finalized ``tmp_path`` / an undone ``monkeypatch`` — the test then fails for reasons
     unrelated to any mutant, and those failures are attributed as kills.
 
-    This mirrors ``pytest-rerunfailures``' reset, which does the same two steps for the
-    same reason. Failing quietly is the danger: run 1 is perfect, so a small smoke test
-    (few items, trivial fixtures) never reveals it.
+    INVALIDATE VIA ``finish()``, NEVER BY ASSIGNING ``cached_result = None``.
+    They are not equivalent, and the difference compounds until the suite collapses.
+    ``FixtureDef.finish()`` is the ONLY thing that empties ``_finalizers`` (it pops each
+    one, runs it, then clears), and it opens with ``if self.cached_result is None:
+    return`` — "already finished. It is assumed that finalizers cannot be added in this
+    state." Nulling the cache directly is what breaks that assumption: the fixture LOOKS
+    finished while its finalizers are still queued, so the next ``finish()`` — including
+    the one pytest's OWN teardown calls — returns early and never clears them. They
+    accumulate across re-runs until ``FixtureDef.execute`` trips its own invariant,
+    ``assert not self._finalizers`` (``_pytest/fixtures.py``), during SETUP.
+
+    That failure mode is maximally deceptive, which is why it must be fixed here and not
+    downstream. The item never reaches its CALL phase, so the engine's wrapper finds a
+    failed report with no captured exception and raises ``AssertionError(...)`` — and
+    pytest's own invariant is an ``AssertionError`` too. Either way the engine's
+    assertion-vs-crash precedence reads "this test's expectation is wrong on correct
+    code" and reports a green suite as broken. Measured on Regenesis (2154-green, 2162
+    items): 2135 tests reported as failing, degrading to 2154 on a second pass, the
+    count drifting run to run because it tracks accumulated finalizers, not behaviour.
+    With ``finish()``, three consecutive passes are byte-identical.
+
+    A finalizer that raises is swallowed ON PURPOSE: it is stale teardown from a PREVIOUS
+    run, and letting it out here would attribute it to whatever mutant is loaded now —
+    the same false accusation, one layer up. Nothing leaks by swallowing it: ``finish()``
+    clears ``cached_result`` and ``_finalizers`` BEFORE re-raising, so the fixture is
+    fully invalidated either way.
+
+    This mirrors ``pytest-rerunfailures``' reset, for the same reason. Failing quietly is
+    the danger: run 1 is perfect, so a small smoke test (few items, trivial fixtures)
+    never reveals it — it takes hundreds of sequential re-runs to surface.
     """
-    init = getattr(item, "_initrequest", None)
-    if init is not None:
-        init()
+    # Tear down BEFORE rebuilding the request: `finish()` runs each fixture's finalizers
+    # against the request they were registered under, then `_initrequest()` gives the next
+    # run a clean one.
+    request = getattr(item, "_request", None)
     info = getattr(item, "_fixtureinfo", None)
     name2defs = getattr(info, "name2fixturedefs", None) or {}
     for defs in name2defs.values():
         for fixturedef in defs:
-            if getattr(fixturedef, "cached_result", None) is not None:
+            if getattr(fixturedef, "cached_result", None) is None:
+                continue
+            if request is None:
+                # No request to finish against (item never ran). Drop the cache, and the
+                # finalizers with it — there is nothing queued that a run could have added.
                 fixturedef.cached_result = None
+                continue
+            try:
+                fixturedef.finish(request)
+            except BaseException:  # noqa: BLE001,S110 — stale teardown; see docstring
+                pass
+    init = getattr(item, "_initrequest", None)
+    if init is not None:
+        init()
 
 
 def _make_item_callable(item: Any, capture: _ExcCapture) -> Callable[[], None]:
