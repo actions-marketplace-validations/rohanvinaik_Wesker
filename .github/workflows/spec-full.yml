@@ -1,0 +1,115 @@
+# THE BADGE RUN — whole codebase, uncompromised.
+#
+# Nothing waits on this. No human is watching a spinner and no merge is blocked, so it has no
+# latency budget at all: it runs on a schedule and writes an SVG that the README serves all
+# week. On a public repo GitHub's standard runners are free, so even a long run costs nothing
+# that matters.
+#
+# That is why it does NOT pass --allow-truncation. The one place a completeness measurement
+# should refuse to compromise is the place with no deadline: a truncated run is a sample of
+# whatever was cheap to reach, and a sample must never be badged as completeness. If this
+# fails on a budget, raise the budget — do not lower the claim.
+name: Specification (full)
+
+on:
+  push:
+    branches: [main]
+  schedule:
+    # Weekly. The badge is a property of the codebase, and the codebase does not change while
+    # nobody pushes.
+    - cron: "0 6 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  spec_full:
+    name: Specification completeness
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      security-events: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Measure the whole codebase
+        id: spec
+        uses: ./
+        with:
+          budget: "30000"
+          sarif: .wesker/wesker.sarif
+
+      - name: Upload survivors as code-scanning alerts
+        if: always() && hashFiles('.wesker/wesker.sarif') != ''
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: .wesker/wesker.sarif
+          category: wesker
+
+      # ── Badges ───────────────────────────────────────────────────
+      #
+      # Two, and only two. The first is the reading: what fraction of this codebase's behavior
+      # its tests pin. The second is the proof that the reading was cheap to get — mutants per
+      # dimension, which the greedy bound makes exactly 1.00. Everything else the run knows
+      # lives in the step summary, where it reads as conviction rather than advertising.
+      #
+      # There is no "unverified" badge, and that is deliberate: a run that cannot produce a
+      # trustworthy number FAILS above, so no badge is written and the maintainer gets a red
+      # X. The README never shows a number Wesker does not stand behind, and never shows an
+      # apology either.
+      - name: Create badges directory
+        run: mkdir -p .github/badges
+
+      # Colour is GREY below 80, not red. This measures something almost no suite scores well
+      # on: `spec_pct` counts assertion kills alone, so a test that merely runs the code pins
+      # nothing. A typical healthy repo lands well under 80% — Wesker's own ci.py reads 26%.
+      # Painting that red would make the badge a verdict, and a verdict most projects fail is
+      # not a measurement anyone installs twice. Grey reports; it does not scold. Green and
+      # amber are kept for the genuinely rare cases where they mean something.
+      - name: Specification completeness badge
+        uses: emibcn/badge-action@v2.0.2
+        with:
+          label: "Specification"
+          label-color: "333"
+          status: "${{ steps.spec.outputs.spec-pct }}% of ${{ steps.spec.outputs.dimensions-total }} dimensions"
+          color: ${{ steps.spec.outputs.spec-pct == '100' && '2ea043' || (steps.spec.outputs.spec-pct >= 80 && 'd29922' || '9f9f9f') }}
+          path: ".github/badges/specification.svg"
+
+      - name: Selection optimality badge
+        uses: emibcn/badge-action@v2.0.2
+        with:
+          label: "Mutants per dimension"
+          label-color: "333"
+          status: "${{ steps.spec.outputs.total-mutants }}/${{ steps.spec.outputs.dimensions-total }} · provably minimal"
+          color: "8b5cf6"
+          path: ".github/badges/optimality.svg"
+
+      - name: Push badges to the badges branch
+        if: github.ref == 'refs/heads/main'
+        run: |
+          cp .github/badges/*.svg /tmp/
+          rm -rf .github/badges
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          if git ls-remote --exit-code --heads origin badges >/dev/null 2>&1; then
+            git fetch origin badges:badges
+            git switch badges
+          else
+            git switch --orphan badges
+            git rm -rf . >/dev/null 2>&1 || true
+          fi
+
+          mkdir -p .github/badges
+          cp /tmp/*.svg .github/badges/
+          git add .github/badges/*.svg
+
+          if git diff --cached --quiet; then
+            echo "No badge changes"
+            exit 0
+          fi
+
+          git commit -m "spec ${{ steps.spec.outputs.spec-pct }}% (${{ steps.spec.outputs.dimensions-pinned }}/${{ steps.spec.outputs.dimensions-total }} dimensions pinned)"
+          git push origin badges

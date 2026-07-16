@@ -139,6 +139,27 @@ Traditional tools run the entire suite against every mutant. For 300 tests, that
 
 Wesker resolves covering tests in three tiers: **convention** (`src/query.py` → `tests/test_query.py`), then **static AST impact** (scan test files for references to the mutated name), then **full fallback** only if the first two find nothing. Most functions resolve at tier 1, and each mutant runs against 3–15 tests rather than the full suite. The argument, again, is exact: a test that neither imports, references, nor transitively calls the mutated function cannot detect the mutation. Running it is pure waste.
 
+This layer is the one place the comparison can be made cleanly, because it is a single flag on
+the same engine: `scope_tests=False` **is** classical mutation testing — every test against
+every mutant — so the two arms share an implementation, a mutant set, a runner, and a machine.
+Nothing is confounded but the thing under test.
+
+| Repo | Tests | Every test × every mutant | Covering tests only | Ratio |
+|------|-------|---------------------------|---------------------|-------|
+| ModelAtlas | 1,000 | 1,625 s | **348 s** | **4.7×** |
+| Detective | 306 | 966 s | **141 s** | **6.9×** |
+| Prism · `economics.py::analyze` | 421 | 33.6 s | **1.8 s** | **18.7×** |
+
+The ratio is the smaller half of the result. At the same per-file budget the classical arm did
+not merely cost more — **it did not finish**, truncating 9 functions on Detective and 7 on
+ModelAtlas, so what it reports is a sample of whatever was cheap to reach. The scoped arm
+truncated 0 and 2 respectively. A cost model that only bites when the budget runs out is not a
+performance footnote; it is the reason the resulting percentage cannot be trusted.
+
+(Single run per repo, one machine, no variance bars — an effect this size does not need them,
+but it is a measurement, not a benchmark suite. `scope_tests` was Wesker's own default until
+these numbers were taken, so the slow arm is not a straw man: it is what this tool shipped.)
+
 ### The combined cost model
 
 Traditional mutation testing costs
@@ -355,11 +376,83 @@ Layout is auto-detected from `[tool.coverage.run]`, `[tool.hatch.build]`, or an 
 
 ### GitHub Action
 
+Two workflows. The first runs on every pull request and is scoped to the diff, so it costs
+seconds. The second measures the whole codebase on a schedule and writes the badge. On a public
+repo GitHub's standard runners are free, so both cost nothing but wall-clock nobody is waiting on.
+
+**On pull requests** — survivors land as code-scanning alerts, inline on the diff:
+
 ```yaml
-- name: Mutation testing
-  run: |
-    pip install wesker
-    wesker src/ --threshold 90
+name: Specification
+on: pull_request
+permissions:
+  contents: read
+  security-events: write        # required to upload SARIF
+jobs:
+  spec:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0        # the diff scope needs the merge base
+      - uses: rohanvinaik/Wesker@v0.5.0
+        with:
+          base-ref: ${{ github.event.pull_request.base.sha }}
+          sarif: .wesker/wesker.sarif
+      - uses: github/codeql-action/upload-sarif@v3
+        if: always() && hashFiles('.wesker/wesker.sarif') != ''
+        with:
+          sarif_file: .wesker/wesker.sarif
+          category: wesker
+```
+
+**On a schedule** — the whole codebase, for the badge:
+
+```yaml
+name: Specification (full)
+on:
+  schedule: [{cron: "0 6 * * 1"}]
+  workflow_dispatch:
+jobs:
+  spec:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: rohanvinaik/Wesker@v0.5.0
+        id: spec
+        with:
+          budget: "30000"
+      - run: echo "${{ steps.spec.outputs.spec-pct }}% of ${{ steps.spec.outputs.dimensions-total }} dimensions"
+```
+
+See [`.github/workflows/`](.github/workflows/) for the versions this repo runs on itself,
+including badge generation.
+
+| Input | Default | |
+|-------|---------|--|
+| `base-ref` | — | scope to files changed since this ref; omit for the whole codebase |
+| `targets` | auto | explicit files; otherwise discovered from `[tool.wesker]` or layout |
+| `budget` | `15000` | per-file budget, ms |
+| `threshold` | — | fail if `spec-pct` is below this |
+| `sarif` | `.wesker/wesker.sarif` | where to write the SARIF report |
+| `allow-truncation` | `false` | report a budget-limited sample rather than failing |
+
+Outputs: `spec-pct`, `dimensions-total`, `dimensions-pinned`, `dimensions-unspecified`,
+`kill-pct`, `total-mutants`, `survivors`, `execution-mode`, `report`, `sarif`.
+
+**Requires pytest, and a suite that passes on unmutated code.** The action would rather fail
+loudly than publish a number it cannot stand behind: it refuses to report if the run falls back
+to the non-pytest runner, if most of the suite fails before any mutant is introduced (a broken
+environment reports `0%` and looks identical to unspecified code), or if the budget truncated
+the run (a sample is not a completeness measurement). Each refusal prints the one-line diagnosis
+and the fix.
+
+#### Badge
+
+The scheduled workflow writes SVGs to a `badges` branch, so the README stays untouched:
+
+```markdown
+![Specification](https://raw.githubusercontent.com/OWNER/REPO/badges/.github/badges/specification.svg)
 ```
 
 ---

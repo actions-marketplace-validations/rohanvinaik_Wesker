@@ -1,55 +1,89 @@
-name: "Wesker Mutation Testing"
-description: "In-process AST mutation testing for Python. Zero dependencies."
+name: "Wesker — Specification Completeness"
+description: "How much of your code's behavior do your tests actually pin? Mutation testing with a denominator that means something."
 branding:
   icon: "shield"
   color: "red"
 
 inputs:
-  targets:
-    description: "Files or directories to profile (space-separated)"
+  base-ref:
+    description: >-
+      Scope the run to files changed since this ref — the pull-request check.
+      Leave empty to measure the whole codebase. Requires fetch-depth: 0 on checkout.
     required: false
-    default: "src/"
+    default: ""
+  targets:
+    description: >-
+      Files or directories to profile (space-separated). Leave empty to auto-detect from
+      [tool.wesker] source_dir, [tool.coverage.run], hatch packages, or an src/ layout.
+    required: false
+    default: ""
   threshold:
-    description: "Minimum kill rate % — fails the check if below"
+    description: "Fail if specification completeness (%) is below this. 0 disables."
     required: false
     default: "0"
-  exclude:
-    description: "Files to exclude (space-separated)"
+  sarif:
+    description: >-
+      Path for the SARIF 2.1.0 report. Upload it with github/codeql-action/upload-sarif to get
+      survivors as code-scanning alerts. Empty to skip.
     required: false
-    default: ""
-  mcdc:
-    description: "MC/DC targets (file.py::function, space-separated)"
-    required: false
-    default: ""
+    default: ".wesker/wesker.sarif"
   budget:
-    description: "Per-file budget in ms"
+    description: "Per-file budget in ms. Raise it rather than accept a truncated (sampled) run."
     required: false
-    default: "10000"
-  max-per-category:
-    description: "Max mutants per category"
+    default: "15000"
+  allow-truncation:
+    description: >-
+      Report a budget-limited sample instead of failing. The number is then NOT a completeness
+      measurement — left off by default on purpose.
     required: false
-    default: "3"
+    default: "false"
   python-version:
     description: "Python version to use"
     required: false
     default: "3.12"
+  install:
+    description: >-
+      Command that installs the project and its test dependencies. The default tries the usual
+      layouts; override it when your project needs something else. It must NOT fail silently —
+      a project whose tests cannot import is a broken environment, and Wesker will refuse to
+      report a number for it rather than publish a confident 0%.
+    required: false
+    default: ""
 
 outputs:
-  kill-rate:
-    description: "Mutation kill rate percentage"
-    value: ${{ steps.run.outputs.kill_rate }}
-  total-killed:
-    description: "Total mutants killed"
-    value: ${{ steps.run.outputs.total_killed }}
+  spec-pct:
+    description: "Specification completeness: % of behavioral dimensions pinned by a test. THE number."
+    value: ${{ steps.run.outputs.spec-pct }}
+  dimensions-total:
+    description: "Behavioral dimensions in the code (denominator; a property of the source)"
+    value: ${{ steps.run.outputs.dimensions-total }}
+  dimensions-pinned:
+    description: "Dimensions some test distinguishes"
+    value: ${{ steps.run.outputs.dimensions-pinned }}
+  dimensions-unspecified:
+    description: "Dimensions no test pins — the work queue"
+    value: ${{ steps.run.outputs.dimensions-unspecified }}
+  dof-pct:
+    description: "% of dimensions the greedy selection reached (a property of the ENGINE, ~100% by design)"
+    value: ${{ steps.run.outputs.dof-pct }}
+  kill-pct:
+    description: "Classic mutation score. Denominator varies with budget — not comparable across repos."
+    value: ${{ steps.run.outputs.kill-pct }}
   total-mutants:
-    description: "Total mutants generated"
-    value: ${{ steps.run.outputs.total_mutants }}
-  mcdc-status:
-    description: "MC/DC verification status"
-    value: ${{ steps.run.outputs.mcdc_status }}
+    description: "Mutants evaluated"
+    value: ${{ steps.run.outputs.total-mutants }}
+  execution-mode:
+    description: "How mutants were judged. Always 'pytest-live' — the action fails rather than degrade."
+    value: ${{ steps.run.outputs.execution-mode }}
+  survivors:
+    description: "Number of surviving mutants"
+    value: ${{ steps.run.outputs.survivors }}
   report:
-    description: "Path to JSON report"
-    value: ${{ steps.run.outputs.report }}
+    description: "Path to the full JSON report"
+    value: ".wesker/mutation_report.json"
+  sarif:
+    description: "Path to the SARIF report (empty if disabled)"
+    value: ${{ inputs.sarif }}
 
 runs:
   using: "composite"
@@ -61,46 +95,39 @@ runs:
 
     - name: Install Wesker
       shell: bash
-      run: pip install ${{ github.action_path }}
+      run: python -m pip install --upgrade pip "${{ github.action_path }}"
 
-    - name: Install project dependencies
+    # Installing the project under test is the step most likely to differ per repo, and a
+    # SILENT failure here is the worst outcome available: every test then fails to import, no
+    # test can testify about any mutant, and a naive runner reports a confident 0% specified.
+    # So this does not swallow errors — and Wesker's suite-health gate catches it regardless.
+    - name: Install project
       shell: bash
       run: |
-        if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
-        if [ -f pyproject.toml ]; then pip install -e ".[dev,test]" 2>/dev/null || pip install -e . 2>/dev/null || true; fi
+        if [ -n "${{ inputs.install }}" ]; then
+          ${{ inputs.install }}
+        else
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+          if [ -f pyproject.toml ]; then
+            pip install -e ".[dev,test]" || pip install -e ".[test]" || pip install -e ".[dev]" || pip install -e . || {
+              echo "::warning::Could not install the project automatically. Set the 'install' input."
+            }
+          fi
+        fi
+        python -m pip install pytest
 
-    - name: Run Wesker
+    - name: Measure specification completeness
       id: run
       shell: bash
       run: |
-        ARGS="${{ inputs.targets }}"
-        if [ -n "${{ inputs.threshold }}" ] && [ "${{ inputs.threshold }}" != "0" ]; then
-          ARGS="$ARGS --threshold ${{ inputs.threshold }}"
-        fi
-        if [ -n "${{ inputs.exclude }}" ]; then
-          ARGS="$ARGS --exclude ${{ inputs.exclude }}"
-        fi
-        if [ -n "${{ inputs.mcdc }}" ]; then
-          ARGS="$ARGS --mcdc ${{ inputs.mcdc }}"
-        fi
-        ARGS="$ARGS --budget ${{ inputs.budget }} --max-per-category ${{ inputs.max-per-category }}"
+        ARGS=""
+        [ -n "${{ inputs.base-ref }}" ] && ARGS="$ARGS --base-ref ${{ inputs.base-ref }}"
+        [ -n "${{ inputs.targets }}" ] && ARGS="$ARGS --targets ${{ inputs.targets }}"
+        [ -n "${{ inputs.sarif }}" ] && ARGS="$ARGS --sarif ${{ inputs.sarif }}"
+        [ "${{ inputs.threshold }}" != "0" ] && ARGS="$ARGS --threshold ${{ inputs.threshold }}"
+        [ "${{ inputs.allow-truncation }}" = "true" ] && ARGS="$ARGS --allow-truncation"
+        ARGS="$ARGS --budget ${{ inputs.budget }}"
 
-        # Run with JSON output for parsing, tee to terminal
-        python -m Wesker $ARGS --json > .wesker-report.json 2>&1 || EXIT_CODE=$?
-
-        # Parse outputs
-        KILL_RATE=$(python -c "import json; d=json.load(open('.wesker-report.json')); print(d.get('mutation',{}).get('kill_pct',0))" 2>/dev/null || echo "0")
-        TOTAL_KILLED=$(python -c "import json; d=json.load(open('.wesker-report.json')); print(d.get('mutation',{}).get('total_killed',0))" 2>/dev/null || echo "0")
-        TOTAL_MUTANTS=$(python -c "import json; d=json.load(open('.wesker-report.json')); print(d.get('mutation',{}).get('total_mutants',0))" 2>/dev/null || echo "0")
-        MCDC_STATUS=$(python -c "import json; d=json.load(open('.wesker-report.json')); print('verified' if d.get('mcdc',{}).get('verified') else 'none')" 2>/dev/null || echo "none")
-
-        echo "kill_rate=$KILL_RATE" >> $GITHUB_OUTPUT
-        echo "total_killed=$TOTAL_KILLED" >> $GITHUB_OUTPUT
-        echo "total_mutants=$TOTAL_MUTANTS" >> $GITHUB_OUTPUT
-        echo "mcdc_status=$MCDC_STATUS" >> $GITHUB_OUTPUT
-        echo "report=.wesker-report.json" >> $GITHUB_OUTPUT
-
-        # Also print human-readable summary
-        python -m Wesker $ARGS 2>&1 || true
-
-        exit ${EXIT_CODE:-0}
+        # One run. It writes GITHUB_OUTPUT, GITHUB_STEP_SUMMARY, annotations, JSON and SARIF
+        # itself — no shell-side JSON parsing, and nothing merges stderr into a report file.
+        python -m Wesker.action $ARGS

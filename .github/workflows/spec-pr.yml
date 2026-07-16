@@ -1,0 +1,42 @@
+# THE FRONT DOOR — the cheap, fast, throwaway run.
+#
+# It answers two questions at once: "does this PR leave new behavior unspecified?" and, for
+# someone evaluating Wesker, "does this tool work on my repo at all?" Scoped to the diff it
+# costs seconds, so the second answer arrives before anyone has put a badge in their README.
+# That matters because Wesker is deliberately strict — it requires pytest and a suite that
+# passes — and finding that out on a throwaway PR is cheap, while finding it out on the badge
+# in your README is not.
+name: Specification (pull request)
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+  # Survivors are uploaded as code-scanning alerts: they land inline on the diff, in the
+  # Security tab, and anywhere else that reads code scanning.
+  security-events: write
+
+jobs:
+  spec_diff:
+    name: Unspecified behavior in this diff
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # The diff scope needs the merge base, which a shallow clone does not have.
+          fetch-depth: 0
+
+      - name: Measure changed files
+        id: spec
+        uses: ./
+        with:
+          base-ref: ${{ github.event.pull_request.base.sha }}
+          sarif: .wesker/wesker.sarif
+
+      - name: Upload survivors as code-scanning alerts
+        if: always() && hashFiles('.wesker/wesker.sarif') != ''
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: .wesker/wesker.sarif
+          category: wesker

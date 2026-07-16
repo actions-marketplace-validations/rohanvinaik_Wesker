@@ -80,24 +80,37 @@ def test_docstring_line_excluded_from_denominator():
 
 
 def test_converged_scoping_default_is_pinned():
-    """Pin the converged path's scoping default so it cannot flip unnoticed.
+    """Pin the converged path's scoping default ON, so it cannot flip back unnoticed.
 
-    This asserts the STATUS QUO (off = this path's historical behaviour), not that
-    off is correct. On prism/economics.py::analyze the two settings disagree 130 vs 2
-    kills, and the unscoped number is inflated: 107 "assertion kills" are credited to
-    a test in another module that never references the function and fails the same way
-    on the UNMUTATED original. Neither setting is trustworthy until a test that fails
-    on the original is barred from being credited with a kill. Whoever fixes that
-    should revisit this default deliberately — hence the pin.
+    Test-impact selection is the DESIGN, not an optimisation. Evaluating every mutant
+    against every test is plain mutation testing — the expensive thing this engine's
+    whole architecture exists to avoid. Off, this path was both slower and wronger:
+
+      - COST: ``evaluate_mutant`` scans the entire suite before conceding a survivor,
+        so unscoped, every would-be survivor pays for the whole suite. Against the
+        500ms per-mutant budget (sized for a scoped handful) that turned 83% of
+        Detective's and 92% of ModelAtlas's unspecified dimensions into TIMEOUTS,
+        with zero true survivors. Those runs measured suite speed, not specification.
+      - ACCURACY: unscoped credited 107 kills on prism/economics.py::analyze to a test
+        that never references the function and fails identically on the UNMUTATED
+        original — a test that distinguishes nothing, credited with killing
+        everything. Scoping drops it, because its traced coverage is empty.
+
+    This default was previously pinned OFF as the status quo, with a note asking
+    whoever revisited it to do so deliberately. This is that revisit.
+    ``test_scoped_and_unscoped_verdicts_agree`` below is the warrant: same verdict,
+    less work.
     """
     import inspect
 
     from Wesker.engine import run_function_converged
 
     sig = inspect.signature(run_function_converged)
-    assert sig.parameters["scope_tests"].default is False, (
-        "the converged path's scope_tests default changed — revisit the "
-        "baseline-failure kill-attribution defect before trusting either setting"
+    assert sig.parameters["scope_tests"].default is True, (
+        "the converged path's scope_tests default flipped OFF — that is plain "
+        "mutation testing: every test against every mutant, which blows the "
+        "per-mutant budget into mass timeouts and credits non-distinguishing tests "
+        "with kills"
     )
 
 

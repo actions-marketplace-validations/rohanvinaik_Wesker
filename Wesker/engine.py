@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import ast
 import copy
+import difflib
 import hashlib
 import math
 import time
@@ -225,6 +226,19 @@ class ProfilingResult:
     # two sites sharing a dimension are still distinct behaviors.
     dof_total: int = 0
     dof_covered: int = 0
+    # THE SPECIFICATION METRIC — distinct dimensions whose mutant a test actually KILLED.
+    #
+    # ``dof_covered`` is a property of the SELECTION (did greedy reach every dimension), and
+    # under the DOF budget it is ~always dof_total, because that is exactly the theorem. It
+    # says nothing about the tests, and reporting it as "specification completeness" would
+    # publish a number that is 100% on a repo with no working tests at all.
+    #
+    # ``dof_pinned`` is the property of the SUITE: of this function's behavioral dimensions,
+    # how many does some test distinguish? Its denominator (``dof_total``) is derived from the
+    # AST — a property of the code, identical on any machine at any budget — which is what
+    # makes the ratio comparable ACROSS repos, unlike a kill rate whose denominator is however
+    # many mutants a given run happened to sample.
+    dof_pinned: int = 0
     # Second completeness axis, from a traced baseline pass over the unmutated
     # function: which target lines each test covers, and the executable-line
     # denominator. Empty when no baseline pass ran (backward-compatible).
@@ -259,12 +273,22 @@ class ProfilingResult:
     def value_survivor_records(self) -> list[dict]:
         """Survivor-shaped record for every value-unspecified mutant — the true survivors
         plus each crash/timeout kill (reshaped from ``killed_records``, carrying its diff)
-        so a value-distinguishing witness can be sought for behavior the tests only ran."""
+        so a value-distinguishing witness can be sought for behavior the tests only ran.
+
+        Carries ``mutated_line``, ``dimension`` and ``change`` through from the kill record.
+        They are what let a consumer report the gap AT the line it lives on and name the
+        behavior nobody pinned — a SARIF result or an editor annotation rather than a count.
+        Without them a crash-kill survivor arrives as `line None` with a blank dimension: a
+        warning that cannot be located, attached to a file, which is worse than silence.
+        """
         crash_survivors = [
             {
                 "mutant_id": r.get("mutant_id"),
                 "mutant": r.get("mutant"),
                 "category": r.get("category"),
+                "mutated_line": r.get("mutated_line"),
+                "dimension": r.get("dimension"),
+                "change": r.get("change", ""),
                 "diff_summary": r.get("diff_summary", ""),
                 "killed_by": r.get("killed_by"),
                 "elapsed_ms": r.get("elapsed_ms", 0.0),
@@ -296,6 +320,15 @@ class ProfilingResult:
                 if self.dof_total > 0
                 else 100
             ),
+            "dof_pinned": self.dof_pinned,
+            # Specification completeness: the fraction of this function's behavioral
+            # dimensions that some test pins. 0 dimensions = nothing to specify = complete,
+            # which is why the empty case is 100 rather than a division error.
+            "spec_pct": (
+                round(100 * self.dof_pinned / self.dof_total)
+                if self.dof_total > 0
+                else 100
+            ),
             "survival_rate": round(self.survival_rate, 3),
             "effective_kill_pct": effective_kill_pct,
             "coverage_depth": self.coverage_depth,
@@ -320,6 +353,13 @@ class ProfilingResult:
             d["kill_matrix"] = self.kill_matrix
         if self.survivor_records:
             d["survivor_records"] = self.survivor_records
+        # The value-unspecified set: true survivors PLUS crash/timeout kills. This is what a
+        # SPECIFICATION consumer wants — `spec_pct` counts assertion kills alone, so a report
+        # that listed only `survivor_records` would claim a gap and then name none of it, and
+        # the SARIF/annotations built from it would show a clean diff under a red badge.
+        # `survivor_records` stays exactly as it was: Detective reads that name.
+        if self.value_survivor_records:
+            d["value_survivor_records"] = self.value_survivor_records
         if self.killed_records:
             d["killed_records"] = self.killed_records
         if self.line_coverage:
@@ -2080,6 +2120,33 @@ def _extract_compare_parts(
 # ── Mutant Evaluation ─────────────────────────────────────────────
 
 
+def _is_private_copy(module_name: str, private_prefix: str) -> bool:
+    """True for a module belonging to the private self-profiling copy of this package.
+
+    THE ONE THING THIS EXISTS FOR. When Wesker profiles Wesker, the engine driving the run is
+    imported a second time under ``private_prefix`` (see ``Wesker.self_profile``) so that the
+    public ``Wesker.*`` modules can be mutated freely without the engine eating its own mutant
+    mid-flight. Both copies are compiled from the SAME source files, so they carry the SAME
+    ``co_filename`` — which means ``_co_filename_matches`` cannot tell them apart, and the
+    patch loop would install the mutant into the private copy too, reintroducing exactly the
+    self-mutation this design removes.
+
+    The module NAME is the only thing that differs between the two copies, so it is the only
+    thing that can discriminate them. Matching on the name rather than on the filename is
+    therefore not a stylistic choice; it is the whole mechanism.
+
+    Takes the NAME rather than the module so it stays a total function of two strings: the
+    caller does the ``getattr``. A predicate that took the module object could only be
+    exercised with a live module, which is not expressible as a test input — and a guard whose
+    correctness cannot be pinned is not a guard worth having.
+
+    Costs nothing when no private copy exists: no module is named ``_wesker_self`` in an
+    ordinary run, so this is a failed prefix check per module and the patch behaviour for every
+    other project is bit-for-bit unchanged.
+    """
+    return module_name.startswith(private_prefix)
+
+
 def _patch_module_qualified(
     func_name: str | None,
     mutated_obj: Any,
@@ -2115,9 +2182,13 @@ def _patch_module_qualified(
         return []
     import sys
 
+    from Wesker.self_profile import PRIVATE_PREFIX
+
     saved: list[tuple[Any, Any]] = []
     for mod in list(sys.modules.values()):
-        if mod is None:
+        if mod is None or _is_private_copy(
+            getattr(mod, "__name__", ""), PRIVATE_PREFIX
+        ):
             continue
         try:
             obj = getattr(mod, func_name, None)
@@ -2141,7 +2212,9 @@ def _patch_module_qualified(
         owner_parts = qualname.split(".")[:-1]
         method = qualname.split(".")[-1]
         for mod in list(sys.modules.values()):
-            if mod is None:
+            if mod is None or _is_private_copy(
+                getattr(mod, "__name__", ""), PRIVATE_PREFIX
+            ):
                 continue
             owner: Any = mod
             try:
@@ -2712,6 +2785,42 @@ def _elapsed(start: float) -> float:
     return (time.monotonic() - start) * 1000
 
 
+def _mutant_change(mutant: Mutant) -> str:
+    """The single changed line, as ``'n >= 10 → n > 10'``.
+
+    ``_mutant_diff`` promises a minimal diff but the mutators set ``original_node`` to the
+    enclosing FunctionDef, so it unparses the WHOLE function twice — fine for the oracle
+    synthesis that consumes it, useless as an annotation an engineer reads in a diff. This
+    recovers the actual edit by line-diffing the two unparsed forms, which works precisely
+    because they are the same function differing at one place.
+
+    Returns "" when the change is not a single line (or cannot be unparsed) rather than
+    guessing: the caller then falls back to the category description, which is vaguer but true.
+    """
+    try:
+        original = ast.unparse(mutant.original_node)
+        mutated = ast.unparse(mutant.mutated_node)
+    except Exception:
+        return ""
+    if original == mutated:
+        return ""
+
+    o_lines = original.splitlines()
+    m_lines = mutated.splitlines()
+    matcher = difflib.SequenceMatcher(None, o_lines, m_lines)
+    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+        if tag == "equal":
+            continue
+        if tag == "replace" and i2 - i1 == 1 and j2 - j1 == 1:
+            return f"{o_lines[i1].strip()} → {m_lines[j1].strip()}"
+        if tag == "delete" and i2 - i1 == 1:
+            # Statement deletion (SDL): there is no replacement text to show, and saying so
+            # is the whole point of the operator.
+            return f"{o_lines[i1].strip()} → (statement deleted)"
+        return ""
+    return ""
+
+
 def _mutant_diff(mutant: Mutant) -> str:
     """A minimal ``'- <original>\\n+ <mutated>'`` diff of the mutated node.
 
@@ -2964,6 +3073,9 @@ def run_function_profiling(
                     "mutant_id": mutant.mutant_id,
                     "mutant": mutant.description,
                     "category": mutant.category.value,
+                    "mutated_line": mutant.mutated_line,
+                    "dimension": mutant.dimension,
+                    "change": _mutant_change(mutant),
                     "diff_summary": _mutant_diff(mutant),
                     "error": f"{type(exc).__name__}: {exc}",
                     "elapsed_ms": 0.0,
@@ -2993,6 +3105,9 @@ def run_function_profiling(
                     "mutant_id": mutant.mutant_id,
                     "mutant": mutant.description,
                     "category": mutant.category.value,
+                    "mutated_line": mutant.mutated_line,
+                    "dimension": mutant.dimension,
+                    "change": _mutant_change(mutant),
                     "killed_by": result.killed_by,
                     "test": result.test_name,
                     "diff_summary": _mutant_diff(mutant),
@@ -3006,6 +3121,9 @@ def run_function_profiling(
                     "mutant_id": mutant.mutant_id,
                     "mutant": mutant.description,
                     "category": mutant.category.value,
+                    "mutated_line": mutant.mutated_line,
+                    "dimension": mutant.dimension,
+                    "change": _mutant_change(mutant),
                     "diff_summary": _mutant_diff(mutant),
                     "elapsed_ms": round(result.elapsed_ms, 1),
                 }
@@ -3231,38 +3349,45 @@ def run_function_converged(
     category_order: list[MutationCategory] | None = None,
     full_matrix: bool = False,
     source_path: str | None = None,
-    scope_tests: bool = False,
+    scope_tests: bool = True,
     trace_budget_s: float | None = DEFAULT_TRACE_BUDGET_S,
     trace_progress: Callable[[int, int, float], None] | None = None,
     trace_session_budget_s: float | None = DEFAULT_TRACE_SESSION_BUDGET_S,
 ) -> ProfilingResult:
     """Multi-pass convergence with integrated equivalence detection.
 
-    ``scope_tests`` defaults to False here — preserving this path's historical
-    behaviour — but that default is NOT an endorsement: the two settings disagree
-    wildly and WHICH ONE IS RIGHT IS UNRESOLVED. Measured on
-    prism/economics.py::analyze (identical 130-mutant set, budget not exhausted):
+    ``scope_tests`` defaults to True: test-impact selection is the intended design,
+    not an optimisation bolted on. Only a test that EXECUTES the mutated line can
+    distinguish the mutant; the rest behave identically under the mutation, so
+    running them buys nothing. ``test_scoped_and_unscoped_verdicts_agree`` pins that
+    the two produce the SAME verdict against a suite that kills everything — scoping
+    is verdict-exact, which is what makes it free.
 
-        scope_tests=False -> 130 killed (110 by assertion)   33.6s
-        scope_tests=True  ->   2 killed                       1.8s
+    This default was False for a period, preserving an older path's behaviour, and
+    that was doing real damage on both axes:
 
-    The unscoped number is demonstrably inflated. 107 of those "assertion kills" are
-    credited to ``test_nudge_contains_tool_count``, which lives in
-    tests/test_compaction_trigger.py, imports only ``prism.compaction_trigger``, and
-    never references ``analyze``. It takes a ``tmp_state`` fixture the direct-call
-    contract cannot supply, so it fails the same way for every mutant AND for the
-    unmutated original — a test that cannot distinguish anything is credited with
-    killing everything. ``trace_line_coverage`` correctly records 0 covered lines for
-    it, which is why scoping drops it.
+    ACCURACY. Measured on prism/economics.py::analyze (identical 130-mutant set):
+    unscoped credited 130 kills, 107 of them to ``test_nudge_contains_tool_count`` —
+    a test in another module that never references ``analyze`` and fails identically
+    on the UNMUTATED original. A test that cannot distinguish anything was credited
+    with killing everything. ``trace_line_coverage`` correctly records 0 covered
+    lines for it, so scoping drops it; the unscoped number was simply inflated.
 
-    ``failing_on_baseline`` is the guard meant to catch exactly this, but it reports
-    0/421 here: it only counts ``AssertionError``, and a missing-fixture test raises
-    ``TypeError`` first. So the guard never fires and the kill is attributed anyway.
+    COST, and it dominated the reports. ``evaluate_mutant`` returns on the FIRST
+    assertion kill but scans the WHOLE set before conceding a survivor — so unscoped,
+    every would-be survivor pays for the entire suite. Against ``per_mutant_timeout_ms``
+    (500ms, sized for a scoped handful) that is not a budget any real suite can meet:
+    profiling Detective (306 tests) turned 1093 of 1305 unspecified dimensions into
+    TIMEOUTS, and ModelAtlas (1000 tests) 2602 of 2801 — with ZERO true survivors.
+    Those runs measured suite speed, not specification. Scoped, the same work is a
+    handful of tests per mutant and the 500ms budget is generous (1.8s vs 33.6s above).
 
-    The real defect is upstream of scoping: a test that fails identically on the
-    UNMUTATED function must never be credited with a kill, whatever the reason it
-    fails. Until that holds, neither setting can be trusted — do not tune this flag
-    to make a number look better.
+    A remaining defect is upstream of this flag and unaffected by it: a test that
+    fails identically on the unmutated original must never be credited with a kill,
+    whatever the reason it fails. ``failing_on_baseline`` only counts
+    ``AssertionError``, so a missing-fixture ``TypeError`` slips past it. Scoping
+    happens to drop such tests when their coverage is empty, but that is a side
+    effect, not the fix.
 
     Returns ``ProfilingResult`` with full kill matrix, survivor/killed
     records, and gateability — compatible with downstream consumers
@@ -3292,6 +3417,7 @@ def run_function_converged(
     universe = estimate_universe_size(func_node, categories)
     dof_total = dof_universe(func_node, categories)
     dims_covered: set[str] = set()
+    dims_pinned: set[str] = set()
     qualname = (
         func_key.split("::", 1)[1]
         if "::" in func_key
@@ -3377,13 +3503,38 @@ def run_function_converged(
 
             seen[mutant.mutant_id] = result
             if mutant.dimension and not _is_dead(mutant.dimension):
-                dims_covered.add(f"{mutant.category.value}\x00{mutant.dimension}")
+                dim_key = f"{mutant.category.value}\x00{mutant.dimension}"
+                dims_covered.add(dim_key)
+                # A dimension counts as PINNED only when a test DISTINGUISHED the mutant's
+                # value — an assertion kill. A crash or timeout kill proves the tests RAN the
+                # mutated code, not that any of them checked what it returned, so it pins
+                # nothing: `CategoryResult.value_survived` already states this outright
+                # ("Value-unspecified DOF: survivors PLUS crash/timeout kills. For
+                # specification these are equivalent — none pins the return value"), and
+                # `value_killed` is `killed_by_assertion` alone.
+                #
+                # This is the difference between a mutation score and a specification
+                # measurement, and getting it wrong is not conservative — it inflates. Counting
+                # every kill made Wesker report 98% on its own ci.py, where Detective (which
+                # reads value_killed) reports 29% for the same code: mutating the machinery the
+                # tests drive makes them fall over, and every one of those crashes was being
+                # credited as pinned behavior. An equivalent mutant pins nothing either, and is
+                # excluded from the denominator elsewhere rather than credited here.
+                if result.killed and result.killed_by == "assertion":
+                    dims_pinned.add(dim_key)
 
-            # Build kill matrix and records for downstream consumers
+            # Build kill matrix and records for downstream consumers.
+            # ``mutated_line`` and ``dimension`` are what let a survivor be reported AT the
+            # source line it lives on, naming the behavior no test pins — an editor annotation
+            # or a SARIF result, rather than a count. Both are carried verbatim from the
+            # mutant; ``mutated_line`` is None when the mutator could not report a position.
             record = {
                 "mutant_id": mutant.mutant_id,
                 "mutant": mutant.description,
                 "category": mutant.category.value,
+                "mutated_line": mutant.mutated_line,
+                "dimension": mutant.dimension,
+                "change": _mutant_change(mutant),
                 "diff_summary": _mutant_diff(mutant),
                 "elapsed_ms": round(result.elapsed_ms, 1),
             }
@@ -3454,6 +3605,7 @@ def run_function_converged(
         survival_rate=survived / total if total > 0 else 0.0,
         dof_total=dof_total,
         dof_covered=len(dims_covered),
+        dof_pinned=len(dims_pinned),
         coverage_depth=depth,
         is_gateable=depth == "profiled",
         per_category=per_cat,

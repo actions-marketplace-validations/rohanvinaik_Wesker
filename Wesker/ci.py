@@ -904,15 +904,62 @@ def profile_codebase_live(
     other consumers (Detective) wrap their own entry points with it rather than
     re-deriving the inversion of control.
 
+    The report gains a ``suite`` block describing the baseline the numbers were measured
+    against — see :func:`suite_health`. Without it, a run whose entire suite was already
+    broken (unmet dependency, import error) is indistinguishable from a run against a
+    codebase nobody had specified: both report every mutant surviving. The first is a
+    broken environment and the second is a real finding, and a consumer must be able to
+    tell them apart before publishing either.
+
     Returns ``None`` when no live session could be started. Callers MUST treat that as
     a distinct outcome and say so. ``profile_codebase`` remains available and unchanged.
     """
+
+    def _profile_and_describe_suite() -> dict:
+        report = profile_codebase(project_root, targets, **kwargs)
+        health = suite_health()
+        if health is not None:
+            report["suite"] = health
+        return report
+
     return run_with_live_suite(
         project_root,
-        lambda: profile_codebase(project_root, targets, **kwargs),
+        _profile_and_describe_suite,
         target_files=targets,
         paths=paths,
     )
+
+
+def suite_health() -> dict | None:
+    """What the session baseline learned about the suite, for the report.
+
+    Only meaningful INSIDE a live session with a session baseline (i.e. called from within
+    :func:`run_with_live_suite` with target files); returns ``None`` otherwise rather than
+    inventing a reading.
+
+    ``inert`` is the load-bearing number. A test that fails with the ORIGINAL code in place
+    is barred from kill attribution — correctly, since it cannot testify about a mutant. But
+    if that is true of the whole suite, every mutant survives and the run reports a confident
+    0% "specified", which is a statement about a broken environment wearing the costume of a
+    statement about the code. Surfacing the count is what lets a caller refuse to publish it.
+    """
+    from Wesker.engine import _SESSION_BASELINE
+
+    baseline = _SESSION_BASELINE.get()
+    if baseline is None:
+        return None
+    return {
+        "tests": baseline.n_tests,
+        # Tests that fail with the unmutated original in place, and so cannot testify
+        # about any mutant.
+        "inert": len(baseline.inert),
+        # The narrower, nameable subset: an assertion that fails on correct code is a
+        # WRONG EXPECTATION, and a human can act on the name.
+        "failing_on_baseline": list(baseline.failing),
+        # Tests whose coverage trace was cut short by the trace budget — their line
+        # coverage is under-counted by construction.
+        "trace_truncated": len(baseline.truncated),
+    }
 
 
 def profile_codebase(
@@ -956,9 +1003,17 @@ def profile_codebase(
     total_universe = 0
     total_dof = 0
     total_dof_covered = 0
+    total_dof_pinned = 0
     total_functions = 0
     per_file: dict[str, dict] = {}
     global_cats: dict[str, dict] = {}
+    # The actionable half of the report. Per-function results carry a record for every
+    # surviving mutant — the source line and the behavioral dimension no test pins — and the
+    # file-level aggregation below reduces them to counts. Collected here so the report can
+    # say WHERE a specification is incomplete, not merely how much of it is: a count is a
+    # score, a located dimension is a task. Without this the survivors exist only inside this
+    # loop and are discarded when it ends.
+    survivors: list[dict] = []
     start = time.monotonic()
 
     for i, target in enumerate(targets, 1):
@@ -983,12 +1038,14 @@ def profile_codebase(
         file_universe = sum(r.get("universe_size", 0) for r in results)
         file_dof = sum(r.get("dof_total", 0) for r in results)
         file_dof_covered = sum(r.get("dof_covered", 0) for r in results)
+        file_dof_pinned = sum(r.get("dof_pinned", 0) for r in results)
         total_killed += file_killed
         total_mutants += file_total
         total_equivalent += file_equiv
         total_universe += file_universe
         total_dof += file_dof
         total_dof_covered += file_dof_covered
+        total_dof_pinned += file_dof_pinned
         total_functions += len(results)
         # A function whose budget ran out was only PARTIALLY evaluated: its unevaluated
         # mutants are absent from both numerator and denominator, so the ratio is a
@@ -996,6 +1053,22 @@ def profile_codebase(
         # because the per-function flag never reached the report — a truncated run and a
         # complete one published byte-identical badges.
         total_truncated += sum(1 for r in results if r.get("budget_exhausted"))
+
+        # Carry each survivor up with the function it came from. ``function_key`` is
+        # "path::qualname", so the record is self-locating: file, line, and the dimension
+        # left unspecified — everything an annotation or a SARIF result needs, and nothing
+        # a consumer would have to re-derive.
+        # value_survivor_records, NOT survivor_records: this report's headline is `spec_pct`,
+        # which counts assertion kills alone, so the gap it names has to be the VALUE-
+        # unspecified set — true survivors plus the crash/timeout kills that ran the code
+        # without ever checking what it returned. Listing only true survivors would report a
+        # gap and then name none of it. Falls back to the raw records for a result produced by
+        # a path that does not distinguish them.
+        for r in results:
+            key = r.get("function_key", "")
+            records = r.get("value_survivor_records") or r.get("survivor_records", [])
+            for rec in records:
+                survivors.append({**rec, "function_key": key})
 
         # Aggregate per-category stats for the report (feeds next run's priors)
         for r in results:
@@ -1033,6 +1106,8 @@ def profile_codebase(
                 "universe": file_universe,
                 "dof": file_dof,
                 "dof_covered": file_dof_covered,
+                "dof_pinned": file_dof_pinned,
+                "spec_pct": round(100 * file_dof_pinned / max(file_dof, 1)),
                 "kill_pct": kill_pct,
                 "elapsed_ms": round(file_ms),
             }
@@ -1065,7 +1140,14 @@ def profile_codebase(
         "total_universe": total_universe,
         "total_dof": total_dof,
         "total_dof_covered": total_dof_covered,
+        # Did the SELECTION reach every behavioral dimension? Under the DOF budget this is
+        # the greedy bound being met — a statement about the engine, not about the suite.
         "dof_pct": round(100 * total_dof_covered / max(total_dof, 1)),
+        "total_dof_pinned": total_dof_pinned,
+        # SPECIFICATION COMPLETENESS — the headline. What fraction of this codebase's
+        # behavioral dimensions do its tests actually pin? The denominator comes from the
+        # AST, so unlike a kill rate it means the same thing in every repo at every budget.
+        "spec_pct": round(100 * total_dof_pinned / max(total_dof, 1)),
         "kill_pct": kill_pct,
         "total_functions": total_functions,
         # Functions whose per-file budget ran out before every selected mutant was
@@ -1076,4 +1158,7 @@ def profile_codebase(
         "elapsed_ms": round(elapsed),
         "per_file": per_file,
         "per_category": list(global_cats.values()),
+        # Every surviving mutant, located. The report's only per-mutant detail: what a
+        # consumer needs to ANNOTATE the gap rather than just score it.
+        "survivors": survivors,
     }

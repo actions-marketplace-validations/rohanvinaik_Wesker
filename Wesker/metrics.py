@@ -34,7 +34,8 @@ from pathlib import Path
 
 # Ensure scripts/ is on the path for wesker_engine/wesker_filter imports
 
-from Wesker.ci import profile_codebase, profile_codebase_live  # noqa: E402
+from Wesker.ci import profile_codebase  # noqa: E402
+from Wesker.self_profile import profiler_for_targets  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
@@ -479,7 +480,9 @@ def main():
     # a test could kill is scored a survivor) and, where collection fails outright,
     # scores their missing-fixture crashes as kills — a fabricated 100%. A CI badge
     # must not be able to report either number without saying so.
-    mutation = profile_codebase_live(
+    # Wesker profiling Wesker runs from a private copy of the package (see
+    # Wesker.self_profile); every other project resolves to the public engine here, unchanged.
+    mutation = profiler_for_targets(targets)(
         ".",
         targets,
         budget_ms_per_file=15000,
