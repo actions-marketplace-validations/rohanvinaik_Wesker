@@ -76,25 +76,30 @@ jobs:
           color: ${{ steps.spec.outputs.spec-pct == '100' && '2ea043' || (steps.spec.outputs.spec-pct >= 80 && 'd29922' || '9f9f9f') }}
           path: ".github/badges/specification.svg"
 
+      # Committed from a WORKTREE, so this checkout is never disturbed. Switching the branch in
+      # place replaces the working tree with one that has no action.yml in it — and the
+      # composite action's own post step then cannot find itself and fails the job AFTER the
+      # badge was already written and pushed. A green measurement reported as a red X.
       - name: Push badges to the badges branch
         if: github.ref == 'refs/heads/main'
         run: |
           cp .github/badges/*.svg /tmp/
-          rm -rf .github/badges
 
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
           if git ls-remote --exit-code --heads origin badges >/dev/null 2>&1; then
-            git fetch origin badges:badges
-            git switch badges
+            git fetch origin badges
+            git worktree add /tmp/badges-wt badges
           else
-            git switch --orphan badges
-            git rm -rf . >/dev/null 2>&1 || true
+            git worktree add --detach /tmp/badges-wt
+            git -C /tmp/badges-wt checkout --orphan badges
+            git -C /tmp/badges-wt rm -rf . >/dev/null 2>&1 || true
           fi
 
-          mkdir -p .github/badges
-          cp /tmp/*.svg .github/badges/
+          mkdir -p /tmp/badges-wt/.github/badges
+          cp /tmp/*.svg /tmp/badges-wt/.github/badges/
+          cd /tmp/badges-wt
           git add .github/badges/*.svg
 
           if git diff --cached --quiet; then

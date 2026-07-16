@@ -73,21 +73,25 @@ jobs:
         if: github.event.pull_request.head.repo.full_name == github.repository
         run: |
           cp .github/badges/specification-diff.svg /tmp/
-          rm -rf .github/badges
 
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
+          # A WORKTREE, so this checkout is untouched — switching the branch in place leaves a
+          # tree with no action.yml, and the composite action's post step then fails the job
+          # after the badge has already been pushed.
           if git ls-remote --exit-code --heads origin badges >/dev/null 2>&1; then
-            git fetch origin badges:badges
-            git switch badges
+            git fetch origin badges
+            git worktree add /tmp/badges-wt badges
           else
-            git switch --orphan badges
-            git rm -rf . >/dev/null 2>&1 || true
+            git worktree add --detach /tmp/badges-wt
+            git -C /tmp/badges-wt checkout --orphan badges
+            git -C /tmp/badges-wt rm -rf . >/dev/null 2>&1 || true
           fi
 
-          mkdir -p .github/badges
-          cp /tmp/specification-diff.svg .github/badges/
+          mkdir -p /tmp/badges-wt/.github/badges
+          cp /tmp/specification-diff.svg /tmp/badges-wt/.github/badges/
+          cd /tmp/badges-wt
           git add .github/badges/specification-diff.svg
 
           if git diff --cached --quiet; then
