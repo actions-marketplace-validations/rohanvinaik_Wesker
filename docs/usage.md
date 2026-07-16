@@ -40,14 +40,6 @@ print(result["survivor_records"])   # survivors, with category + location
 print(result["is_gateable"])        # True if every mutant was tested
 ```
 
-Per-function caching (returns instantly on repeat calls until the code changes):
-
-```python
-from Wesker.ci import profile_function_cached
-
-result = profile_function_cached(".", "src/scoring.py", "compute_score")
-```
-
 Whole file, or whole codebase:
 
 ```python

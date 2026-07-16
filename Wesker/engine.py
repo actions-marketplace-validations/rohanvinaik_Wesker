@@ -53,6 +53,16 @@ DEFAULT_TRACE_BUDGET_S = 50.0
 # pass.
 DEFAULT_TRACE_SESSION_BUDGET_S = 300.0
 
+# How long to let an ABANDONED test thread unwind, while its stdout/stderr are still redirected.
+# An abandoned frame runs its `finally`/`__exit__` blocks on the way out, so a test (or any
+# library it called) that entered its own `redirect_stdout` reinstalls what IT captured — our
+# StringIO. Landing after we restore, that replaces the process's real `sys.stdout` with a dead
+# buffer and every later write is discarded in silence. Waiting here keeps the unwind inside our
+# own redirect, so our restoration is the last writer. Deliberately short: a courtesy window on a
+# thread already declared a timeout, not a second timeout — the verdict is decided either way, and
+# a thread outliving it is no worse off than before this wait existed. See `_run_test_with_timeout`.
+_ABANDON_UNWIND_S = 0.25
+
 
 class MutationCategory(str, Enum):
     """Semantic mutation category (§6.4 dispatch table)."""
@@ -1546,11 +1556,81 @@ class SessionBaseline:
         self.truncated = truncated or set()
 
 
+class LazySessionBaseline:
+    """A :class:`SessionBaseline` that is not built until something actually reads it.
+
+    The hoist made the baseline suite-global; this makes it DEMAND-driven, and the two together
+    are what let a cache save anything. Built eagerly, the baseline is the whole cost of a run —
+    it traces the entire suite before the consumer's first line of work — and a consumer whose
+    own cache answers the question then never touches it. Measured on Regenesis: a warm-cache
+    `detective diagnose` still paid 191s to trace 240 tests, then served the profile from disk
+    and dropped the trace unread. The cost sat OUTSIDE the region the cache protects, so the
+    cache could not amortise the only thing worth amortising.
+
+    Deferring costs nothing: a run that needs the baseline builds it on first read and every
+    later function reuses it exactly as before, while a run answered from cache never builds it
+    at all. The eager/lazy difference is invisible to a caller — same object, same values, same
+    once-per-session guarantee.
+
+    The build closure must carry its OWN stream guard. Eagerly, the caller could wrap the build;
+    lazily it fires deep inside the consumer's call stack, where nothing is wrapping it, and the
+    baseline RUNS the target's suite — arbitrary code that can leave `sys.stdout` replaced.
+    Whatever wraps this must therefore live in the closure, not around the site that stores it.
+    """
+
+    __slots__ = ("_build", "_value", "_built")
+
+    def __init__(self, build: Callable[[], SessionBaseline]) -> None:
+        self._build = build
+        self._value: SessionBaseline | None = None
+        self._built = False
+
+    def get(self) -> SessionBaseline:
+        """The baseline, building it on first call. Memoised — the pass runs at most once."""
+        if not self._built:
+            self._value = self._build()
+            self._built = True
+        return self._value  # type: ignore[return-value]
+
+    @property
+    def built(self) -> bool:
+        """Whether the pass has actually run — for callers that must not force it."""
+        return self._built
+
+    def invalidate(self) -> None:
+        """Discard the built baseline so the next read rebuilds it from the CURRENT suite.
+
+        The baseline is a measurement OF a suite: which test covers which line, which tests fail
+        on the unmutated original. Add a test to the suite and every one of those answers is out
+        of date — the new test is simply absent from `traced`, so `_build_test_scope` finds no
+        covering tests for it and the mutation loop never runs it. It is not "a bit stale": the
+        test cannot kill anything, so a consumer that WRITES tests scores the suite it had before
+        it wrote them, and reports its own work as unspecified behaviour (measured: 18 kills on
+        disk, 2 reported).
+
+        Cheap precisely because the baseline is lazy: this drops the value, and the next reader
+        pays for a rebuild only if there IS a next reader. A run that writes tests and stops
+        never re-traces at all.
+        """
+        self._value = None
+        self._built = False
+
+
 # Set only by the live-session path; None everywhere else, so every existing caller
 # (Detective included) keeps the exact per-function behaviour it has today.
-_SESSION_BASELINE: ContextVar[SessionBaseline | None] = ContextVar(
+_SESSION_BASELINE: ContextVar[LazySessionBaseline | None] = ContextVar(
     "wesker_session_baseline", default=None
 )
+
+
+def session_baseline() -> SessionBaseline | None:
+    """The live session's baseline, built on demand, or None outside a live session.
+
+    The single read point. Both consumers go through here so neither can forget to resolve the
+    holder, and so "is there a session?" stays separable from "build it".
+    """
+    holder = _SESSION_BASELINE.get()
+    return holder.get() if holder is not None else None
 
 
 def build_session_baseline(
@@ -1705,7 +1785,10 @@ def _build_test_scope(
     ``run_function_converged``, so the two can never drift apart on soundness.
     """
     exec_lines = sorted(_executable_lines(func_node))
-    session = _SESSION_BASELINE.get()
+    # Resolving the holder is what BUILDS the baseline (see `LazySessionBaseline`). Reaching
+    # here means a real profiling pass is under way and the coverage is about to be used, which
+    # is exactly the demand the laziness waits for.
+    session = session_baseline()
     inert: set[int] = set()
     if precomputed_line_data is not None:
         # An adaptive-probe caller already ran this baseline over the same tests+function;
@@ -2761,21 +2844,37 @@ def _run_test_with_timeout(
     # prints, logging) so consumer-test side-effects never pollute the engine's
     # report. Set up in the main thread around start+join so restoration is
     # guaranteed even when the worker hangs and is abandoned as a timeout.
+    timed_out = False
     with (
         contextlib.redirect_stdout(io.StringIO()),
         contextlib.redirect_stderr(io.StringIO()),
     ):
         thread.start()
         thread.join(timeout=timeout_ms / 1000.0)
+        timed_out = thread.is_alive()
+        if timed_out:
+            # Timed out. STOP the runaway rather than abandoning it: the verdict is already
+            # decided (below), so what is left is the thread itself, and a daemon thread is only
+            # reclaimed at PROCESS exit — i.e. never, across a run. Every timeout used to leave
+            # one live thread burning a core for the rest of the session, so later mutants timed
+            # out BECAUSE earlier ones were still running and the failure compounded.
+            #
+            # The abandon and the unwind it triggers MUST happen INSIDE the redirect above, which
+            # is why they are in here rather than after it. `redirect_stdout` restores the value
+            # IT captured; the abandoned test's own frames may hold their own. A test — or any
+            # library it called — that entered `redirect_stdout` and is cut mid-block unwinds
+            # through that `__exit__` and reinstalls what IT saved, which is this StringIO. Run
+            # after the `with` exited, that write lands AFTER our restoration and therefore wins:
+            # `sys.stdout` is left a dead buffer for the rest of the PROCESS and every later
+            # print — the engine's own report included — is discarded in silence. Measured on
+            # Regenesis: one JVM-backed test overran the 5s cap and `detective diagnose` then
+            # exited 0 having printed nothing at all, which in CI is an empty artifact and a
+            # green check. Unwinding in here means any such restore is itself captured, and OUR
+            # `__exit__` is the last writer.
+            _abandon(thread)
+            thread.join(timeout=_ABANDON_UNWIND_S)
 
-    if thread.is_alive():
-        # Timed out. STOP the runaway rather than abandoning it: the verdict was already decided
-        # (below), so what is left is the thread itself, and a daemon thread is only reclaimed at
-        # PROCESS exit — i.e. never, across a run. Every timeout used to leave one live thread
-        # burning a core for the rest of the session, so later mutants timed out BECAUSE earlier
-        # ones were still running and the failure compounded. Its abandoned writes also landed on
-        # the real stdout once the redirect above exited, corrupting the engine's own report.
-        _abandon(thread)
+    if timed_out:
         return "timeout"
 
     return result_box[0]

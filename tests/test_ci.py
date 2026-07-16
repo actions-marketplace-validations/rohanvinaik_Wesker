@@ -15,14 +15,11 @@ import textwrap
 import Wesker.ci as ci
 from Wesker.ci import (
     _build_static_impact_map,
-    _code_hash,
     _discover_all_test_files,
     _discover_by_convention,
     _load_cached_state,
-    _load_function_cache,
     _name_matches_convention,
     _pct_color,
-    _save_function_cache,
     discover_tests,
     walk_functions,
 )
@@ -210,26 +207,7 @@ def test_walk_functions_qualnames():
     assert "C.method" in names
 
 
-# ── _code_hash: deterministic + sensitive ────────────────────────
-
-
-def test_code_hash_deterministic_and_sensitive():
-    h = _code_hash("def f(): return 1")
-    assert h == _code_hash("def f(): return 1")
-    assert h != _code_hash("def f(): return 2")
-    assert len(h) == 16
-
-
 # ── Caches: roundtrip, missing, corrupt ──────────────────────────
-
-
-def test_function_cache_roundtrip(tmp_path):
-    _save_function_cache(str(tmp_path), {"f:abc": {"killed": 3}})
-    assert _load_function_cache(str(tmp_path)) == {"f:abc": {"killed": 3}}
-
-
-def test_function_cache_missing_is_empty(tmp_path):
-    assert _load_function_cache(str(tmp_path)) == {}
 
 
 def test_load_cached_state_missing_is_none(tmp_path):

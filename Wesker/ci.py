@@ -12,6 +12,7 @@ Zero external dependencies beyond the test framework.
 from __future__ import annotations
 
 import ast
+import contextlib
 import hashlib
 import importlib.util
 import json
@@ -331,6 +332,14 @@ def load_test_callables(
 # cannot be passed down through profile_codebase -> profile_file -> discover_*
 # without changing every signature Detective imports. Unset by default, so every
 # existing caller — Detective included — takes the ordinary discovery path unchanged.
+# `None` is already a MEANINGFUL budget — "unbounded, the historical pass" — so it cannot double as
+# "caller said nothing". A sentinel keeps the three states distinct: unset (use the engine's
+# default), None (explicitly unbounded), a number (that budget). Without it, a consumer that simply
+# does not mention budgets would be indistinguishable from one asking for an unbounded trace, and
+# the engine's defaults — the only thing making the baseline phase finite — would silently vanish
+# for every caller of this seam.
+_UNSET: Any = object()
+
 _LIVE_SUITE: ContextVar[list[Any] | None] = ContextVar(
     "wesker_live_suite", default=None
 )
@@ -369,7 +378,9 @@ def discover_test_callables(
     # skip the empty/not-yet-created dir early, include it once tests land there.
     # A live pytest session outranks every backend: its items carry real fixtures,
     # conftest and lifecycle, which no re-collection here can reproduce. The session
-    # already collected the whole suite, so the same list serves every file.
+    # already collected the whole suite, so the same list serves every file — for as long
+    # as the suite is what it was when the session opened. A consumer that WRITES tests
+    # must say so via `refresh_live_suite`; see there for what went wrong when it could not.
     live = _LIVE_SUITE.get()
     if live is not None:
         return live
@@ -662,135 +673,6 @@ def profile_function(
 # ── Per-function result cache ──────────────────────────────────
 
 
-def _code_hash(source: str) -> str:
-    """Stable hash of source text for cache invalidation."""
-    import hashlib
-
-    return hashlib.sha256(source.encode()).hexdigest()[:16]
-
-
-def _load_function_cache(project_root: str) -> dict:
-    """Load per-function result cache from .wesker/function_cache.json.
-
-    Returns a dict keyed by ``func_key:code_hash`` → result dict.
-    Entries whose code_hash no longer matches are stale and will be
-    ignored by callers.
-    """
-    cache_path = Path(project_root) / ".wesker" / "function_cache.json"
-    if not cache_path.exists():
-        return {}
-    try:
-        return json.loads(cache_path.read_text())
-    except Exception:
-        return {}
-
-
-def _save_function_cache(project_root: str, cache: dict) -> None:
-    """Write per-function result cache."""
-    cache_dir = Path(project_root) / ".wesker"
-    cache_dir.mkdir(parents=True, exist_ok=True)
-    (cache_dir / "function_cache.json").write_text(json.dumps(cache, indent=2))
-
-
-def single_valid_copy(cache: dict, func_prefix: str, current_key: str) -> dict:
-    """The cache with every OTHER-version entry for one function removed, keeping
-    only ``current_key`` — the single-valid-copy invariant.
-
-    A cache key is ``path::qualname:code_hash``; ``func_prefix`` is ``path::qualname:``
-    and identifies the function across versions. When a function is re-profiled after
-    an edit, its previous-hash entry is stale: it can never be served again (the hash
-    won't match current code) yet it lingers forever, so the file grows without bound
-    across edits. Purging same-function/other-hash entries on write guarantees exactly
-    one valid result per function — bounded, never stale."""
-    return {
-        key: value
-        for key, value in cache.items()
-        if key == current_key or not key.startswith(func_prefix)
-    }
-
-
-def profile_function_cached(
-    project_root: str,
-    source_file: str,
-    function_name: str,
-    budget_ms: float = 10000,
-    max_per_category: int | None = None,
-    passes: int = 1,
-) -> dict | None:
-    """Profile a function with per-function caching.
-
-    Checks ``.wesker/function_cache.json`` for a valid cached result
-    (matching code hash). On hit, returns the cached result immediately.
-    On miss, profiles the function, writes the result to cache, and returns it.
-
-    This is the preferred entry point for interactive/local use where
-    the same function may be profiled repeatedly across sessions.
-    """
-    full_path = (
-        os.path.join(project_root, source_file)
-        if not os.path.isabs(source_file)
-        else source_file
-    )
-    try:
-        source = Path(full_path).read_text()
-    except OSError:
-        return None
-
-    # Extract just the function's source for hashing
-    try:
-        tree = ast.parse(source)
-    except SyntaxError:
-        return None
-
-    func_source = None
-    for qn, node in walk_functions(tree):
-        if qn == function_name or qn.split(".")[-1] == function_name:
-            lines = source.splitlines(keepends=True)
-            end = getattr(node, "end_lineno", None) or len(lines)
-            func_source = "".join(lines[node.lineno - 1 : end])
-            break
-
-    if func_source is None:
-        return None
-
-    h = _code_hash(func_source)
-    rel = os.path.relpath(full_path, project_root)
-    # Find qualname for the cache key
-    for qn, node in walk_functions(tree):
-        if qn == function_name or qn.split(".")[-1] == function_name:
-            cache_key = f"{rel}::{qn}:{h}"
-            break
-    else:
-        return None
-
-    # Check cache
-    cache = _load_function_cache(project_root)
-    if cache_key in cache:
-        return cache[cache_key]
-
-    # Cache miss — profile
-    cached_state = _load_cached_state(project_root)
-    result = profile_function(
-        project_root,
-        source_file,
-        function_name,
-        budget_ms=budget_ms,
-        max_per_category=max_per_category,
-        passes=passes,
-        cached_state=cached_state,
-    )
-
-    if result is not None:
-        # Single valid copy: drop any stale entry for an earlier version of this
-        # function before recording the current one, so the cache stays bounded
-        # (one result per function) and never accumulates unservable stale copies.
-        cache = single_valid_copy(cache, f"{rel}::{qn}:", cache_key)
-        cache[cache_key] = result
-        _save_function_cache(project_root, cache)
-
-    return result
-
-
 # ── Codebase profiling with formatted output ─────────────────────
 
 
@@ -811,12 +693,87 @@ def live_suite_active() -> bool:
     return _LIVE_SUITE.get() is not None
 
 
+def refresh_live_suite(project_root: str, path: str) -> int:
+    """Re-collect ONE test file into the live suite after writing it. Returns its test count.
+
+    The live suite is a SNAPSHOT of the collection taken when the session opened, and
+    `discover_test_callables` serves it to every later caller. That is exactly right for a
+    consumer that only READS a suite. It is silently wrong for one whose product is WRITING
+    tests: it writes a file, re-profiles, and is handed a list that predates its own work — so
+    it scores the suite it had BEFORE it did anything. Measured on a 25-mutant function: the
+    written tests were on disk, passing, and killing 18, while the run that wrote them reported
+    2 and asked the user to supply inputs for the 14 it had already killed. Both features are
+    correct alone; only their composition is not.
+
+    ONLY the named file is re-collected, and only ITS prior callables are replaced. A blanket
+    re-collect would be worse than the bug: the collect-only backend cannot bind a
+    fixture-taking test, so refreshing the whole suite would silently DROP every one of them —
+    reintroducing the false-survivor bug the live session exists to prevent. Restricting the
+    blast radius to the written file is safe because the writer's own output is plain
+    functions: whatever it generates, IT generates, and it does not generate fixtures.
+
+    Identity has to survive BOTH shapes a callable can arrive in, and a tag is the only thing
+    that does. A live item wraps its test as ``__wrapped__`` (see
+    ``pytest_runner._make_item_callable``), so its file is recoverable — but a re-collected
+    parametrized case is a closure built in ``pytest_discovery``, whose ``co_filename`` is that
+    module, not the test's. Reading the code object alone therefore fails to recognise what a
+    PREVIOUS refresh added, and each pass appends another copy of the same tests instead of
+    replacing them. Tagging what we add makes the second refresh see the first's work.
+
+    Invalidating the session baseline is not an extra: the baseline measures which test covers
+    which line, so a suite with a new test in it has no measurement for that test, and
+    `_build_test_scope` finds no covering tests to run it against. Refreshing the list without
+    the baseline changes what is DISCOVERED and nothing about what is RUN — the count stays
+    exactly as wrong. Lazy, so the rebuild costs nothing until something actually reads it.
+
+    Returns 0 and does nothing when no session is live: the non-live path re-collects on every
+    call already and has nothing to invalidate.
+    """
+    live = _LIVE_SUITE.get()
+    if live is None:
+        return 0
+    target = os.path.abspath(path)
+
+    def _origin(c: Any) -> str | None:
+        tagged = getattr(c, "__wesker_origin__", None)
+        if tagged:
+            return str(tagged)
+        real = getattr(c, "__wrapped__", c)
+        code = getattr(real, "__code__", None)
+        f = getattr(code, "co_filename", None)
+        return os.path.abspath(f) if f else None
+
+    kept = [c for c in live if _origin(c) != target]
+    fresh: list[Any] = []
+    try:
+        from Wesker.pytest_discovery import collect_pytest_callables
+
+        fresh = list(collect_pytest_callables(project_root, paths=[target]) or [])
+    except Exception:  # noqa: BLE001 — a failed refresh must not fail the caller's run
+        fresh = []
+    for c in fresh:
+        with contextlib.suppress(Exception):  # builtins/C callables reject attributes
+            c.__wesker_origin__ = target
+    _LIVE_SUITE.set(kept + fresh)
+
+    from Wesker.engine import (
+        _SESSION_BASELINE,
+    )  # local: engine imports ci at module scope
+
+    holder = _SESSION_BASELINE.get()
+    if holder is not None:
+        holder.invalidate()
+    return len(fresh)
+
+
 def run_with_live_suite(
     project_root: str,
     fn: Callable[[], Any],
     target_files: Iterable[str] | None = None,
     paths: list[str] | None = None,
     trace_progress: Callable[[int, int, float], None] | None = None,
+    trace_budget_s: float | None = _UNSET,
+    trace_session_budget_s: float | None = _UNSET,
 ) -> Any:
     """Run ``fn()`` inside a LIVE pytest session — the public seam for any consumer.
 
@@ -839,6 +796,14 @@ def run_with_live_suite(
     Omitted, only the live suite is provided and the per-function baseline stands — still
     correct, just slower.
 
+    ``trace_budget_s`` (per test) and ``trace_session_budget_s`` (the whole pass) bound the
+    baseline trace this seam runs, and default to the engine's own. They are here because the
+    baseline is traced HERE: a consumer exposing budget flags of its own had nowhere to send
+    them, so the values reached only the per-function path while the pass that actually traces
+    the suite kept the engine defaults — a documented opt-out that could not reach the thing it
+    opts out of. ``None`` is a real value meaning unbounded, so "not passed" is a distinct state
+    (see ``_UNSET``) and omitting them leaves the defaults exactly as they were.
+
     ``trace_progress(done, total, elapsed_ms)`` reports that baseline trace. It matters MOST
     here: this is the earliest thing that happens, it traces the WHOLE suite, and it runs before
     the consumer's own reporting can print anything at all — so without it a large suite spends
@@ -850,7 +815,11 @@ def run_with_live_suite(
     callers must treat it as one: falling back silently to the collect-only path is the
     exact failure this seam exists to end.
     """
-    from Wesker.engine import _SESSION_BASELINE, build_session_baseline
+    from Wesker.engine import (
+        _SESSION_BASELINE,
+        LazySessionBaseline,
+        build_session_baseline,
+    )
     from Wesker.pytest_runner import run_in_session
 
     resolved = {
@@ -858,16 +827,49 @@ def run_with_live_suite(
         for t in (target_files or ())
     }
 
+    # Only forward a budget the caller actually named, so the engine's own defaults stay the
+    # default. Passing `None` through unconditionally would read as "unbounded" and quietly
+    # remove the only bound on the baseline phase.
+    budgets: dict[str, Any] = {}
+    if trace_budget_s is not _UNSET:
+        budgets["trace_budget_s"] = trace_budget_s
+    if trace_session_budget_s is not _UNSET:
+        budgets["trace_session_budget_s"] = trace_session_budget_s
+
     def _body(callables: list[Any], _session: Any) -> Any:
         suite_token = _LIVE_SUITE.set(callables)
-        base_token = (
-            _SESSION_BASELINE.set(
-                build_session_baseline(
-                    callables, resolved, trace_progress=trace_progress
+
+        def _build() -> Any:
+            # The guard lives INSIDE the closure because the closure decides when it runs. The
+            # baseline RUNS the consumer's whole suite — arbitrary third-party code — and any of
+            # it can leave `sys.stdout` replaced: by assigning it, or by being cut mid-
+            # `redirect_stdout` so its `__exit__` reinstalls a stale buffer on the way out. The
+            # engine guards each test where it runs one; this is where such a leak stops being
+            # the engine's problem and becomes the CONSUMER's, because `fn()` is the caller's
+            # whole program and a dead `sys.stdout` means its report goes nowhere while it exits
+            # 0. Re-entering the streams as they are on entry captures whatever the pass does and
+            # hands them back intact. Wrapping the STORE below instead would guard nothing: this
+            # now fires lazily, from deep inside `fn()`, long after any such block had exited.
+            with (
+                contextlib.redirect_stdout(sys.stdout),
+                contextlib.redirect_stderr(sys.stderr),
+            ):
+                # The CURRENT live suite, not the list this closure captured. `refresh_live_suite`
+                # replaces that list when a consumer writes tests, and this may run after it —
+                # rebuilding from the captured snapshot would re-measure the suite we already
+                # know is out of date, which is the whole bug.
+                return build_session_baseline(
+                    _LIVE_SUITE.get() or callables,
+                    resolved,
+                    trace_progress=trace_progress,
+                    **budgets,
                 )
-            )
-            if resolved
-            else None
+
+        # Stored, not built. Whether the suite is traced at all is now the consumer's demand:
+        # a run whose own cache answers the question never triggers it, and a run that needs it
+        # gets it once. See `LazySessionBaseline` for why that is where the cost belongs.
+        base_token = (
+            _SESSION_BASELINE.set(LazySessionBaseline(_build)) if resolved else None
         )
         try:
             return fn()
@@ -943,9 +945,14 @@ def suite_health() -> dict | None:
     0% "specified", which is a statement about a broken environment wearing the costume of a
     statement about the code. Surfacing the count is what lets a caller refuse to publish it.
     """
-    from Wesker.engine import _SESSION_BASELINE
+    from Wesker.engine import session_baseline
 
-    baseline = _SESSION_BASELINE.get()
+    # Resolving BUILDS the baseline if nothing has yet (see `LazySessionBaseline`). Correct here
+    # rather than merely convenient: these numbers ARE the baseline, so a caller asking for them
+    # is the demand, and returning "no data" because nobody happened to profile first would make
+    # the answer depend on call order. Outside a live session it is still None — the honest
+    # "there is no suite-global baseline to report", which is a different claim from zero.
+    baseline = session_baseline()
     if baseline is None:
         return None
     return {

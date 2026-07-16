@@ -15,4 +15,11 @@ coverage.xml
 # Dev tooling caches (not part of the package)
 .serena/
 .claude/
+.prism/
 .DS_Store
+
+# Secrets. No .env exists here today — this is the GUARD, not a cleanup: an ignore rule
+# added after the accident is added too late, and the file it protects against is the one
+# nobody notices staging.
+.env
+.env.*

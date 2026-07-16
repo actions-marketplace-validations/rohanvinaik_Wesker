@@ -193,16 +193,26 @@ def telemetry(budget_bytes: int | None = None) -> str:
 
 
 def purge_caches(project_root: str) -> tuple[tuple[str, ...], int]:
-    """Delete regeneratable analysis cruft under ``project_root`` — the function
-    result cache and the mutation/mcdc reports that a prior run left in ``.wesker/``.
+    """Delete regeneratable analysis cruft under ``project_root`` — the mutation/mcdc
+    reports a prior run left in ``.wesker/``.
 
     Returns ``(removed_paths, reclaimed_bytes)``. Generated TEST files are the
     product, not cruft, and are never touched. Everything removed here is rebuilt on
     the next run from the current code, so purging can only cost recomputation, never
     correctness — which is the point: a clean restart that guarantees no stale state
-    lingers."""
+    lingers.
+
+    ONLY ``.wesker/``. This cannot purge a consumer's own caches — it does not know they
+    exist — so a consumer that keeps state of its own must purge it alongside this rather
+    than delegate and assume. Detective's `purge` had delegated here and reported "a clean
+    state" over 3.1 MB of its own untouched cache.
+
+    ``function_cache.json`` was dropped from the targets when the subsystem that wrote it
+    was removed in 0.6.0: nothing outside its own tests ever called it, and it invalidated
+    on the function's hash but NOT its tests', so editing a test served a stale verdict.
+    Detective's `verdict_cache` had already rebuilt the same idea keyed on both."""
     wesker_dir = os.path.join(project_root, ".wesker")
-    targets = ("function_cache.json", "mutation_report.json", "mcdc_report.json")
+    targets = ("mutation_report.json", "mcdc_report.json")
     removed: list[str] = []
     reclaimed = 0
     for name in targets:
