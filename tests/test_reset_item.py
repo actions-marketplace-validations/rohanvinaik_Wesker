@@ -126,7 +126,9 @@ def test_the_cache_is_invalidated_between_runs():
 
     cached = _in_temp_suite("cache", _FIXTURE_SUITE, body)
     assert cached, "no fixturedefs seen — the probe itself is wrong, not the reset"
-    assert all(c is None for c in cached), f"a fixture value survived the reset: {cached}"
+    assert all(c is None for c in cached), (
+        f"a fixture value survived the reset: {cached}"
+    )
 
 
 def test_a_raising_finalizer_does_not_escape_the_reset():
@@ -146,4 +148,6 @@ def test_a_raising_finalizer_does_not_escape_the_reset():
         return results
 
     results = _in_temp_suite("badteardown", _BAD_TEARDOWN_SUITE, body)
-    assert results[-1] != "assertion", f"stale teardown leaked into a later run: {results}"
+    assert results[-1] != "assertion", (
+        f"stale teardown leaked into a later run: {results}"
+    )
