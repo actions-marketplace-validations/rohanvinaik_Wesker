@@ -12,7 +12,8 @@ on:
   pull_request:
 
 permissions:
-  contents: read
+  # write, so this workflow can publish its own badge to the badges branch.
+  contents: write
   # Survivors are uploaded as code-scanning alerts: they land inline on the diff, in the
   # Security tab, and anywhere else that reads code scanning.
   security-events: write
@@ -40,3 +41,59 @@ jobs:
         with:
           sarif_file: .wesker/wesker.sarif
           category: wesker
+
+      # ── The diff badge ───────────────────────────────────────────
+      #
+      # The pair to spec-full.yml's whole-repo badge. Two badges, one per workflow, because
+      # they answer different questions on different clocks: this one says what the code you
+      # just wrote pins, and it moves on every pull request; the other says what the codebase
+      # pins, and it moves once a week.
+      #
+      # It is also what makes the tool watchable before it is trusted. A maintainer evaluating
+      # Wesker can open a throwaway PR and see the badge move — a live demonstration on their
+      # own code, on their own repo, before they have committed anything to a README.
+      #
+      # Same colour rule as the full badge: grey below 80. This measures something almost no
+      # suite scores well on, and a badge that scolds most projects is not one anyone installs
+      # twice.
+      - name: Diff specification badge
+        if: github.event.pull_request.head.repo.full_name == github.repository
+        uses: emibcn/badge-action@v2.0.2
+        with:
+          label: "Specification (diff)"
+          label-color: "333"
+          status: "${{ steps.spec.outputs.spec-pct }}% of ${{ steps.spec.outputs.dimensions-total }} dimensions"
+          color: ${{ steps.spec.outputs.spec-pct == '100' && '2ea043' || (steps.spec.outputs.spec-pct >= 80 && 'd29922' || '9f9f9f') }}
+          path: ".github/badges/specification-diff.svg"
+
+      # A fork's PR runs with a read-only token, so it cannot publish — hence the guard above
+      # and here. The measurement, the annotations and the SARIF still run for forks; only the
+      # badge write is skipped, because a badge is the one part that needs to outlive the run.
+      - name: Push the diff badge
+        if: github.event.pull_request.head.repo.full_name == github.repository
+        run: |
+          cp .github/badges/specification-diff.svg /tmp/
+          rm -rf .github/badges
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          if git ls-remote --exit-code --heads origin badges >/dev/null 2>&1; then
+            git fetch origin badges:badges
+            git switch badges
+          else
+            git switch --orphan badges
+            git rm -rf . >/dev/null 2>&1 || true
+          fi
+
+          mkdir -p .github/badges
+          cp /tmp/specification-diff.svg .github/badges/
+          git add .github/badges/specification-diff.svg
+
+          if git diff --cached --quiet; then
+            echo "No badge change"
+            exit 0
+          fi
+
+          git commit -m "spec (diff) ${{ steps.spec.outputs.spec-pct }}% — PR #${{ github.event.pull_request.number }}"
+          git push origin badges

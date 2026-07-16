@@ -8,9 +8,8 @@
   <a href="https://opensource.org/licenses/MIT"><img src="https://img.shields.io/badge/License-MIT-3367d6.svg" alt="License: MIT"></a>
   <a href="https://www.python.org/downloads/"><img src="https://img.shields.io/badge/python-3.10+-3367d6.svg" alt="Python 3.10+"></a>
   <br>
-  <a href="https://github.com/rohanvinaik/Wesker/actions/workflows/spec-badges.yml"><img src="https://raw.githubusercontent.com/rohanvinaik/Wesker/badges/.github/badges/sigma.svg" alt="Mean σ"></a>
-  <a href="https://github.com/rohanvinaik/Wesker/actions/workflows/spec-badges.yml"><img src="https://raw.githubusercontent.com/rohanvinaik/Wesker/badges/.github/badges/mutation-kill-rate.svg" alt="Mutation Kill Rate"></a>
-  <a href="https://github.com/rohanvinaik/Wesker/actions/workflows/spec-badges.yml"><img src="https://raw.githubusercontent.com/rohanvinaik/Wesker/badges/.github/badges/mcdc.svg" alt="MC/DC"></a>
+  <a href="https://github.com/rohanvinaik/Wesker/actions/workflows/spec-full.yml"><img src="https://raw.githubusercontent.com/rohanvinaik/Wesker/badges/.github/badges/specification.svg" alt="Specification completeness — whole codebase"></a>
+  <a href="https://github.com/rohanvinaik/Wesker/actions/workflows/spec-pr.yml"><img src="https://raw.githubusercontent.com/rohanvinaik/Wesker/badges/.github/badges/specification-diff.svg" alt="Specification completeness — latest diff"></a>
 </p>
 
 `8 semantic categories · 1.00 mutants per behavioral dimension · Fully deterministic`
@@ -139,26 +138,15 @@ Traditional tools run the entire suite against every mutant. For 300 tests, that
 
 Wesker resolves covering tests in three tiers: **convention** (`src/query.py` → `tests/test_query.py`), then **static AST impact** (scan test files for references to the mutated name), then **full fallback** only if the first two find nothing. Most functions resolve at tier 1, and each mutant runs against 3–15 tests rather than the full suite. The argument, again, is exact: a test that neither imports, references, nor transitively calls the mutated function cannot detect the mutation. Running it is pure waste.
 
-This layer is the one place the comparison can be made cleanly, because it is a single flag on
-the same engine: `scope_tests=False` **is** classical mutation testing — every test against
-every mutant — so the two arms share an implementation, a mutant set, a runner, and a machine.
-Nothing is confounded but the thing under test.
+This is the one comparison that can be made cleanly: it is a single flag on the same engine, so nothing is confounded but the thing under test. `scope_tests=False` **is** classical mutation testing — every test against every mutant — and it was Wesker's own default until these numbers were taken.
 
-| Repo | Tests | Every test × every mutant | Covering tests only | Ratio |
-|------|-------|---------------------------|---------------------|-------|
+| Repo | Tests | Every test | Covering only | |
+|------|-------|-----------|---------------|--|
 | ModelAtlas | 1,000 | 1,625 s | **348 s** | **4.7×** |
 | Detective | 306 | 966 s | **141 s** | **6.9×** |
 | Prism · `economics.py::analyze` | 421 | 33.6 s | **1.8 s** | **18.7×** |
 
-The ratio is the smaller half of the result. At the same per-file budget the classical arm did
-not merely cost more — **it did not finish**, truncating 9 functions on Detective and 7 on
-ModelAtlas, so what it reports is a sample of whatever was cheap to reach. The scoped arm
-truncated 0 and 2 respectively. A cost model that only bites when the budget runs out is not a
-performance footnote; it is the reason the resulting percentage cannot be trusted.
-
-(Single run per repo, one machine, no variance bars — an effect this size does not need them,
-but it is a measurement, not a benchmark suite. `scope_tests` was Wesker's own default until
-these numbers were taken, so the slow arm is not a straw man: it is what this tool shipped.)
+The ratio is the smaller half of it. At the same budget the classical arm *did not finish* — truncating 9 functions on Detective and 7 on ModelAtlas, so its number is a sample of whatever was cheap to reach. Scoped truncated 0 and 2.
 
 ### The combined cost model
 
@@ -236,36 +224,15 @@ So Wesker does no work that provably cannot produce a result, and spends what re
 
 ## Bounded runs, in practice
 
-By default Wesker samples: for 20 VALUE targets and `max_per_category=5`, it tests 5 per pass. Three things keep that honest.
+By default Wesker samples. Three things keep that honest.
 
-**The universe is always computable.** `estimate_universe_size()` counts every possible target by walking the AST — no generation, no execution. Output always reports both numbers, `killed/tested [tested/universe]`: a line reading `82/82 [82/173]` means 82 tested, all 82 killed, out of a 173-mutant universe. You always know how much of the space you covered.
+**The universe is always computable.** `estimate_universe_size()` counts every possible target by walking the AST — no generation, no execution. Output reports both numbers: `82/82 [82/173]` is 82 tested, all killed, out of a 173-mutant universe. You always know how much of the space you covered.
 
-**Multi-pass convergence extends coverage.** Each pass takes the next window of the greedy order — pass 0 the five highest-marginal-coverage targets, pass 1 the next five — so after $N$ passes exactly $N \times$ `max_per_category` unique mutants per category, deepening coverage rather than re-rolling a random subset. Even under the legacy random fallback (`greedy=False`), the chance of missing a real survivor after $K$ passes is bounded:
+**Multi-pass convergence extends coverage.** Each pass takes the next window of the greedy order, so N passes test N × `max_per_category` unique mutants per category — deepening coverage rather than re-rolling a random subset.
 
-$$P(\text{miss}) \;=\; \left(\frac{n - k}{n}\right)^{\!K}, \qquad n = \text{targets in category}, \quad k = \texttt{max\_per\_category}.$$
+**Category order comes from predictive priors.** Each run writes per-category survival rates to `.wesker/mutation_report.json`; the next run tests historically weak categories first, spending budget where gaps live. Priors choose *which category*; greedy coverage chooses *which mutants within it*.
 
-| Targets $n$ | $k{=}5$, 1 pass | $k{=}5$, 3 passes | $k{=}5$, 5 passes |
-|-------------|-------------|---------------|---------------|
-| 5 | 0% (exhaustive) | 0% | 0% |
-| 10 | 50% | 12.5% | 3.1% |
-| 20 | 75% | 42% | 24% |
-| 50 | 90% | 73% | 59% |
-
-For ≤5 targets per category — the common case in well-decomposed code — a single pass is already exhaustive. Greedy selection (the default) replaces this probabilistic bound with the coverage *guarantee* proved above; the table is the worst case it improves on.
-
-**Category order comes from predictive priors.** Each run writes per-category survival rates to `.wesker/mutation_report.json`; the next run tests historically weak categories first, spending budget where gaps actually live. Priors choose *which category*; greedy coverage chooses *which mutants within it*.
-
-### When to use exhaustive mode
-
-For published libraries, safety-critical code, or a badge that says *every mutant tested*:
-
-```toml
-[tool.wesker]
-max_per_category = 0       # unlimited — test every mutant
-convergence_passes = 1     # one pass suffices when unlimited
-```
-
-This is identical to traditional mutation testing — same mutants, same evaluation, same kill rate. Only the execution architecture differs (in-process vs. subprocess, covering tests vs. full suite), which changes the speed and nothing else.
+Set `max_per_category = 0` and the budget disappears: every mutant, identical to traditional mutation testing — same mutants, same evaluation, same kill rate.
 
 ---
 
@@ -286,7 +253,7 @@ For safety-critical functions that must prove every condition independently affe
 ## Installation
 
 ```bash
-pip install wesker
+uv add wesker          # or: pip install wesker
 ```
 
 From source:
@@ -294,7 +261,7 @@ From source:
 ```bash
 git clone https://github.com/rohanvinaik/Wesker.git
 cd Wesker
-pip install -e .
+uv pip install -e .    # or: pip install -e .
 ```
 
 Python 3.10+. No dependencies beyond the standard library and your test framework.
@@ -303,157 +270,30 @@ Python 3.10+. No dependencies beyond the standard library and your test framewor
 
 ## Usage
 
-### CLI
-
 ```bash
-wesker src/                          # profile a directory
-wesker src/scoring.py src/query.py   # profile specific files
-wesker src/ --threshold 90           # fail CI if kill rate < 90%
-wesker src/ --max-per-category 0 --passes 1   # exhaustive mode
-wesker src/ --json                   # JSON output for CI
-wesker --mcdc src/scoring.py::compute_score   # MC/DC verification
+wesker src/                    # profile a directory
+wesker src/ --threshold 90     # fail CI below 90%
 ```
 
-Full option reference:
-
-```
-wesker [targets...] [options]
-
-  --threshold N            Exit 1 if kill rate < N%
-  --mcdc FILE::FUNC ...    MC/DC verification on specific functions
-  --json                   JSON output (for CI parsing)
-  --budget MS              Per-file time budget (default: 10000ms)
-  --max-per-category N     Mutants per category per pass (default: 5, 0=exhaustive)
-  --passes N               Convergence passes (default: 3)
-  --exclude FILE ...       Files to skip
-  --quiet                  Minimal output
-```
-
-### As a library
-
-```python
-from Wesker.ci import profile_function
-
-result = profile_function(".", "src/scoring.py", "compute_score")
-print(result["kill_matrix"])        # which test killed which mutant
-print(result["survivor_records"])   # survivors, with category + location
-print(result["is_gateable"])        # True if every mutant was tested
-```
-
-Per-function caching (returns instantly on repeat calls until the code changes):
-
-```python
-from Wesker.ci import profile_function_cached
-
-result = profile_function_cached(".", "src/scoring.py", "compute_score")
-```
-
-Whole file, or whole codebase:
-
-```python
-from Wesker.ci import profile_file, profile_codebase
-
-for r in profile_file(".", "src/scoring.py", passes=3):
-    print(f"{r['function_key']}: {r['total_killed']}/{r['total_mutants']}")
-
-result = profile_codebase(".", ["src/scoring.py", "src/query.py"])
-print(result["kill_pct"], result["per_category"])
-```
-
-### Configuration
-
-```toml
-# pyproject.toml
-[tool.wesker]
-source_dir = "src/mypackage"
-exclude = ["src/mypackage/server.py"]
-max_per_category = 5          # mutants per category per pass (default: 5)
-convergence_passes = 3        # convergence passes (default: 3)
-mcdc_targets = [["src/mypackage/scoring.py", "compute_score"]]
-```
-
-Layout is auto-detected from `[tool.coverage.run]`, `[tool.hatch.build]`, or an `src/*/` convention when `[tool.wesker]` is absent.
-
-### GitHub Action
-
-Two workflows. The first runs on every pull request and is scoped to the diff, so it costs
-seconds. The second measures the whole codebase on a schedule and writes the badge. On a public
-repo GitHub's standard runners are free, so both cost nothing but wall-clock nobody is waiting on.
-
-**On pull requests** — survivors land as code-scanning alerts, inline on the diff:
+As a GitHub Action — one step, and survivors land on the diff as code-scanning alerts:
 
 ```yaml
-name: Specification
-on: pull_request
-permissions:
-  contents: read
-  security-events: write        # required to upload SARIF
-jobs:
-  spec:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0        # the diff scope needs the merge base
-      - uses: rohanvinaik/Wesker@v0.5.0
-        with:
-          base-ref: ${{ github.event.pull_request.base.sha }}
-          sarif: .wesker/wesker.sarif
-      - uses: github/codeql-action/upload-sarif@v3
-        if: always() && hashFiles('.wesker/wesker.sarif') != ''
-        with:
-          sarif_file: .wesker/wesker.sarif
-          category: wesker
+- uses: actions/checkout@v4
+  with: {fetch-depth: 0}
+- uses: rohanvinaik/Wesker@v0.5.0
+  with:
+    base-ref: ${{ github.event.pull_request.base.sha }}
+    sarif: .wesker/wesker.sarif
+- uses: github/codeql-action/upload-sarif@v3
+  with: {sarif_file: .wesker/wesker.sarif, category: wesker}
 ```
 
-**On a schedule** — the whole codebase, for the badge:
+It requires pytest and a suite that passes on unmutated code, and it would rather fail loudly
+than publish a number it cannot stand behind — a non-pytest runner, a suite broken before any
+mutant exists, or a budget-truncated run each fail with the diagnosis and the fix.
 
-```yaml
-name: Specification (full)
-on:
-  schedule: [{cron: "0 6 * * 1"}]
-  workflow_dispatch:
-jobs:
-  spec:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: rohanvinaik/Wesker@v0.5.0
-        id: spec
-        with:
-          budget: "30000"
-      - run: echo "${{ steps.spec.outputs.spec-pct }}% of ${{ steps.spec.outputs.dimensions-total }} dimensions"
-```
-
-See [`.github/workflows/`](.github/workflows/) for the versions this repo runs on itself,
-including badge generation.
-
-| Input | Default | |
-|-------|---------|--|
-| `base-ref` | — | scope to files changed since this ref; omit for the whole codebase |
-| `targets` | auto | explicit files; otherwise discovered from `[tool.wesker]` or layout |
-| `budget` | `15000` | per-file budget, ms |
-| `threshold` | — | fail if `spec-pct` is below this |
-| `sarif` | `.wesker/wesker.sarif` | where to write the SARIF report |
-| `allow-truncation` | `false` | report a budget-limited sample rather than failing |
-
-Outputs: `spec-pct`, `dimensions-total`, `dimensions-pinned`, `dimensions-unspecified`,
-`kill-pct`, `total-mutants`, `survivors`, `execution-mode`, `report`, `sarif`.
-
-**Requires pytest, and a suite that passes on unmutated code.** The action would rather fail
-loudly than publish a number it cannot stand behind: it refuses to report if the run falls back
-to the non-pytest runner, if most of the suite fails before any mutant is introduced (a broken
-environment reports `0%` and looks identical to unspecified code), or if the budget truncated
-the run (a sample is not a completeness measurement). Each refusal prints the one-line diagnosis
-and the fix.
-
-#### Badge
-
-The scheduled workflow writes SVGs to a `badges` branch, so the README stays untouched:
-
-```markdown
-![Specification](https://raw.githubusercontent.com/OWNER/REPO/badges/.github/badges/specification.svg)
-```
+**[Full usage → `docs/usage.md`](docs/usage.md)** — CLI reference, library API, configuration,
+action inputs and outputs, badges, and the scheduled whole-repo workflow.
 
 ---
 

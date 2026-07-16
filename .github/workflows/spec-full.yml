@@ -47,12 +47,12 @@ jobs:
           sarif_file: .wesker/wesker.sarif
           category: wesker
 
-      # ── Badges ───────────────────────────────────────────────────
+      # ── The badge ────────────────────────────────────────────────
       #
-      # Two, and only two. The first is the reading: what fraction of this codebase's behavior
-      # its tests pin. The second is the proof that the reading was cheap to get — mutants per
-      # dimension, which the greedy bound makes exactly 1.00. Everything else the run knows
-      # lives in the step summary, where it reads as conviction rather than advertising.
+      # ONE badge here: the whole-repo reading. Its pair is written by spec-pr.yml, which
+      # measures the diff — two badges, one per workflow, because they answer different
+      # questions on different clocks. Everything else this run knows lives in the step
+      # summary, where it reads as conviction rather than advertising.
       #
       # There is no "unverified" badge, and that is deliberate: a run that cannot produce a
       # trustworthy number FAILS above, so no badge is written and the maintainer gets a red
@@ -75,15 +75,6 @@ jobs:
           status: "${{ steps.spec.outputs.spec-pct }}% of ${{ steps.spec.outputs.dimensions-total }} dimensions"
           color: ${{ steps.spec.outputs.spec-pct == '100' && '2ea043' || (steps.spec.outputs.spec-pct >= 80 && 'd29922' || '9f9f9f') }}
           path: ".github/badges/specification.svg"
-
-      - name: Selection optimality badge
-        uses: emibcn/badge-action@v2.0.2
-        with:
-          label: "Mutants per dimension"
-          label-color: "333"
-          status: "${{ steps.spec.outputs.total-mutants }}/${{ steps.spec.outputs.dimensions-total }} · provably minimal"
-          color: "8b5cf6"
-          path: ".github/badges/optimality.svg"
 
       - name: Push badges to the badges branch
         if: github.ref == 'refs/heads/main'
