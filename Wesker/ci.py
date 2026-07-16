@@ -817,6 +817,8 @@ def run_with_live_suite(
     """
     from Wesker.engine import (
         _SESSION_BASELINE,
+        DEFAULT_TRACE_BUDGET_S,
+        DEFAULT_TRACE_SESSION_BUDGET_S,
         LazySessionBaseline,
         build_session_baseline,
     )
@@ -835,6 +837,16 @@ def run_with_live_suite(
         budgets["trace_budget_s"] = trace_budget_s
     if trace_session_budget_s is not _UNSET:
         budgets["trace_session_budget_s"] = trace_session_budget_s
+
+    # The budgets the baseline will ACTUALLY be built under: what the caller named, else the
+    # engine's own defaults — resolved HERE because `budgets` deliberately records only what was
+    # named, and "not named" is not a value a consumer can key a verdict on. Published on the
+    # holder (below) so a cache can ask what produced a verdict without forcing the trace that
+    # would produce it. `_UNSET` never escapes this function.
+    effective: tuple[float | None, float | None] = (
+        budgets.get("trace_budget_s", DEFAULT_TRACE_BUDGET_S),
+        budgets.get("trace_session_budget_s", DEFAULT_TRACE_SESSION_BUDGET_S),
+    )
 
     def _body(callables: list[Any], _session: Any) -> Any:
         suite_token = _LIVE_SUITE.set(callables)
@@ -869,7 +881,9 @@ def run_with_live_suite(
         # a run whose own cache answers the question never triggers it, and a run that needs it
         # gets it once. See `LazySessionBaseline` for why that is where the cost belongs.
         base_token = (
-            _SESSION_BASELINE.set(LazySessionBaseline(_build)) if resolved else None
+            _SESSION_BASELINE.set(LazySessionBaseline(_build, budgets=effective))
+            if resolved
+            else None
         )
         try:
             return fn()

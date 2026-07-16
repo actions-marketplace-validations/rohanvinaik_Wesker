@@ -45,13 +45,39 @@ DEFAULT_TRACE_BUDGET_S = 50.0
 
 # The default budget for the WHOLE traced baseline pass. Independent of the per-test cap above,
 # because they bound different things and neither implies the other: a per-test cap × N tests is
-# still N× unbounded, and on a 2000-test suite the 50s cap alone permits a day of tracing. Five
-# minutes is not arbitrary — it is this project's own stated intolerable case ("the whole-file
-# audit that ran 5 min with zero output", `_stream_progress`); a baseline that outruns it is not a
-# slow measurement but a dead-looking tool, and the tests it did not reach are reported by name so
-# a partial baseline is never mistaken for a complete one. Pass None for the historical unbounded
-# pass.
-DEFAULT_TRACE_SESSION_BUDGET_S = 300.0
+# still N× unbounded, and on a 2000-test suite the 50s cap alone permits a day of tracing. The
+# tests it did not reach are reported by name, so a partial baseline is never mistaken for a
+# complete one. Pass None for the historical unbounded pass.
+#
+# WAS 300s, on the reasoning that five minutes is "this project's own stated intolerable case (the
+# whole-file audit that ran 5 min with zero output)". That premise has since been retired by the
+# thing that fixed it: `trace_progress` now reports this pass from its first test (see
+# `ci.run_with_live_suite`), so outrunning five minutes is a VISIBLE slow measurement, not a
+# dead-looking tool. The budget was sized to a silence that no longer exists.
+#
+# What the old number cost, measured on Regenesis (240 scoped tests, 3.06s/test, 734.8s to trace
+# in full): the 300s cap cut 152 tests, whose line coverage is then under-counted, so no test could
+# be credited with the kills it actually makes — `greedy_coverage` reported 0 of 45 behaviours
+# pinned where the truth is 22. Not a slower answer: a confidently wrong one, in the direction that
+# invites `converge` to write tests for behaviour the suite already pins. Undersizing this is
+# silent and wrong; oversizing it is loud and slow. Prefer loud.
+#
+# 1800s is read off that measurement (~2.4x), not picked: the order of magnitude a genuine suite
+# needs, while still bounding the pathological case this exists for. The per-test cap above is
+# deliberately NOT raised with it — on the same measurement, (50,300) and (∞,300) cut an identical
+# 152 tests, so the per-test bound was never the binding constraint and there is no evidence to
+# change it. Raise a default the evidence indicts; leave the rest alone.
+#
+# NOTE THE UNITS, because they decide how to read that 734.8s: these budgets are WALL-CLOCK
+# (`time.monotonic`, see `line_coverage.trace_suite`) while the work is CPU-bound and single-core.
+# So the wall-clock cost of the SAME suite rises with whatever else is running, and truncation is a
+# property of the machine at that moment, not of the suite. That cuts one way for sizing: 734.8s
+# was measured on a CONTENDED box (test suites running alongside it), which makes it the
+# conservative sample and the right one to size against — a number taken on an idle machine would
+# under-size the budget for precisely the loaded runs that need the headroom. It also means no
+# budget can be "correct": a busy enough box cuts at any finite value. The bound is here to stop a
+# pathological hang, not to certify a measurement; when the answer must be exact, pass 0.
+DEFAULT_TRACE_SESSION_BUDGET_S = 1800.0
 
 # How long to let an ABANDONED test thread unwind, while its stdout/stderr are still redirected.
 # An abandoned frame runs its `finally`/`__exit__` blocks on the way out, so a test (or any
@@ -1578,12 +1604,17 @@ class LazySessionBaseline:
     Whatever wraps this must therefore live in the closure, not around the site that stores it.
     """
 
-    __slots__ = ("_build", "_value", "_built")
+    __slots__ = ("_build", "_value", "_built", "_budgets")
 
-    def __init__(self, build: Callable[[], SessionBaseline]) -> None:
+    def __init__(
+        self,
+        build: Callable[[], SessionBaseline],
+        budgets: tuple[float | None, float | None] | None = None,
+    ) -> None:
         self._build = build
         self._value: SessionBaseline | None = None
         self._built = False
+        self._budgets = budgets
 
     def get(self) -> SessionBaseline:
         """The baseline, building it on first call. Memoised — the pass runs at most once."""
@@ -1596,6 +1627,18 @@ class LazySessionBaseline:
     def built(self) -> bool:
         """Whether the pass has actually run — for callers that must not force it."""
         return self._built
+
+    @property
+    def budgets(self) -> tuple[float | None, float | None] | None:
+        """The ``(per_test, session)`` trace budgets this baseline is built with, or None.
+
+        Readable WITHOUT forcing the build: the budgets are fixed when the closure is stored, not
+        when it runs, so a consumer can ask what a verdict WOULD be measured under before deciding
+        whether it needs the measurement at all. That ordering is the whole point — the one caller
+        that needs this reads it to build a cache key, and a key that forced the trace it is trying
+        to avoid would defeat the laziness above.
+        """
+        return self._budgets
 
     def invalidate(self) -> None:
         """Discard the built baseline so the next read rebuilds it from the CURRENT suite.
@@ -1631,6 +1674,21 @@ def session_baseline() -> SessionBaseline | None:
     """
     holder = _SESSION_BASELINE.get()
     return holder.get() if holder is not None else None
+
+
+def session_budgets() -> tuple[float | None, float | None] | None:
+    """The ``(per_test, session)`` trace budgets the live session's baseline is built under, or
+    None outside a live session. Does NOT force the build.
+
+    The read point for "what actually produced this verdict". Inside a live session the baseline —
+    and therefore ``truncated`` and every absent ``line_coverage`` — comes from THESE budgets;
+    the per-function ``trace_budget_s`` arguments are not consulted at all (see
+    ``_build_test_scope``'s precedence). A consumer that caches a verdict must key it on these,
+    or it keys on numbers that had no bearing on the answer and serves one budget's measurement
+    to another's question.
+    """
+    holder = _SESSION_BASELINE.get()
+    return holder.budgets if holder is not None else None
 
 
 def build_session_baseline(
