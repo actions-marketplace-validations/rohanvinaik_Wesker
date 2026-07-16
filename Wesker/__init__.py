@@ -6,10 +6,13 @@ filtering, 3-layer test discovery, equivalent mutant detection, and MC/DC
 verification.
 """
 
-# Keep in lockstep with pyproject's `version` — this is restated, so it drifts silently:
-# it read 0.1.0 for the whole of the 0.3.0 release, and would have shipped 0.4.0 still
-# claiming 0.1.0. Bump both, or neither.
-__version__ = "0.6.2"
+# THE one owner of this number. `pyproject.toml` declares `dynamic = ["version"]` and
+# `[tool.hatch.version] path = "Wesker/__init__.py"`, so the build reads it from HERE — bump this
+# and nothing else. (This comment used to say "keep in lockstep with pyproject's version — this is
+# restated... bump both, or neither", which was true until the number moved here and stopped being
+# restated. Following it now would put a second copy back in pyproject and recreate precisely the
+# drift going dynamic removed: 0.6.0 shipped to PyPI announcing itself as 0.5.1.)
+__version__ = "0.7.0"
 
 from .engine import (
     BoundaryInput,
