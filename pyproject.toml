@@ -4,7 +4,11 @@ build-backend = "hatchling.build"
 
 [project]
 name = "Wesker"
-version = "0.6.0"
+# ONE owner: `Wesker/__init__.py`. Not a style choice — 0.6.0 shipped to PyPI with
+# `Wesker.__version__ == '0.5.1'`, because the number lived here AND there and only this copy
+# got bumped. A version that disagrees with itself is the same one-fact-two-homes drift this
+# release removes from the cache layer.
+dynamic = ["version"]
 description = "In-process AST mutation testing for Python. Zero dependencies."
 readme = "README.md"
 license = "MIT"
@@ -45,6 +49,9 @@ dev = ["pytest>=7", "pytest-cov>=4", "ruff==0.14.10"]
 # Wesker profiles its own library core. CLI/entry/orchestration modules
 # (cli, __main__, __init__, metrics) are excluded — they are thin dispatch,
 # matching the coverage exclusions below.
+[tool.hatch.version]
+path = "Wesker/__init__.py"
+
 [tool.wesker]
 source_dir = "Wesker"
 exclude = [
