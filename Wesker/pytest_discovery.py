@@ -154,7 +154,12 @@ def collect_pytest_callables(
     importlib.invalidate_caches()
 
     plugin = _Collect()
-    args = ["--collect-only", "-q", "-p", "no:cacheprovider"]
+    # `--capture=sys` for the same reason as `pytest_runner.run_in_session`: pytest's default
+    # fd-capture replaces descriptor 1, which for a STDIO consumer is the protocol channel, not a
+    # terminal — collection output lands in the JSON-RPC frame and the client drops the
+    # connection. Collection is quieter than a run, but "quieter" is not "silent", and a single
+    # stray byte breaks a frame just as completely.
+    args = ["--collect-only", "-q", "-p", "no:cacheprovider", "--capture=sys"]
     args += paths or ["."]
     cwd = os.getcwd()
     try:

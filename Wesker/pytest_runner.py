@@ -260,7 +260,20 @@ def run_in_session(
                 box["exc"] = exc
             return True  # the loop is ours; pytest must not also run the suite
 
-    args = ["-q", "-p", "no:cacheprovider", "--no-header"]
+    # `--capture=sys`, NOT pytest's default `fd`, and this is load-bearing for any consumer whose
+    # stdout is a PROTOCOL rather than a terminal. fd-capture dups and replaces file descriptor 1
+    # for the duration of the run; a STDIO server's JSON-RPC channel IS descriptor 1, so pytest's
+    # own progress output ("." per test, the summary line) is written straight into the response
+    # frame. The client then reads `.{"jsonrpc":...` , fails to parse it, and closes the
+    # connection — the server vanishes mid-session with no traceback, because nothing crashed.
+    #
+    # `contextlib.redirect_stdout` cannot prevent this and the `quiet` block below is not enough:
+    # it rebinds `sys.stdout`, a Python-level name, while the damage happens one layer down at the
+    # descriptor. Reproduced directly: identical server, identical call — with fd capture the
+    # session dies on `McpError: Connection closed`; with `--capture=sys` it returns rc=0.
+    # `sys` capture gives the same isolation of the TESTS' output (Wesker's whole reason for
+    # wanting capture) without touching the descriptor the caller may be speaking on.
+    args = ["-q", "-p", "no:cacheprovider", "--no-header", "--capture=sys"]
     args += paths or ["."]
     cwd = os.getcwd()
     prev_path = list(sys.path)
