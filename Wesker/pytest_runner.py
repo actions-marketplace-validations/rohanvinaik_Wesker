@@ -194,11 +194,34 @@ def session_callables(session: Any, capture: _ExcCapture) -> list[Callable[[], N
     return [_make_item_callable(it, capture) for it in session.items]
 
 
+class _CollectionErrorCapture:
+    """Pytest plugin that stashes every failing collection report.
+
+    A ``None`` return from ``run_in_session`` used to conflate three distinct
+    failure modes ("pytest missing", "collection failed", "empty collection")
+    behind a single generic warning at the caller. Consumers had no way to tell
+    them apart, so an ImportPathMismatchError in a mutmut/mutants shadow tree
+    surfaced as "pytest missing" — sending the user to reinstall pytest for a
+    problem that was two lines of pyproject.toml. This plugin is what makes the
+    distinction observable: the reports it captures are handed back through the
+    ``diagnostic`` out-param so callers can name the actual reason.
+    """
+
+    def __init__(self) -> None:
+        self.errors: list[tuple[str, str]] = []
+
+    def pytest_collectreport(self, report: Any) -> None:  # noqa: ANN401
+        if report.failed:
+            longrepr = str(report.longrepr) if report.longrepr else "(no detail)"
+            self.errors.append((report.nodeid or "(root)", longrepr[:800]))
+
+
 def run_in_session(
     project_root: str,
     body: Callable[[list[Callable[[], None]], Any], Any],
     paths: list[str] | None = None,
     quiet: bool = True,
+    diagnostic: dict[str, Any] | None = None,
 ) -> Any:
     """Run ``body(callables, session)`` inside a LIVE pytest session.
 
@@ -224,14 +247,30 @@ def run_in_session(
     collected — so a caller can fall back to the legacy path exactly as before. The
     fallback must be LOUD at the call site: silently degrading to a different, weaker
     test set is what let a fixture-driven repo report a fabricated 100%.
+
+    ``diagnostic``: when a mutable dict is passed, the None-return path populates it
+    with a machine-readable reason so the caller can distinguish the three failure
+    modes. Keys written:
+
+      * ``reason`` — one of ``"pytest_missing"``, ``"collection_errors"``,
+        ``"empty_collection"``, ``"pytest_crashed"``.
+      * ``errors`` — list of ``(nodeid, longrepr)`` for every failing collection
+        report; only present when ``reason == "collection_errors"``.
+
+    Backward-compat: default is ``None`` — omitted, the seam behaves exactly as before.
+    Old callers unaffected; new callers surface the specific reason instead of the
+    misleading "pytest missing or collection failed" catch-all.
     """
     try:
         import pytest
     except ImportError:
+        if diagnostic is not None:
+            diagnostic["reason"] = "pytest_missing"
         return None
 
     box: dict[str, Any] = {}
     capture = _ExcCapture()
+    collect_errors = _CollectionErrorCapture()
     # Bound BEFORE any redirect is entered, so `body` can be handed the caller's own
     # streams rather than the suppression sink.
     real_stdout, real_stderr = sys.stdout, sys.stderr
@@ -286,10 +325,12 @@ def run_in_session(
                 contextlib.redirect_stdout(io.StringIO()),
                 contextlib.redirect_stderr(io.StringIO()),
             ):
-                pytest.main(args, plugins=[_Driver(), capture])
+                pytest.main(args, plugins=[_Driver(), capture, collect_errors])
         else:
-            pytest.main(args, plugins=[_Driver(), capture])
+            pytest.main(args, plugins=[_Driver(), capture, collect_errors])
     except Exception:
+        if diagnostic is not None:
+            diagnostic["reason"] = "pytest_crashed"
         return None
     finally:
         sys.path[:] = prev_path
@@ -299,6 +340,12 @@ def run_in_session(
     if "exc" in box:
         raise box["exc"]  # the body's failure is the caller's, not a missing session
     if not box.get("ran"):
+        if diagnostic is not None:
+            if collect_errors.errors:
+                diagnostic["reason"] = "collection_errors"
+                diagnostic["errors"] = collect_errors.errors
+            else:
+                diagnostic["reason"] = "empty_collection"
         return None
     return box.get("result")
 

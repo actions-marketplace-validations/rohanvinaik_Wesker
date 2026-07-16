@@ -774,6 +774,7 @@ def run_with_live_suite(
     trace_progress: Callable[[int, int, float], None] | None = None,
     trace_budget_s: float | None = _UNSET,
     trace_session_budget_s: float | None = _UNSET,
+    diagnostic: dict[str, Any] | None = None,
 ) -> Any:
     """Run ``fn()`` inside a LIVE pytest session — the public seam for any consumer.
 
@@ -892,7 +893,7 @@ def run_with_live_suite(
                 _SESSION_BASELINE.reset(base_token)
             _LIVE_SUITE.reset(suite_token)
 
-    return run_in_session(project_root, _body, paths=paths)
+    return run_in_session(project_root, _body, paths=paths, diagnostic=diagnostic)
 
 
 def profile_codebase_live(
