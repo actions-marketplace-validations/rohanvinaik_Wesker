@@ -1589,6 +1589,46 @@ class SessionBaseline:
         self.n_tests = n_tests
         self.truncated = truncated or set()
 
+    def replaced(
+        self,
+        affected: set[str],
+        removed_ids: set[int],
+        partial: "SessionBaseline",
+        n_tests: int,
+    ) -> "SessionBaseline":
+        """This baseline with every test named in ``affected`` re-measured from ``partial``.
+
+        Writing ONE test file invalidated the whole baseline, so the next read re-traced the
+        entire suite to learn what one file changed — and a consumer that writes tests in a loop
+        (converge) paid that per pass. Measured on Detective's own 312-test suite: 4 full traces,
+        8.6s, 60% of wall clock, to write 3 tests. Nothing about the other 311 tests changed, and
+        re-measuring a constant is the same refusal-of-provably-irrelevant-work the engine already
+        applies to mutants and `trace_suite` applies to the per-function trace.
+
+        ``affected`` is keyed by test NAME because ``traced`` is, and that keying is why this
+        takes a name set rather than a file: ``trace_suite`` UNIONS duplicate ``__name__``s
+        across files, so a name the written file merely SHARES with another module cannot be
+        dropped — its other owner's coverage would vanish with it, and a test whose coverage is
+        absent is one `_build_test_scope` never runs, which reports a mutant it kills as a
+        surviving behavioral gap. The caller therefore re-traces every CURRENT owner of an
+        affected name and hands the result here; this method only splices.
+
+        ``removed_ids`` are the ``id()``s of callables that left the suite. They must be dropped
+        explicitly: ``inert`` is keyed by object identity, and an id whose object has been freed
+        can be reused by a later allocation — a stale entry would bar an unrelated test from kill
+        attribution. Every id kept here belongs to a callable the live suite still references, so
+        none can dangle.
+        """
+        traced = {k: v for k, v in self.traced.items() if k not in affected}
+        traced.update(partial.traced)
+        return SessionBaseline(
+            traced,
+            [n for n in self.failing if n not in affected] + partial.failing,
+            {i for i in self.inert if i not in removed_ids} | partial.inert,
+            n_tests,
+            {n for n in self.truncated if n not in affected} | partial.truncated,
+        )
+
 
 class LazySessionBaseline:
     """A :class:`SessionBaseline` that is not built until something actually reads it.
@@ -1616,9 +1656,12 @@ class LazySessionBaseline:
 
     def __init__(
         self,
-        build: Callable[[], SessionBaseline],
+        build: Callable[..., SessionBaseline],
         budgets: tuple[float | None, float | None] | None = None,
     ) -> None:
+        # Takes an optional subset of callables: the same closure builds the whole baseline
+        # (subset=None) and the partial one `refresh` splices in, so both are measured under
+        # identical target files and budgets by construction rather than by discipline.
         self._build = build
         self._value: SessionBaseline | None = None
         self._built = False
@@ -1665,6 +1708,42 @@ class LazySessionBaseline:
         """
         self._value = None
         self._built = False
+
+    def refresh(
+        self,
+        affected: set[str],
+        removed_ids: set[int],
+        retrace: list[Callable[..., None]],
+        n_tests: int,
+    ) -> bool:
+        """Re-measure only the tests ``affected`` names, keeping the rest. True if spliced.
+
+        `invalidate` is correct but total: it answers "one file changed" by re-measuring every
+        file. The other tests' coverage is a CONSTANT across a write that did not touch them —
+        so the next read paid the whole suite to rediscover what it already knew. Measured on
+        Detective's own suite: converge did 4 full 312-test traces (8.6s, 60% of wall clock) to
+        write 3 tests; only the written file's tests were ever new.
+
+        Nothing is built if nothing was built: the lazy build already reads the CURRENT live
+        suite, so a not-yet-forced baseline is not stale, and forcing a trace here to service a
+        write is precisely the eager cost `LazySessionBaseline` exists to defer.
+
+        DEGRADES TO `invalidate`, never to a wrong answer. A partial build runs the consumer's
+        own test code, so it can fail in ways this module cannot enumerate; a half-spliced
+        baseline would under-report coverage, and an under-covered test is one the mutation loop
+        never runs — a false survivor, the exact lie the live session exists to prevent. So any
+        failure drops the whole value and the next reader re-traces, which is what today does
+        unconditionally: the fast path can only ever be skipped, never be wrong.
+        """
+        if not self._built or self._value is None:
+            return False
+        try:
+            partial = self._build(retrace)
+            self._value = self._value.replaced(affected, removed_ids, partial, n_tests)
+        except Exception:  # noqa: BLE001 — see DEGRADES above; correctness over speed
+            self.invalidate()
+            return False
+        return True
 
 
 # Set only by the live-session path; None everywhere else, so every existing caller

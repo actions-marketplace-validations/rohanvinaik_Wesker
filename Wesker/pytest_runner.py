@@ -322,8 +322,19 @@ def run_in_session(
                 and not session.config.option.continue_on_collection_errors
             ):
                 return None  # let pytest handle collection errors normally
-            box["ran"] = True
             calls = session_callables(session, capture)
+            if not calls:
+                # A session that bound NOTHING is not a cheap session, it is no measurement at
+                # all — and running `body` against it produces the most dangerous output this
+                # tool has: a confident "0 pinned", indistinguishable from a real finding, for
+                # a function whose suite may pin it completely. Refusing here is what lets the
+                # caller retry (see `run_with_live_suite`): `body` has not run, so nothing has
+                # been measured, printed, or written, and a second collection is free of side
+                # effects. This guard matters MORE now that `--continue-on-collection-errors` is
+                # set above — that flag deliberately lets a half-broken collection through, and
+                # without this an ALL-broken one would sail through with it.
+                return None
+            box["ran"] = True
             try:
                 if quiet:
                     with (
@@ -352,7 +363,27 @@ def run_in_session(
     # session dies on `McpError: Connection closed`; with `--capture=sys` it returns rc=0.
     # `sys` capture gives the same isolation of the TESTS' output (Wesker's whole reason for
     # wanting capture) without touching the descriptor the caller may be speaking on.
-    args = ["-q", "-p", "no:cacheprovider", "--no-header", "--capture=sys"]
+    # `--continue-on-collection-errors`, because a suite is not all-or-nothing and this seam
+    # was treating it as if it were. Without it, ONE unimportable test file anywhere in the
+    # collection sets `session.testsfailed`, `_Driver.pytest_runtestloop` above bails, and the
+    # consumer is handed ZERO callables — so it degrades to the collect-only backend, drops every
+    # fixture-taking test, and reports a fully-specified function as entirely unspecified. That
+    # is the exact failure this session exists to prevent, re-entered through the front door.
+    # Measured on TailChasingFixer (a repo with 11 stale test imports out of 61 files, which is
+    # an ordinary amount of drift): 0 tests bound, and `CachedFileInfo.is_valid_for` — covered by
+    # three passing tests — reported `0 pinned of 21`. With the flag: 94 of the reachable tests
+    # bind, including all three. The driver has ALWAYS read this option; nothing ever set it.
+    #
+    # Coverage, not perfection: the broken file's own tests are lost either way, and losing them
+    # is not a reason to also lose the other 94. A collection error is a fact about ONE file.
+    args = [
+        "-q",
+        "-p",
+        "no:cacheprovider",
+        "--no-header",
+        "--capture=sys",
+        "--continue-on-collection-errors",
+    ]
     args += paths or ["."]
     cwd = os.getcwd()
     prev_path = list(sys.path)
@@ -379,13 +410,26 @@ def run_in_session(
 
     if "exc" in box:
         raise box["exc"]  # the body's failure is the caller's, not a missing session
+    if diagnostic is not None and collect_errors.errors:
+        # Handed back even when the session RAN, and that is the point. `--continue-on-collection
+        # -errors` is what lets it run, and on its own it converts a LOUD total failure into a
+        # SILENT partial one: measured, 41 of 44 files bound while the 3 holding the target's
+        # tests did not, and the verdict was a confident `0 pinned` with nothing said. A file the
+        # session never collected contributes no tests, so every mutant those tests would have
+        # killed reads as a surviving behavioral gap — the exact lie the live session exists to
+        # prevent, arriving through the door that keeps the session alive.
+        #
+        # Reported, not judged. Most collection errors are in files that could never touch the
+        # target and are pure noise; whether one MATTERS depends on the consumer's own scoping,
+        # which this layer does not have. So the facts go back and the caller decides. That split
+        # is why this sets `errors` unconditionally but leaves `reason` to the failure path: an
+        # error is data, a reason is a verdict about the session.
+        diagnostic["errors"] = collect_errors.errors
     if not box.get("ran"):
         if diagnostic is not None:
-            if collect_errors.errors:
-                diagnostic["reason"] = "collection_errors"
-                diagnostic["errors"] = collect_errors.errors
-            else:
-                diagnostic["reason"] = "empty_collection"
+            diagnostic["reason"] = (
+                "collection_errors" if collect_errors.errors else "empty_collection"
+            )
         return None
     return box.get("result")
 

@@ -720,11 +720,23 @@ def refresh_live_suite(project_root: str, path: str) -> int:
     PREVIOUS refresh added, and each pass appends another copy of the same tests instead of
     replacing them. Tagging what we add makes the second refresh see the first's work.
 
-    Invalidating the session baseline is not an extra: the baseline measures which test covers
+    Re-measuring the session baseline is not an extra: the baseline measures which test covers
     which line, so a suite with a new test in it has no measurement for that test, and
     `_build_test_scope` finds no covering tests to run it against. Refreshing the list without
     the baseline changes what is DISCOVERED and nothing about what is RUN — the count stays
-    exactly as wrong. Lazy, so the rebuild costs nothing until something actually reads it.
+    exactly as wrong.
+
+    It is a SPLICE, not an invalidation, and the difference is the cost of the consumer that
+    needs this at all. Invalidating answered "one file changed" by re-measuring every file, so
+    a consumer that writes tests in a loop paid the whole suite per pass — `O(passes x suite)`
+    for a per-file edit. Measured on Detective's own 312-test suite: converge re-traced
+    1,253 tests across 4 full passes (8.4s, 60% of wall clock) to write 3; the splice re-traces
+    317 (2.2s, 27%) for the same verdict and the same generated file, byte for byte. The other
+    tests' coverage is a CONSTANT across a write that did not touch them, and re-measuring a
+    constant is the work `trace_suite` already refuses per function.
+
+    The unit of replacement is a test NAME, not a file — see `SessionBaseline.replaced`, which
+    is where that reasoning and the id()-reuse hazard live.
 
     Returns 0 and does nothing when no session is live: the non-live path re-collects on every
     call already and has nothing to invalidate.
@@ -733,6 +745,13 @@ def refresh_live_suite(project_root: str, path: str) -> int:
     if live is None:
         return 0
     target = os.path.abspath(path)
+
+    def _name(c: Any) -> str:
+        # The key `SessionBaseline.traced` / `.failing` / `.truncated` use — `trace_suite` reads
+        # the same attribute with the same fallback, so a splice keyed here lines up with what
+        # the full build wrote. Not `_origin`: a parametrized case's code object names its
+        # DEFINING module, which is why the file cannot be recovered from the name.
+        return getattr(c, "__name__", "unknown")
 
     def _origin(c: Any) -> str | None:
         tagged = getattr(c, "__wesker_origin__", None)
@@ -743,6 +762,10 @@ def refresh_live_suite(project_root: str, path: str) -> int:
         f = getattr(code, "co_filename", None)
         return os.path.abspath(f) if f else None
 
+    # `gone` is held, not just counted: it carries the ids `SessionBaseline.inert` is keyed by,
+    # and holding the objects until the splice is done is what stops a freed id being reused by
+    # a later allocation and barring an unrelated test from kill attribution.
+    gone = [c for c in live if _origin(c) == target]
     kept = [c for c in live if _origin(c) != target]
     fresh: list[Any] = []
     try:
@@ -762,7 +785,20 @@ def refresh_live_suite(project_root: str, path: str) -> int:
 
     holder = _SESSION_BASELINE.get()
     if holder is not None:
-        holder.invalidate()
+        # Re-measure ONLY what this write changed. `traced` is keyed by test ``__name__`` and
+        # UNIONS duplicates across files, so the unit of replacement is a NAME, not a file: a
+        # name this file merely shares with another module cannot be dropped on its own, or the
+        # other owner's coverage goes with it and every mutant it kills reads as a survivor. So
+        # re-trace every CURRENT owner of an affected name — this file's new tests, plus any
+        # same-named test elsewhere whose entry the drop takes with it. Normally that is exactly
+        # `fresh` (a writer's output is uniquely named), and the pass is milliseconds.
+        affected = {_name(c) for c in gone} | {_name(c) for c in fresh}
+        holder.refresh(
+            affected,
+            {id(c) for c in gone},
+            [c for c in kept if _name(c) in affected] + fresh,
+            len(kept) + len(fresh),
+        )
     return len(fresh)
 
 
@@ -852,7 +888,7 @@ def run_with_live_suite(
     def _body(callables: list[Any], _session: Any) -> Any:
         suite_token = _LIVE_SUITE.set(callables)
 
-        def _build() -> Any:
+        def _build(subset: list[Any] | None = None) -> Any:
             # The guard lives INSIDE the closure because the closure decides when it runs. The
             # baseline RUNS the consumer's whole suite — arbitrary third-party code — and any of
             # it can leave `sys.stdout` replaced: by assigning it, or by being cut mid-
@@ -871,10 +907,17 @@ def run_with_live_suite(
                 # replaces that list when a consumer writes tests, and this may run after it —
                 # rebuilding from the captured snapshot would re-measure the suite we already
                 # know is out of date, which is the whole bug.
+                #
+                # `subset` is the partial re-measure `LazySessionBaseline.refresh` splices in
+                # after a write. It goes through THIS closure, not a second one, so a partial is
+                # measured under the same target files and the same budgets as the whole — the
+                # one property that makes the two safe to merge. It reports no progress: the
+                # phase is a handful of tests, and a "baseline traced · 3 tests" line under a
+                # label that meant 312 describes the splice as if it were the suite.
                 return build_session_baseline(
-                    _LIVE_SUITE.get() or callables,
+                    subset if subset is not None else (_LIVE_SUITE.get() or callables),
                     resolved,
-                    trace_progress=trace_progress,
+                    trace_progress=trace_progress if subset is None else None,
                     **budgets,
                 )
 
@@ -893,7 +936,26 @@ def run_with_live_suite(
                 _SESSION_BASELINE.reset(base_token)
             _LIVE_SUITE.reset(suite_token)
 
-    return run_in_session(project_root, _body, paths=paths, diagnostic=diagnostic)
+    result = run_in_session(project_root, _body, paths=paths, diagnostic=diagnostic)
+    if result is None and paths:
+        # The SCOPED collection bound nothing. That is a statement about the scope, not about
+        # the suite — and the expensive pass is right there. `paths` is an optimisation: it
+        # narrows collection to the files that could execute the target. When it narrows to a
+        # set that will not collect (one stale import among them is enough — pytest's collection
+        # is per-invocation, not per-file), the honest move is to pay for the whole suite rather
+        # than report a suite that does not exist. Measured on TailChasingFixer: the 6 scoped
+        # files could not collect, while the full 61 collect 815 tests.
+        #
+        # SAFE TO RETRY, and only because of the guard in `_Driver.pytest_runtestloop`: `body`
+        # is the consumer's whole program — it writes test files — so a retry that could
+        # double-run it would be far worse than a wrong number. `run_in_session` returns None
+        # ONLY when body never ran, so the first attempt has no side effects to repeat. Never
+        # retry on an exception: that means body DID run and raised.
+        #
+        # Coverage, not perfection: slow and correct beats fast and false. A user who wants the
+        # cheap answer already got it when the scope collected.
+        result = run_in_session(project_root, _body, paths=None, diagnostic=diagnostic)
+    return result
 
 
 def profile_codebase_live(
