@@ -222,6 +222,7 @@ def trace_suite(
     truncated: set[str] | None = None,
     progress: Callable[[int, int, float], None] | None = None,
     session_budget_s: float | None = None,
+    cache: dict[str, dict[str, list[int]]] | None = None,
 ) -> dict[str, dict[str, set[int]]]:
     """Trace the WHOLE suite ONCE: ``{test_name: {file: lines}}``.
 
@@ -258,7 +259,25 @@ def trace_suite(
     that matters (2000 tests × a 50s cap is a day). Once it is spent the remaining tests are left
     untraced and are named in ``truncated`` with everything else — they are under-counted for the
     same reason and must not read as covered.
+
+    ``cache`` is ``{fingerprint: {file: lines}}`` (see :mod:`Wesker.trace_cache`) and carries the
+    reduction above ACROSS invocations, which is where the O(suite) above actually lives. Hoisting
+    made the trace once-per-SESSION; a CLI takes one target per session, so the hoist never paid —
+    every command re-measured the same function-independent constant from zero. Measured on
+    Regenesis: an 11-minute baseline for one function, and 11 minutes again for the next function
+    in the same file. On LintGate's 14,000 tests it is hours, per target.
+
+    Keyed per TEST, not per suite: a consumer whose product is writing tests (converge) adds one
+    file, and only that file's entries may miss. One digest over the whole suite would void 14,000
+    entries because one arrived — the total-invalidation defect `LazySessionBaseline.refresh`
+    exists to avoid, reintroduced a layer down.
+
+    Passed dict is MUTATED with the misses, so the caller persists the union without a second
+    walk. A CUT trace is never stored: it is under-counted by construction, and a cache that
+    remembers a truncation makes a timing accident permanent.
     """
+    from Wesker.trace_cache import test_fingerprint
+
     out: dict[str, dict[str, set[int]]] = {}
     if not target_files:
         return out
@@ -279,15 +298,28 @@ def trace_suite(
                     getattr(t, "__name__", "unknown") for t in test_functions[i:]
                 )
             break
-        # The redirect isolates the TEST's own stdout/stderr and must wrap the test ONLY —
-        # not the loop. Wrapped around the loop it also swallows `progress`, which reports on
-        # stderr: the callback fires, writes into the StringIO, and the phase stays silent
-        # exactly as if nothing were reporting at all.
-        with (
-            contextlib.redirect_stdout(io.StringIO()),
-            contextlib.redirect_stderr(io.StringIO()),
-        ):
-            per_file, was_cut = _trace_one_multi(test_fn, target_files, budget_s)
+        fp = test_fingerprint(test_fn) if cache is not None else None
+        hit = cache.get(fp) if (cache is not None and fp is not None) else None
+        if hit is not None:
+            # Measured before, by this engine, on these target files, under these budgets. The
+            # trace is function-independent, so re-running it cannot produce a different answer —
+            # only the same one, slower.
+            per_file, was_cut = {f: set(v) for f, v in hit.items()}, False
+        else:
+            # The redirect isolates the TEST's own stdout/stderr and must wrap the test ONLY —
+            # not the loop. Wrapped around the loop it also swallows `progress`, which reports on
+            # stderr: the callback fires, writes into the StringIO, and the phase stays silent
+            # exactly as if nothing were reporting at all.
+            with (
+                contextlib.redirect_stdout(io.StringIO()),
+                contextlib.redirect_stderr(io.StringIO()),
+            ):
+                per_file, was_cut = _trace_one_multi(test_fn, target_files, budget_s)
+            if cache is not None and fp is not None and not was_cut:
+                # NOT when cut: a truncated trace is under-counted, and downstream that is
+                # indistinguishable from "no test reaches this line". Storing it would make one
+                # slow afternoon a permanent false gap.
+                cache[fp] = {f: sorted(v) for f, v in per_file.items()}
         if was_cut and truncated is not None:
             truncated.add(name)
         bucket = out.setdefault(name, {})

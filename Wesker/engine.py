@@ -1785,8 +1785,14 @@ def build_session_baseline(
     trace_budget_s: float | None = DEFAULT_TRACE_BUDGET_S,
     trace_progress: Callable[[int, int, float], None] | None = None,
     trace_session_budget_s: float | None = DEFAULT_TRACE_SESSION_BUDGET_S,
+    project_root: str | None = None,
 ) -> SessionBaseline:
     """Run the suite-global baseline passes ONCE. See :class:`SessionBaseline`.
+
+    ``project_root`` turns on the PERSISTENT cache (`Wesker.trace_cache`) and is the difference
+    between once-per-session and once-per-suite-state. Both passes here measure constants, and a
+    ContextVar forgets them at process exit, so a CLI — one target per invocation — re-measured
+    the whole suite for every function. `None` keeps the pre-cache behaviour exactly.
 
     ``inert`` is computed by running each test AS-IS (no patch): with the original code
     in place that is precisely "does this test fail regardless of any mutation?", which
@@ -1799,6 +1805,19 @@ def build_session_baseline(
     one heavy test stalls the whole session before a single mutant runs — the failure mode is a
     silent hang, not a slow answer. ``None`` = unbounded = the historical behavior.
     """
+    from Wesker import trace_cache  # local: trace_cache imports nothing from engine
+
+    # Both passes below measure a CONSTANT: the trace is function-independent (see `trace_suite`),
+    # and so is "does this test pass on the unmutated original". They were re-run per invocation
+    # because the result lived in a ContextVar. Persisted, the first target in a repo pays and
+    # every later one does not. Off (project_root=None) it behaves exactly as before.
+    budgets = (trace_budget_s, trace_session_budget_s)
+    targets_fp = trace_cache.targets_fingerprint(target_files) if project_root else ""
+    cache = (
+        trace_cache.load(project_root, targets_fp, budgets) if project_root else None
+    )
+    before = len(cache) if cache is not None else 0
+
     truncated: set[str] = set()
     traced = _trace_suite(
         test_functions,
@@ -1807,18 +1826,44 @@ def build_session_baseline(
         truncated,
         trace_progress,
         trace_session_budget_s,
+        cache,
     )
     failing: list[str] = []
     inert: set[int] = set()
-    for test_fn in test_functions:
-        outcome = _run_test_with_timeout(test_fn, None, True, timeout_ms)
-        if outcome is not None:
-            inert.add(id(test_fn))
-            if outcome == "assertion":
-                # An assertion that fails on correct code is a WRONG EXPECTATION — the
-                # narrower thing failing_on_baseline reports to a human. Other outcomes
-                # are ambiguous and are barred from attribution without accusation.
-                failing.append(getattr(test_fn, "__name__", "unknown"))
+    # `inert` is keyed by id() — a fact about THIS heap — so it can never be read from disk.
+    # The NAMES are what persist; the ids are rebuilt here against the live callables. Same
+    # information, addressed by something that survives a process boundary.
+    cached_failing, cached_inert = (
+        trace_cache.load_outcomes(project_root)
+        if (project_root and cache)
+        else ([], [])
+    )
+    reuse_outcomes = bool(cache) and before > 0 and len(cache) == before
+    if reuse_outcomes:
+        inert_names = set(cached_inert)
+        failing = list(cached_failing)
+        inert = {
+            id(t) for t in test_functions if getattr(t, "__name__", "") in inert_names
+        }
+    else:
+        inert_names_out: list[str] = []
+        for test_fn in test_functions:
+            outcome = _run_test_with_timeout(test_fn, None, True, timeout_ms)
+            if outcome is not None:
+                inert.add(id(test_fn))
+                inert_names_out.append(getattr(test_fn, "__name__", "unknown"))
+                if outcome == "assertion":
+                    # An assertion that fails on correct code is a WRONG EXPECTATION — the
+                    # narrower thing failing_on_baseline reports to a human. Other outcomes
+                    # are ambiguous and are barred from attribution without accusation.
+                    failing.append(getattr(test_fn, "__name__", "unknown"))
+        cached_inert = inert_names_out
+    if project_root and cache is not None and not truncated:
+        # Never persist a truncated pass: what a budget cut is absent, not zero, and a cache
+        # that remembers the cut serves a false gap forever.
+        trace_cache.save(
+            project_root, targets_fp, budgets, cache, failing, list(cached_inert)
+        )
     return SessionBaseline(traced, failing, inert, len(test_functions), truncated)
 
 

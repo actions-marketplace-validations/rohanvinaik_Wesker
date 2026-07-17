@@ -918,6 +918,9 @@ def run_with_live_suite(
                     subset if subset is not None else (_LIVE_SUITE.get() or callables),
                     resolved,
                     trace_progress=trace_progress if subset is None else None,
+                    # The persistent cache lives under the CONSUMER's `.wesker/`, so the root has
+                    # to reach it — this closure is the only place that has both.
+                    project_root=project_root,
                     **budgets,
                 )
 
