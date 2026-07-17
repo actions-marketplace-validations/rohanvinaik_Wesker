@@ -45,6 +45,15 @@ def main(argv: list[str] | None = None) -> int:
         prog="wesker",
         description="Wesker — in-process AST mutation testing for Python",
     )
+    # There was no `--version` at all: `wesker --version` printed an argparse usage error, so
+    # the only way to ask an INSTALLED engine what it was was to import it. That matters more
+    # here than for a normal CLI — this engine decides the verdict (a kill classified `crash`
+    # rather than `exception` changes what counts as specified at all), and its consumers key
+    # their verdict caches on this number. A tool whose answer depends on its version has to
+    # be able to say what it is. Sourced from `Wesker.__version__`, the one owner.
+    from . import __version__
+
+    parser.add_argument("--version", action="version", version=f"wesker {__version__}")
     parser.add_argument(
         "targets", nargs="*", default=["."], help="Files or directories to profile"
     )

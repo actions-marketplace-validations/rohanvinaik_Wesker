@@ -138,7 +138,7 @@ class MutantResult:
 
     mutant: Mutant
     killed: bool = False
-    killed_by: str | None = None  # "assertion" | "crash" | "timeout"
+    killed_by: str | None = None  # "assertion" | "exception" | "crash" | "timeout"
     test_name: str | None = None  # first killing test (first-killer mode)
     elapsed_ms: float = 0.0
     equivalent: bool = False
@@ -156,6 +156,7 @@ class CategoryResult:
     killed: int = 0
     survived: int = 0
     killed_by_assertion: int = 0
+    killed_by_exception: int = 0
     killed_by_crash: int = 0
     timed_out: int = 0
     equivalent: int = 0
@@ -166,9 +167,16 @@ class CategoryResult:
 
     @property
     def value_killed(self) -> int:
-        """Mutants whose VALUE behavior is pinned. Only an assertion kill qualifies —
-        a crash/timeout kill proves the code RUNS, not WHAT it returns."""
-        return self.killed_by_assertion
+        """Mutants whose VALUE behavior is pinned. An assertion kill qualifies, and so does
+        an EXCEPTION kill: a test that says ``pytest.raises(ValueError)`` has stated what the
+        function does on that input as precisely as ``== 3`` states it elsewhere. Raising IS
+        the return behaviour of an error path.
+
+        Only crash/timeout are excluded, and for the original reason: they prove the code RAN,
+        not WHAT it did. Counting a declared failure among them read a pin as a gap — and since
+        an error path can be pinned ONLY this way, it made every input-validating function
+        permanently unspecifiable rather than merely unspecified."""
+        return self.killed_by_assertion + self.killed_by_exception
 
     @property
     def value_survived(self) -> int:
@@ -330,7 +338,7 @@ class ProfilingResult:
                 "elapsed_ms": r.get("elapsed_ms", 0.0),
             }
             for r in self.killed_records
-            if r.get("killed_by") != "assertion"
+            if r.get("killed_by") not in ("assertion", "exception")
         ]
         return list(self.survivor_records) + crash_survivors
 
@@ -2775,12 +2783,16 @@ def evaluate_mutant(
                         reasons.append(result)
                         if first_reason is None:
                             first_reason = result
-                    elif result == "assertion":
-                        # Strongest verdict: the value is pinned — stop here.
+                    elif result in ("assertion", "exception"):
+                        # Strongest verdict: the value is pinned — stop here. An exception
+                        # kill is the same strength as an assertion: both are a test stating
+                        # what the function does and the mutant contradicting it. Scanning on
+                        # for a "better" kill would find none, and treating it as provisional
+                        # would let a later crash-kill overwrite a real pin.
                         return MutantResult(
                             mutant=mutant,
                             killed=True,
-                            killed_by="assertion",
+                            killed_by=result,
                             test_name=tname,
                             elapsed_ms=_elapsed(start),
                         )
@@ -2795,7 +2807,13 @@ def evaluate_mutant(
             return MutantResult(
                 mutant=mutant,
                 killed=True,
-                killed_by=("assertion" if "assertion" in reasons else first_reason),
+                killed_by=(
+                    "assertion"
+                    if "assertion" in reasons
+                    else "exception"
+                    if "exception" in reasons
+                    else first_reason
+                ),
                 test_name=killers[0],
                 killed_by_tests=killers,
                 elapsed_ms=_elapsed(start),
@@ -2859,6 +2877,44 @@ def _outcome_on_original(
                 pass
 
 
+def _is_declared_failure(exc: BaseException) -> bool:
+    """True for pytest's ``Failed`` — the outcome pytest raises when a test DECLARES a
+    failure rather than blowing up: a violated ``pytest.raises(...)`` contract ("DID NOT
+    RAISE"), or an explicit ``pytest.fail()``.
+
+    It matters because ``Failed`` derives from ``BaseException``, NOT ``AssertionError``
+    (MRO: Failed -> OutcomeException -> BaseException). So ``except AssertionError`` cannot
+    see it and it lands in the BaseException fallback beside genuine crashes — a category
+    error. A crash means the mutant blew up and no test said anything about its VALUE; a
+    declared failure means a test stated a contract and the mutant broke it. The second
+    pins behaviour; the first does not.
+
+    Identified by its BASE, because ``Failed.__module__`` is the string ``"builtins"`` —
+    pytest rewrites it so tracebacks read ``Failed`` rather than ``_pytest.outcomes.Failed``.
+    Trusting that attribute silently matches nothing, which is worse than not checking:
+    every raises-kill keeps its crash verdict and the classifier looks like it simply does
+    not work. ``OutcomeException.__module__`` is NOT rewritten, so the base is the honest
+    signal, and requiring it keeps an unrelated user class named ``Failed`` out.
+
+    Deliberately narrow. ``Skipped`` shares the ``OutcomeException`` base and would match a
+    base-only check, but a skip is not a failure and must not read as a kill — hence the
+    exact name. ``Exit`` derives from ``Exception`` and never reaches here at all.
+
+    Detected STRUCTURALLY, never by importing pytest: this engine is zero-dependency and
+    pytest is an optional extra (``Wesker[pytest]``), so importing ``_pytest.outcomes`` here
+    would make the engine unimportable for consumers who never opted in, in order to
+    classify an exception they cannot raise. With pytest absent, no ``Failed`` exists and
+    this correctly returns False for everything.
+    """
+    cls = type(exc)
+    if cls.__name__ != "Failed":
+        return False
+    return any(
+        base.__name__ == "OutcomeException" and base.__module__.startswith("_pytest")
+        for base in cls.__mro__
+    )
+
+
 def _run_test_with_timeout(
     test_fn: Callable[..., None],
     mutated_func: Any,
@@ -2867,7 +2923,7 @@ def _run_test_with_timeout(
 ) -> str | None:
     """Run a single test function with a hard thread-based timeout.
 
-    Returns the kill reason ("assertion", "crash", "timeout") if killed,
+    Returns the kill reason ("assertion", "exception", "crash", "timeout") if killed,
     or None if the test passed (mutant survived this test).
 
     The timeout bounds the WAIT and, via `interrupt.abandon`, the thread itself — see there for what
@@ -2894,8 +2950,14 @@ def _run_test_with_timeout(
             result_box[0] = "crash"
         except (KeyboardInterrupt, SystemExit):
             raise
-        except BaseException:  # pragma: no cover — pytest.outcomes.Failed etc.
-            result_box[0] = "crash"
+        except BaseException as exc:
+            # A test DECLARING failure is not a crash — see `_is_declared_failure`. Reading
+            # it as one discards a real pin: `value_survivor_records` re-lists every
+            # non-value kill, so a mutant killed by a `pytest.raises` contract came back as
+            # an unpinned survivor, was re-classified killable off the same witness, and the
+            # residual asked for an input that would write the same test and be discarded
+            # again. That is not a slow path to a verdict; it is a loop with no exit.
+            result_box[0] = "exception" if _is_declared_failure(exc) else "crash"
 
     thread = threading.Thread(target=_target, daemon=True)
     # Isolate the discovered test's own stdout/stderr (argparse usage banners,
@@ -3066,6 +3128,10 @@ def run_function_sampling(
             cr.killed += 1
             if result.killed_by == "assertion":
                 cr.killed_by_assertion += 1
+            elif result.killed_by == "exception":
+                # Its own counter, never folded into assertion: `value_killed` needs it to
+                # count, and a reader needs to still see WHICH contract pinned the mutant.
+                cr.killed_by_exception += 1
             elif result.killed_by == "crash":
                 cr.killed_by_crash += 1
         else:
@@ -3248,6 +3314,10 @@ def run_function_profiling(
             cr.killed += 1
             if result.killed_by == "assertion":
                 cr.killed_by_assertion += 1
+            elif result.killed_by == "exception":
+                # Its own counter, never folded into assertion: `value_killed` needs it to
+                # count, and a reader needs to still see WHICH contract pinned the mutant.
+                cr.killed_by_exception += 1
             elif result.killed_by == "crash":
                 cr.killed_by_crash += 1
             elif result.killed_by == "timeout":
@@ -3726,6 +3796,10 @@ def run_function_converged(
             cr.killed += 1
             if result.killed_by == "assertion":
                 cr.killed_by_assertion += 1
+            elif result.killed_by == "exception":
+                # Its own counter, never folded into assertion: `value_killed` needs it to
+                # count, and a reader needs to still see WHICH contract pinned the mutant.
+                cr.killed_by_exception += 1
             elif result.killed_by == "crash":
                 cr.killed_by_crash += 1
             elif result.killed_by == "timeout":
