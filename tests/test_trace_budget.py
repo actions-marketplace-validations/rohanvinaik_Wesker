@@ -39,6 +39,8 @@ from Wesker.line_coverage import (  # noqa: E402
     trace_line_coverage,
     trace_suite,
 )
+
+from Wesker.ci import callable_test_id
 from _trace_budget_target import spin  # noqa: E402
 
 _FILE = spin.__code__.co_filename
@@ -72,14 +74,14 @@ def _slow_elsewhere() -> None:
 
 def test_unbudgeted_is_the_historical_unbounded_pass():
     """None (the default) must not change what the tracer does — only what it is ALLOWED to cost."""
-    covered, truncated = _trace_one(_fast, _FILE, _LINES)
+    covered, truncated, *_ = _trace_one(_fast, _FILE, _LINES)
     assert truncated is False
     assert covered == _LINES  # the whole function body was reached
 
 
 def test_budget_cuts_a_heavy_test_and_keeps_its_partial_coverage():
     """The cut is not a failure — the lines reached before it are real and are kept."""
-    covered, truncated = _trace_one(_slow, _FILE, _LINES, budget_s=0.25)
+    covered, truncated, *_ = _trace_one(_slow, _FILE, _LINES, budget_s=0.25)
     assert truncated is True
     assert covered  # partial coverage is real coverage
     assert covered <= _LINES
@@ -91,7 +93,7 @@ def test_budget_binds_work_outside_the_target_file():
     sailed through untouched (measured 4.2s under a 1.0s budget). Bounding by wall-clock in
     another thread does not care which module is running."""
     t0 = time.monotonic()
-    _covered, truncated = _trace_one(_slow_elsewhere, _FILE, _LINES, budget_s=0.5)
+    _covered, truncated, *_ = _trace_one(_slow_elsewhere, _FILE, _LINES, budget_s=0.5)
     elapsed = time.monotonic() - t0
     assert truncated is True
     assert elapsed < 3.0, (
@@ -101,8 +103,8 @@ def test_budget_binds_work_outside_the_target_file():
 
 def test_budget_does_not_touch_a_test_that_fits_in_it():
     """The common case pays nothing: a fast test's coverage is identical budgeted or not."""
-    unbudgeted, _ = _trace_one(_fast, _FILE, _LINES)
-    budgeted, truncated = _trace_one(_fast, _FILE, _LINES, budget_s=5.0)
+    unbudgeted, *_ = _trace_one(_fast, _FILE, _LINES)
+    budgeted, truncated, *_ = _trace_one(_fast, _FILE, _LINES, budget_s=5.0)
     assert budgeted == unbudgeted and truncated is False
 
 
@@ -119,13 +121,18 @@ def test_a_cut_test_is_stopped_not_leaked():
 
 
 def test_trace_line_coverage_names_every_test_the_budget_cut():
-    """No silent caps: the caller learns WHICH tests are under-counted, by name."""
+    """No silent caps: the caller learns WHICH tests are under-counted, by test id.
+
+    Asserted through `callable_test_id` rather than a literal: the cut set and the coverage
+    map must speak ONE vocabulary (issue #16), and hardcoding either spelling would let them
+    drift apart while the test still passed."""
     cut: set[str] = set()
     cov = trace_line_coverage(
         [_fast, _slow], spin, _LINES, budget_s=0.25, truncated=cut
     )
-    assert cut == {"_slow"}
-    assert cov["_fast"] and cov["_slow"]  # both still contribute coverage
+    assert cut == {callable_test_id(_slow)}
+    # both still contribute coverage
+    assert cov[callable_test_id(_fast)] and cov[callable_test_id(_slow)]
 
 
 def test_trace_line_coverage_reports_nothing_cut_when_unbudgeted():
@@ -139,17 +146,18 @@ def test_trace_suite_budgets_each_test_and_reports_the_cuts():
     and reused by every function, so one heavy test stalls the whole session before any mutant."""
     cut: set[str] = set()
     traced = trace_suite([_fast, _slow], {_FILE}, budget_s=0.25, truncated=cut)
-    assert cut == {"_slow"}
-    assert set(traced) == {"_fast", "_slow"}
-    assert traced["_fast"][_FILE]  # the fast test's lines survive intact
+    assert cut == {callable_test_id(_slow)}
+    assert set(traced) == {callable_test_id(_fast), callable_test_id(_slow)}
+    # the fast test's lines survive intact
+    assert traced[callable_test_id(_fast)][_FILE]
 
 
 def test_trace_one_multi_reports_its_own_cut_rather_than_the_caller_timing_it():
     """The trace reports the cut it made; the caller never infers it from a clock (which would
     false-positive on a test that merely happens to take about the budget)."""
-    per_file, truncated = _trace_one_multi(_slow, {_FILE}, budget_s=0.25)
+    per_file, truncated, *_ = _trace_one_multi(_slow, {_FILE}, budget_s=0.25)
     assert truncated is True and per_file[_FILE]
-    per_file2, truncated2 = _trace_one_multi(_fast, {_FILE})
+    per_file2, truncated2, *_ = _trace_one_multi(_fast, {_FILE})
     assert truncated2 is False and per_file2[_FILE]
 
 
@@ -190,8 +198,14 @@ def test_session_budget_names_the_tests_it_never_reached():
     traced = trace_suite(
         tests, {_FILE}, budget_s=50.0, truncated=cut, session_budget_s=0.01
     )
-    assert cut == {"heavy_1", "heavy_2"}  # the entire untraced tail, by name
-    assert set(traced) == {"heavy_0"}  # and only the one that ran is reported as traced
+    ids = [callable_test_id(t) for t in tests]
+    # These three are closures minted by ONE factory, so they share `__qualname__` and differ
+    # only in `__name__`. That is precisely the shape that collapsed onto a single id while
+    # #16 was being written — a 2-test cut reporting as 1 — so the distinctness is asserted
+    # here rather than assumed by the two set comparisons below.
+    assert len(set(ids)) == 3, f"factory closures must not share an id: {ids}"
+    assert set(cut) == {ids[1], ids[2]}  # the entire untraced tail, by id
+    assert set(traced) == {ids[0]}  # and only the one that ran is reported as traced
 
 
 # --- progress: the half that makes the phase legible rather than merely finite ------------------
@@ -224,3 +238,20 @@ def test_progress_is_not_swallowed_by_the_consumer_output_redirect():
     finally:
         sys.stderr = real
     assert written.getvalue().strip() == "1/2 2/2"
+
+
+def test_trace_suite_marks_a_cache_hit_as_replayed():
+    """#20: a cold trace is FRESH (a miss, measured now); a warm read of the same cache is REPLAYED —
+    routing-usable but proof-inadmissible. The provenance is what keeps cache reuse from becoming
+    fresh admissible coverage."""
+    from Wesker.trace_cache import test_fingerprint
+
+    cache: dict = {}
+    name = callable_test_id(_fast)
+    cold: set[str] = set()
+    trace_suite([_fast], {_FILE}, cache=cache, replayed=cold)
+    assert cold == set(), "a cold trace is freshly measured — nothing is replayed"
+    assert test_fingerprint(_fast) in cache, "the fresh trace warmed the cache"
+    warm: set[str] = set()
+    trace_suite([_fast], {_FILE}, cache=cache, replayed=warm)
+    assert warm == {name}, "the second read is served from cache -> replayed"

@@ -9,29 +9,54 @@ namespace. Respects per-function time budgets.
 from __future__ import annotations
 
 import ast
+import contextlib
 import copy
 import difflib
+import functools
 import hashlib
+import itertools
 import math
+import threading
 import time
 import types
 from dataclasses import dataclass, field
 from contextvars import ContextVar
 from enum import Enum
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, TypeGuard
 
 from .interrupt import abandon as _abandon
+from .line_coverage import admissible_coverage as _admissible_coverage
+from .line_coverage import arcs_from_trace as _arcs_from_trace
 from .line_coverage import coverage_from_trace as _coverage_from_trace
 from .line_coverage import executable_lines as _executable_lines
 from .line_coverage import failing_on_baseline as _failing_on_baseline
 from .line_coverage import trace_line_coverage as _trace_line_coverage
 from .line_coverage import trace_suite as _trace_suite
+from .isolation import (
+    IsolatedMutantWorker,
+    IsolatedRun,
+    baseline_determinism,
+    callable_shape_hazards,
+    entry_disposition,
+    execution_mode_standing,
+    fast_mode_standing,
+    mutant_verdict,
+    run_baseline_traced_isolated,
+    scope_fast_mode_standing,
+    should_recycle,
+)
+from .subsumption import distinct_obligations as _distinct_obligations
+from .subsumption import redundancy_groups
+from .tce import WARRANT_BYTECODE, nodes_equivalent
+from .trace_evidence import TraceEvidence, build_trace_ledger
+from .memory_guard import memory_enforcement_standing
 from .memory_guard import over_budget as _over_budget
 from .memory_guard import reclaim as _reclaim
+from .memory_guard import run_baseline_bytes as _mem_baseline
 from .memory_guard import resolve_budget as _resolve_budget
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import Callable, Iterator
 
 
 # The default per-test TRACE budget, in seconds. A backstop, NOT a target: it is generous enough
@@ -105,6 +130,21 @@ class MutationCategory(str, Enum):
     # three orthogonal sub-modes (see _ExceptionMutator) counted against their own
     # target sets, the same shape STATE uses.
     EXCEPTION = "EXCEPTION"
+    # Reference identity: does this expression use the CORRECT available value
+    # (issue #10)? Two sub-modes (return_sub / name_sub, see _DataflowMutator) —
+    # the wrong-reference fault class that preserves every operator and
+    # control-flow shape, and the signature fault family of extraction
+    # refactors (wrong helper input, wrong live-out).
+    DATAFLOW = "DATAFLOW"
+    # Output-space perturbation — μ⁻, negative specification (σ(P, μ ∪ μ⁻)). Perturbs the
+    # RETURN VALUE and re-runs the covering tests: all-green means that output dimension is
+    # unpinned (a NEGATIVE degree of freedom), the polarity of a surviving mutant. Form A
+    # (return-site rewrite, _OutputMutator) carries three ALWAYS-APPLICABLE sub-modes — the
+    # independence pair (→const, →identity) plus →none — that cannot mis-apply on any value;
+    # the type-conditional family (→negate/→empty/→NaN/…) and its UNDEFINED disposition are
+    # Fork 2 / Form B. NOT in the DEFAULT one-sign policy: enabled only under the two-sign
+    # policy, see policy.mutation_policy(two_sign=True) and filter_categories(two_sign=True).
+    OUTPUT = "OUTPUT"
 
 
 @dataclass
@@ -130,6 +170,15 @@ class Mutant:
     # report DOF coverage exactly (distinct dimensions reached / this function's DOF)
     # instead of inferring it from the selection. "" when unrecorded (greedy=False).
     dimension: str = ""
+    # μ⁻ Form B (the non-return codomain): a RUNTIME wrapper of the original —
+    # ``original -> perturbed callable`` — instead of a compiled AST mutant. When set,
+    # ``evaluate_mutant`` builds the mutant object by CALLING this on the original rather than
+    # compiling ``mutated_node`` (which is a per-mode synthetic marker here, carried only so the
+    # content-addressed id stays distinct). Excluded from eq/repr: engine-internal state, never part
+    # of the mutant's identity or its serialized shape.
+    wrapper_factory: Callable[..., Any] | None = field(
+        default=None, compare=False, repr=False
+    )
 
 
 @dataclass
@@ -142,9 +191,110 @@ class MutantResult:
     test_name: str | None = None  # first killing test (first-killer mode)
     elapsed_ms: float = 0.0
     equivalent: bool = False
-    killed_by_tests: list[str] = field(
-        default_factory=list
-    )  # all killers (full-matrix mode)
+    killed_by_tests: list[str] = field(default_factory=list)
+    # False when a timed-out worker could not be stopped — blocked outside the interpreter
+    # (subprocess/socket/C-extension), where the async-exception injection cannot land (#14). The
+    # kill still counts as a run-only timeout, but the measurement is UNCONTAINED: the runaway may
+    # still be executing and mutating shared state, so a profile that contains it is not gateable.
+    contained: bool = True  # all killers (full-matrix mode)
+    # --- execution phases (issue #18) -------------------------------------------------------
+    # `killed` alone cannot say WHY. A mutant Wesker failed to build, and one a green suite
+    # genuinely failed to detect, are different facts about different things — the first is a
+    # fact about the harness — and both used to arrive here as `killed=True, killed_by="crash"`.
+    #
+    # Defaults are chosen so every EXISTING construction site keeps exactly today's meaning:
+    # reaching one of them means the mutant was built and the tests ran, which is
+    # `constructed=True, installed=True`. Only the construction-failure paths set them False.
+    constructed: bool = True
+    installed: bool = True
+    # None = NOT OBSERVED, which is not the same as False. Until entry is instrumented the
+    # engine has no evidence either way, and inventing `not_entered` here would withhold real
+    # kills — the one direction this repo's conservatism rule forbids (over-approximate only
+    # where that withholds a mutation dimension, never fabricate one). A False here is a
+    # positive observation that the test never called the mutant.
+    entered: bool | None = None
+    # HOW an equivalence was established, "" when none was (issue #24). `equivalent` alone
+    # cannot say whether the engine PROVED it or merely failed to refute it, and those are
+    # different claims: boundary-probe agreement means no input Wesker tried distinguished the
+    # two, while bytecode identity means none exists. Sharing one flag would promote
+    # `candidate-equivalent — UNPROVEN` to `equivalent` by assertion, which is precisely the
+    # move this tool refuses everywhere else.
+    equivalence_warrant: str = ""
+
+
+# Dispositions that belong in the mutation-score denominator. A mutant only measures the SUITE
+# once it was built, installed, and entered; before that, an outcome measures the harness.
+SCORED_DISPOSITIONS = ("killed_after_entry", "survived_after_entry")
+
+
+def mutant_disposition(
+    constructed: bool,
+    installed: bool,
+    entered: bool | None,
+    contained: bool,
+    killed: bool,
+) -> str:
+    """What a mutant's outcome is EVIDENCE OF (issue #18).
+
+    `killed` answers "did something go wrong", not "did the suite detect the change", and the
+    two diverged silently. A mutant whose construction raised returned `killed=True,
+    killed_by="crash"` — a fact about Wesker's compile step scored as a fact about the user's
+    tests, straight into the adequacy numerator. `_preserve_descriptor_shape` records the same
+    class of error from the other side (issue #25: a double-bound classmethod raised TypeError
+    "which the runner reads as a spurious crash"), fixed there for one shape; this names the
+    category so the next shape cannot repeat it.
+
+    PRECEDENCE, earliest failed phase first — each answers a question the later ones presuppose:
+
+    * ``harness_error``  — never built. Says nothing about any test.
+    * ``not_installed``  — built, but no call site was rebound to it. A survivor here is a
+      patch blind spot, not a specification gap; `_patch_module_qualified` skips any object
+      without ``__code__``, so an `lru_cache`/`partial`-wrapped target lands here.
+    * ``not_entered``    — installed, but the test never called it. The classic decorator and
+      registry capture: the namespace holds the mutant while the caller holds the original.
+    * ``cut``            — ran, but the measurement is truncated or uncontained, so its outcome
+      is not evidence either way (the #14 boundary).
+    * ``killed_after_entry`` / ``survived_after_entry`` — the only two that measure the SUITE,
+      and the only two :data:`SCORED_DISPOSITIONS` admits to the denominator.
+
+    ``entered=None`` means NOT OBSERVED and falls through to the scored pair, preserving the
+    pre-#18 verdict exactly. It is deliberately not treated as ``not_entered``: that would
+    withhold real kills on evidence the engine does not have.
+    """
+    if not constructed:
+        return "harness_error"
+    if not installed:
+        return "not_installed"
+    if entered is False:
+        return "not_entered"
+    if not contained:
+        return "cut"
+    return "killed_after_entry" if killed else "survived_after_entry"
+
+
+def merge_unscored(counts: list[dict[str, int]]) -> tuple[int, dict[str, int]]:
+    """Fold per-category unscored breakdowns into one ``(total, by_reason)`` pair (#18).
+
+    The TOTAL IS DERIVED FROM THE BREAKDOWN, never summed alongside it. Reported separately
+    the two can disagree, and a payload whose own numbers do not reconcile is worse than one
+    that omits them — a reader who checks is told the report is wrong, and one who does not is
+    told a number nobody computed. This is the same partition discipline the audit accounting
+    already runs on: name the parts, derive the total, so the identity cannot be violated by
+    an update that touches one and forgets the other.
+
+    Shared by both :meth:`SamplingResult.to_dict` and :meth:`ProfilingResult.to_dict` because
+    the repo treats a second implementation of one fact as a defect class rather than a style
+    question — the two results are read by the same consumers and must not answer differently.
+
+    Zero-valued reasons are dropped: a reason that never fired is not evidence of anything, and
+    keeping it invites a reader to treat an empty bucket as a measured zero.
+    """
+    merged: dict[str, int] = {}
+    for one in counts:
+        for reason, n in one.items():
+            if n:
+                merged[reason] = merged.get(reason, 0) + n
+    return sum(merged.values()), merged
 
 
 @dataclass
@@ -160,6 +310,14 @@ class CategoryResult:
     killed_by_crash: int = 0
     timed_out: int = 0
     equivalent: int = 0
+    # Mutants whose outcome measured the HARNESS, not the suite (issue #18): never built,
+    # never installed at any call site, never entered by the test, or cut mid-measurement.
+    # Deliberately OUTSIDE `total`, which is the denominator: a mutant Wesker could not build
+    # is not a behaviour the tests failed to pin, and counting it either way is a claim about
+    # the suite that no measurement supports. Reported so the omission is visible — a silently
+    # smaller denominator is the same lie in the other direction.
+    unscored: int = 0
+    unscored_by: dict[str, int] = field(default_factory=dict)
 
     @property
     def survival_rate(self) -> float:
@@ -203,6 +361,12 @@ class SamplingResult:
     universe_size: int = 0
 
     def to_dict(self) -> dict:
+        # See `ProfilingResult.to_dict` for why this is emitted unconditionally. Sampling needs
+        # it at least as much: it already reports a PARTIAL universe, so a second, unexplained
+        # reason for the denominator to shrink is indistinguishable from the sampling itself.
+        unscored, unscored_by = merge_unscored(
+            [cr.unscored_by for cr in self.per_category]
+        )
         effective_total = self.total_mutants - self.total_equivalent
         effective_kill_pct = (
             round(100 * self.total_killed / effective_total)
@@ -216,6 +380,8 @@ class SamplingResult:
             "total_killed": self.total_killed,
             "total_survived": self.total_survived,
             "total_equivalent": self.total_equivalent,
+            "unscored": unscored,
+            "unscored_by": unscored_by,
             "universe_size": self.universe_size,
             "survival_rate": round(self.survival_rate, 3),
             "effective_kill_pct": effective_kill_pct,
@@ -229,6 +395,7 @@ class SamplingResult:
                     "killed": cr.killed,
                     "survived": cr.survived,
                     "equivalent": cr.equivalent,
+                    "unscored": cr.unscored,
                     "survival_rate": round(cr.survival_rate, 3),
                 }
                 for cr in self.per_category
@@ -247,9 +414,59 @@ class ProfilingResult:
     total_survived: int = 0
     survival_rate: float = 0.0
     coverage_depth: str = "profiled"
+    #: Which execution mode measured this result (#19): "in_process" (default) or "isolated". The
+    #: isolated worker's containment is a real SIGKILL guarantee; the in-process path can only ASK a
+    #: runaway thread to stop. `execution_mode_standing` maps this + containment to a gateability tier
+    #: (Detective #60 consumes it). Defaults "in_process" so every existing construction keeps meaning.
+    execution_mode: str = "in_process"
+    #: The fast-mode SHAPE standing over this function's covering tests (#19): "hermetic" when every
+    #: in_process-measured test is containable, "refuse_<hazard>" naming the first that is not, or
+    #: "n/a" under the isolated mode (a whole process is killable, so shape is irrelevant). A
+    #: "refuse_*" here is why an in_process result is not gateable — the NAMED refusal the issue asks
+    #: for. Default "n/a" leaves every existing construction (and the isolated path) unaffected.
+    fast_mode: str = "n/a"
+    #: The memory-budget standing over the isolated workers (W#21): "cut" when a mutant hit the
+    #: worker's address-space cap (that mutant is non-gateable), else "enforced" / "telemetry_only"
+    #: — the HONEST capability, never claiming a guarantee an unaccepting platform did not keep — or
+    #: "n/a" on the in_process path. Default "n/a" leaves every existing construction unaffected.
+    memory_standing: str = "n/a"
+    #: The repeated-fresh-baseline determinism standing (#19): "deterministic" when two fresh isolated
+    #: baseline runs agreed on outcome AND covered lines, "nondeterministic" when they disagreed (→
+    #: not gateable), or "unchecked" (the default) when the opt-in `check_determinism` run did not
+    #: happen. An unrepeatable baseline cannot ground a gateable verdict.
+    determinism: str = "unchecked"
     is_gateable: bool = True
+    # Module names the LIVE collection resolved to more than one file (#58). Non-empty means
+    # the measurement may be perfectly counted and still be about the wrong copy of the code,
+    # so `is_gateable` is False and the reason is nameable rather than a bare refusal.
+    collection_conflicts: tuple[str, ...] = ()
+    # The runner's OWN node-ID proof basis (#58): each collected item as (node_id, content digest),
+    # from the manifest THIS live session captured (admissible per `manifest_admissibility`). A
+    # certificate freezes the exact items pytest selected — addressed as pytest addresses them —
+    # instead of a file set Detective re-derives from the kill matrix (which omits a line/arc-only
+    # owner) by reading config a second way. Empty when the collection was inadmissible/unobserved
+    # (e.g. a profile run OUTSIDE a live session); non-empty when the session CONFIRMED its identity.
+    proof_basis: tuple[tuple[str, str], ...] = ()
     per_category: list[CategoryResult] = field(default_factory=list)
     kill_matrix: dict[str, list[str]] = field(default_factory=dict)
+    # The PROOF view of `line_coverage` (issue #17): the same map with the entries whose owner
+    # cannot discharge an obligation removed — baseline-failing, truncated, or uncontained.
+    #
+    # A SECOND FIELD rather than a redefinition of `line_coverage`, on purpose. That field is
+    # what Detective judges line completeness from, and narrowing it here would make every
+    # consumer report more gaps the moment this engine updated — a behaviour change arriving
+    # ahead of the change that handles it (Detective #59). `line_coverage` stays the OBSERVED
+    # reach, which is also what `_build_test_scope` correctly scopes on: routing wants a test
+    # that reaches the line even when it cannot prove anything about it.
+    admissible_line_coverage: dict[str, list[int]] = field(default_factory=dict)
+    # The per-TestId outcome-qualified baseline ledger (#17): the typed source the two coverage
+    # views above derive from, WITHOUT loss through early unioning. Each entry names the item's
+    # baseline outcome, whether its trace was truncated or the measurement uncontained, and whether
+    # it may therefore discharge a statement obligation. `observed_union` / `admissible_union` are
+    # the named views over it. Arc/branch obligations are a follow-up — the tracer records
+    # statements today, so this ledger is statement-level with the outcome qualification the proof
+    # view was missing.
+    trace_evidence: tuple[TraceEvidence, ...] = ()
     survivor_records: list[dict] = field(default_factory=list)
     killed_records: list[dict] = field(default_factory=list)
     budget_exhausted: bool = False
@@ -296,12 +513,57 @@ class ProfilingResult:
     # signal, not weak tests. -1 = not populated (older callers), so consumers can
     # tell "no tests" apart from "unknown". Prevents a silent, misleading 0%.
     tests_discovered: int = -1
+    # Per-function routing census (#15): the exact partition that decided the target-first seed.
+    # Counts only — TestIds remain in trace_evidence/proof_basis. Empty means routing was not used
+    # (standalone/unscoped/older caller), never "all buckets were zero".
+    test_routing: dict[str, int] = field(default_factory=dict)
+    # The candidate-operator policy census (#22): what the policy did to EVERY category on this
+    # target — generated, or withheld/not_applicable with a reason — so a reader can audit not just
+    # how many mutants ran but why the absent ones are absent (a purity-suppressed STATE alternative
+    # is a reviewable judgement, not a silent gap). Keyed by MutationCategory; empty on the converged
+    # path and any construction that does not supply it. Serialized (enum -> str) in to_dict.
+    operator_census: dict = field(default_factory=dict)
 
     # --- Value-specification view -------------------------------------------------
     # An assertion kill pins WHAT the function returns; a crash/timeout kill only proves
     # it RUNS. For SPECIFICATION only assertion kills count, so crash/timeout kills are
     # unspecified value-DOF. Derived (not stored) so they can never drift from the record
     # of record — any ProfilingResult, however constructed, reports the split correctly.
+
+    @property
+    def execution_standing(self) -> str:
+        """The gateability tier this result earns from its execution mode (#19).
+
+        `isolated` + a valid measurement -> "gateable"; `in_process` + valid -> "conditional"
+        (the counts hold, but in-process containment is best-effort — increment 5's shape check is
+        what will let it gate); an invalid measurement -> "cut". Derived, never stored, so it cannot
+        drift from `execution_mode`/`is_gateable`; INFORMATIONAL — it does not change `is_gateable`,
+        so no in-process certificate is downgraded before that shape check lands.
+        """
+        return execution_mode_standing(self.execution_mode, self.is_gateable)
+
+    @property
+    def empirical_redundancy_groups(self) -> list[list[str]]:
+        """Killed mutants the CURRENT suite cannot tell apart, grouped (W#25).
+
+        Two mutants killed by exactly the same tests are indistinguishable BY THIS SUITE, so a
+        reader considering both is considering a distinction the evidence does not contain. This is a
+        PRESENTATION view — a dynamic, suite-relative OBSERVATION, never a proof. It MUST NOT shrink
+        the universe `COMPLETE (operator universe)` is claimed over: `total_mutants` / `total_killed`
+        stay the full universe, and this only groups the OUTPUT. Derived, so it cannot drift.
+        """
+        return redundancy_groups(self.kill_matrix)
+
+    @property
+    def distinct_obligations(self) -> int:
+        """How many ACTUALLY-DISTINCT behavioural obligations this run witnesses (W#25).
+
+        Each group of mutually-redundant killed mutants counts once, and each true survivor is its
+        own distinct gap (a survivor's empty killer set means "nothing detected this", never "these
+        behave the same"). The honest, actionable number behind a large kill/survivor list —
+        presentation only, and never a denominator a completeness claim rests on.
+        """
+        return _distinct_obligations(self.kill_matrix, self.total_survived)
 
     @property
     def value_killed(self) -> int:
@@ -342,7 +604,48 @@ class ProfilingResult:
         ]
         return list(self.survivor_records) + crash_survivors
 
+    @property
+    def observed_union(self) -> set[int]:
+        """Every line ANY test executed — conservative routing/diagnostic reach (#17).
+
+        The union that used to close the line ledger; kept as a NAMED view so a consumer that
+        wants observed reach (routing) asks for it explicitly and never gets it where proof is
+        meant.
+        """
+        return {ln for ev in self.trace_evidence for ln in ev.lines}
+
+    @property
+    def admissible_union(self) -> set[int]:
+        """Every line an ADMISSIBLE observation executed — the lines proof may rest on (#17).
+
+        Baseline-green, contained, non-truncated owners only. This is the union a certificate's
+        line ledger may close on; the failing-only counterexample leaves the false-branch line
+        OUT of it, which is the whole point.
+        """
+        return {ln for ev in self.trace_evidence if ev.admissible for ln in ev.lines}
+
+    @property
+    def admissible_arc_union(self) -> set[tuple[int, int]]:
+        """Every branch edge an ADMISSIBLE observation executed — arc obligations proof may rest on (#17).
+
+        Empty unless the trace was run with arc capture. Distinguishes the two sides of a
+        conditional that :attr:`admissible_union` (statements) collapses: a suite that reaches a
+        line by only ONE of its incoming edges is line-complete but arc-incomplete, and this is the
+        view that shows it.
+        """
+        return {arc for ev in self.trace_evidence if ev.admissible for arc in ev.arcs}
+
     def to_dict(self) -> dict:
+        # Mutants whose outcome measured the HARNESS, not the suite (#18) — never built, never
+        # installed, never entered. `total_mutants` excludes them, so EMITTING THIS IS PART OF
+        # THE CONTRACT, including as 0: without it a consumer sees `universe_size` exceed
+        # `total_mutants`, and `effective_kill_pct` computed over a base that shrank for a
+        # reason the payload never states. A silently smaller denominator is the same
+        # dishonesty as counting a harness failure as a kill, pointed the other way; a reader
+        # has to be able to reconcile the two numbers from this payload alone.
+        unscored, unscored_by = merge_unscored(
+            [cr.unscored_by for cr in self.per_category]
+        )
         effective_total = self.total_mutants - self.total_equivalent
         effective_kill_pct = (
             round(100 * self.total_killed / effective_total)
@@ -356,6 +659,11 @@ class ProfilingResult:
             "total_killed": self.total_killed,
             "total_survived": self.total_survived,
             "total_equivalent": self.total_equivalent,
+            # `universe_size` counts every mutant the AST admits; `total_mutants` counts only
+            # those actually MEASURED against the suite. `unscored` is the difference this run
+            # is responsible for, and names why each one was not measurable.
+            "unscored": unscored,
+            "unscored_by": unscored_by,
             "universe_size": self.universe_size,
             "dof_total": self.dof_total,
             "dof_covered": self.dof_covered,
@@ -375,7 +683,16 @@ class ProfilingResult:
             ),
             "survival_rate": round(self.survival_rate, 3),
             "effective_kill_pct": effective_kill_pct,
+            # W#25 presentation: the count of ACTUALLY-DISTINCT obligations (redundant killed mutants
+            # collapsed, each survivor its own). A reporting view over the SAME full universe —
+            # `total_mutants`/`universe_size`/`COMPLETE` are unchanged; this never shrinks them.
+            "distinct_obligations": self.distinct_obligations,
             "coverage_depth": self.coverage_depth,
+            "execution_mode": self.execution_mode,
+            "fast_mode": self.fast_mode,
+            "memory_standing": self.memory_standing,
+            "determinism": self.determinism,
+            "execution_standing": self.execution_standing,
             "is_gateable": self.is_gateable,
             "budget_exhausted": self.budget_exhausted,
             "elapsed_ms": round(self.elapsed_ms, 1),
@@ -386,6 +703,7 @@ class ProfilingResult:
                     "killed": cr.killed,
                     "survived": cr.survived,
                     "equivalent": cr.equivalent,
+                    "unscored": cr.unscored,
                     "killed_by_assertion": cr.killed_by_assertion,
                     "killed_by_crash": cr.killed_by_crash,
                     "survival_rate": round(cr.survival_rate, 3),
@@ -395,6 +713,16 @@ class ProfilingResult:
         }
         if self.kill_matrix:
             d["kill_matrix"] = self.kill_matrix
+        # W#25: killed mutants this suite cannot tell apart, grouped for the reader — presentation
+        # only, emitted when non-empty like the other record views, and never shrinking the universe.
+        if self.empirical_redundancy_groups:
+            d["empirical_redundancy_groups"] = self.empirical_redundancy_groups
+        # The candidate-operator policy census (#22): enum keys -> category names for JSON, emitted
+        # whenever present so a reader can audit what the policy did to every category on this target.
+        if self.operator_census:
+            d["operator_census"] = {
+                cat.value: row for cat, row in self.operator_census.items()
+            }
         if self.survivor_records:
             d["survivor_records"] = self.survivor_records
         # The value-unspecified set: true survivors PLUS crash/timeout kills. This is what a
@@ -408,10 +736,36 @@ class ProfilingResult:
             d["killed_records"] = self.killed_records
         if self.line_coverage:
             d["line_coverage"] = self.line_coverage
+        # The proof view alongside the observed one (#17), never instead of it. A consumer
+        # deciding COMPLETENESS reads this; one deciding what to RUN reads `line_coverage`.
+        # Emitted only when non-empty, matching the surrounding convention — and note the
+        # converged entry point emits no line data at all, so neither key appears there.
+        if self.admissible_line_coverage:
+            d["admissible_line_coverage"] = self.admissible_line_coverage
+        # The typed per-TestId ledger the two views derive from (#17), so a certificate consumer can
+        # name the exact admissible owner of each obligation instead of unioning. Serialized as
+        # dicts; omitted when empty (the converged path carries none).
+        if self.trace_evidence:
+            d["trace_evidence"] = [
+                {
+                    "test_id": ev.test_id,
+                    "lines": list(ev.lines),
+                    "baseline_passed": ev.baseline_passed,
+                    "truncated": ev.truncated,
+                    "contained": ev.contained,
+                    "admissible": ev.admissible,
+                    "reason": ev.reason,
+                    "provenance": ev.provenance,
+                    **({"arcs": [list(a) for a in ev.arcs]} if ev.arcs else {}),
+                }
+                for ev in self.trace_evidence
+            ]
         if self.executable_lines:
             d["executable_lines"] = self.executable_lines
         if self.failing_tests:
             d["failing_tests"] = self.failing_tests
+        if self.test_routing:
+            d["test_routing"] = dict(self.test_routing)
         return d
 
 
@@ -455,7 +809,17 @@ class _BaseMutator(ast.NodeTransformer):
 
 
 class _ValueMutator(_BaseMutator):
-    """Replace constants with boundary values."""
+    """Replace constants with boundary values.
+
+    Ints carry TWO dimensions: the 0/1 COLLAPSE (is the constant read at all?)
+    and an OFF-BY-ONE (is its exact value pinned?). The collapse alone lets a
+    near-miss hide: ``round(cost, 2) -> round(cost, 0)`` is killed by any
+    1-decimal golden value, while ``2 -> 3`` changes nothing a coarse input can
+    see — only the off-by-one forces the witness that pins the exact value.
+    Ints only: a float/str collapse already forces an exact-value assertion
+    wherever a value test exists, and a threshold used in a comparison is
+    BOUNDARY's job (its endpoint shift generates the same witness ±1 would).
+    """
 
     # Types we can actually mutate — others (None, bytes, complex, Ellipsis)
     # are left unchanged by _mutate_constant, so we must not count them as
@@ -482,32 +846,64 @@ class _ValueMutator(_BaseMutator):
             and (node.lineno, node.col_offset) in self._ds_pos
         ):
             return node
-        self._note(
-            f"VALUE:{'bool' if isinstance(node.value, bool) else type(node.value).__name__}"
-        )
-        if self.current == self.target:
-            mutated = self._mutate_constant(node)
-            if mutated is not node:
-                self._mark_applied(node)
-                return mutated
-            # Defensive: if _mutate_constant somehow returned the original,
-            # do not mark applied — skip this target.
-            return node
-        self.current += 1
+        # One dimension per alternative (mirrors _BoundaryMutator): the counter
+        # derives from _alternatives, so count and visit order cannot drift.
+        for repl, label in self._alternatives(node.value):
+            selected = not self.applied and self.current == self.target
+            self._note(label)
+            self.current += 1
+            if not selected:
+                continue
+            self._mark_applied(node)
+            return ast.Constant(value=repl)
         return node
 
     @staticmethod
-    def _mutate_constant(node: ast.Constant) -> ast.Constant:
-        v = node.value
+    def _alternatives(v: Any) -> list[tuple[Any, str]]:
+        """Ordered (replacement value, dimension label) for one constant.
+
+        Single source of truth: the mutator and ``_count_value_target`` both
+        read it. bool is checked before int — it IS an int, and ``True + 1``
+        is not a boolean dimension.
+        """
         if isinstance(v, bool):
-            return ast.Constant(value=not v)
+            return [(not v, "VALUE:bool")]
         if isinstance(v, int):
-            return ast.Constant(value=0 if v != 0 else 1)
+            collapse = 0 if v != 0 else 1
+            # ±1 dodges the collapse value so the two dimensions never share a
+            # mutant (v=0: collapse 1, off-by-one -1; v=-1: collapse 0, off-by-one -2).
+            off1 = v + 1 if v + 1 != collapse else v - 1
+            return [(collapse, "VALUE:int"), (off1, "VALUE:int~off1")]
         if isinstance(v, float):
-            return ast.Constant(value=0.0 if v else 1.0)
+            collapse = 0.0 if v else 1.0
+            alts: list[tuple[Any, str]] = [(collapse, "VALUE:float")]
+            # Hail-mary perturbations (±1.0, ±0.1), BOTH directions per delta. A float
+            # literal has no canonical unit — no perturbation family can be COMPLETE
+            # the way int ±1 is — so these four catch the common magnitudes cheaply
+            # and no more. On a value (a rate, a multiplier) any golden capture kills
+            # them; on a comparison threshold each direction shifts the edge across a
+            # different interval, and only an input INSIDE that interval kills — the
+            # up-mutant pins the upper side, the down-mutant the lower, so one
+            # direction alone leaves half the shift class invisible (measured: a
+            # 150.0 -> 149.0 hand-bug survives a suite that kills only up-perts).
+            # What survives is the ask it is: the human holds the domain knowledge,
+            # and `flag` is how they spend it. NaN never perturbs (x+d is NaN,
+            # ==-invisible); a delta lost to float magnitude (1e20+0.1 == 1e20) or
+            # landing on the collapse drops out rather than duplicating a mutant.
+            if v == v:
+                for delta, label in (
+                    (1.0, "VALUE:float~pert+1"),
+                    (-1.0, "VALUE:float~pert-1"),
+                    (0.1, "VALUE:float~pert+01"),
+                    (-0.1, "VALUE:float~pert-01"),
+                ):
+                    cand = v + delta
+                    if cand != v and cand != collapse:
+                        alts.append((cand, label))
+            return alts
         if isinstance(v, str):
-            return ast.Constant(value="" if v else "mutated")
-        return node
+            return [("" if v else "mutated", "VALUE:str")]
+        return []
 
 
 class _BoundaryMutator(_BaseMutator):
@@ -624,23 +1020,179 @@ class _BoundaryMutator(_BaseMutator):
         return self.generic_visit(node)
 
 
+def _stmt_call_ids(root: ast.AST) -> set[int]:
+    """ids of Call nodes in expression-STATEMENT position (``log.info(x)``,
+    ``items.append(y)``). Their value is discarded, so unwrap (call -> first
+    arg) is a guaranteed-equivalent no-op there — and SDL already owns the
+    "does this discarded call do anything?" question by deleting the statement.
+    ids are safe here: the set is built and consumed within one traversal of
+    one live tree, never persisted (contrast ``_deletable_stmt_ids``)."""
+    return {
+        id(stmt.value)
+        for stmt in ast.walk(root)
+        if isinstance(stmt, ast.Expr) and isinstance(stmt.value, ast.Call)
+    }
+
+
 class _SwapMutator(_BaseMutator):
-    """Transpose two parameters in a function call."""
+    """Call-shape mutations: transpose adjacent arguments, or unwrap the call.
+
+    Per call site, one dimension per alternative (mirrors _BoundaryMutator):
+
+      * a TRANSPOSITION per adjacent argument pair — ``f(a, b, c)`` carries
+        (a,b) and (b,c). The first pair keeps the bare ``SWAP:<callee>`` label
+        the universe has always had; later pairs get ``~p<i>``.
+      * an UNWRAP (``f(x, ...) -> x``) when the call's value is USED — the
+        "does this call do anything the suite can see?" question. It forces a
+        witness where the call is observable: ``round(cost, 2) -> cost``
+        demands an input with 3+ decimals, which also pins the ndigits
+        constant no VALUE collapse can reach. Skipped in expression-statement
+        position (guaranteed-equivalent there) and for a starred first arg.
+
+    ``_alternatives`` is the single source of truth: the mutator and
+    ``_count_targets``'s SWAP case both read it, so the target count and the
+    visit order cannot drift.
+    """
+
+    def __init__(self, target_index: int = 0):
+        super().__init__(target_index)
+        self._stmt_ids: set[int] | None = None
+        self._bindings: dict[str, str] | None = None
+
+    def visit(self, node: ast.AST) -> ast.AST:
+        # The first visit sees the root: capture statement-position calls and the
+        # function's bound names once, so per-Call eligibility below needs no
+        # parent pointers.
+        if self._stmt_ids is None:
+            self._stmt_ids = _stmt_call_ids(node)
+            self._bindings = _scope_bindings(node)
+        return super().visit(node)
+
+    # The curated callee-dual table (issue #5). Small and boring ON PURPOSE — every
+    # entry inflates every universe that calls it (measured before adding: the whole
+    # table costs +0.33% universe on Detective, +0.46% on Wesker). Symmetric pairs;
+    # `sorted(reverse=)` deliberately excluded until a measured case wants it.
+    _DUALS = {
+        "min": "max",
+        "max": "min",
+        "any": "all",
+        "all": "any",
+        "floor": "ceil",
+        "ceil": "floor",
+    }
+
+    @staticmethod
+    def _dual_eligible(node: ast.Call, bindings: dict[str, str]) -> bool:
+        """Only a callee that RESOLVES to the curated table gets a dual dimension.
+
+        Resolution, not spelling (issue #5, second round): an attribute callee
+        qualifies only when its qualifier is PROVEN to be the stdlib ``math`` module —
+        the literal unbound name ``math``, or any alias whose import provenance is
+        ``math`` (``import math as m``) — so ``import numpy as math; math.floor``
+        never qualifies. A bare-name callee qualifies as an unbound builtin
+        (``min``/``max``/``any``/``all``) or as a name imported FROM math
+        (``from math import floor``); a param/local/def shadow or a foreign import
+        (``from custom import min``) is the user's object, whose dual the table never
+        promised. Bare ``floor``/``ceil`` with no visible import is unresolvable and
+        abstains — they are not builtins.
+        """
+        f = node.func
+        if isinstance(f, ast.Attribute):
+            if f.attr not in ("floor", "ceil") or not isinstance(f.value, ast.Name):
+                return False
+            provenance = bindings.get(f.value.id)
+            if provenance is None:
+                return (
+                    f.value.id == "math"
+                )  # module-level `import math` is the one sane reading
+            return provenance == "import:math"
+        if isinstance(f, ast.Name) and f.id in _SwapMutator._DUALS:
+            provenance = bindings.get(f.id)
+            if provenance is None:
+                return f.id in (
+                    "min",
+                    "max",
+                    "any",
+                    "all",
+                )  # builtins; bare floor/ceil abstain
+            return provenance == "import:math"
+        return False
+
+    @staticmethod
+    def _alternatives(
+        node: ast.Call, stmt_ids: set[int], bindings: dict[str, str] | None = None
+    ) -> list[tuple[Any, str]]:
+        """Ordered (spec, dimension label) for one call site — a spec is the
+        left index of the adjacent pair to transpose, ``"unwrap"``, or ``"dual"``
+        (swap the callee for its curated dual: ``min``↔``max``, ``any``↔``all``,
+        ``math.floor``↔``math.ceil``). The dual expresses the wrong-fold-direction
+        bug class no argument transposition can reach — ``min(a, b)`` and
+        ``max(a, b)`` take the same arguments in every order."""
+        name = _callee_name(node)
+        alts: list[tuple[Any, str]] = []
+        for i in range(len(node.args) - 1):
+            alts.append((i, f"SWAP:{name}" if i == 0 else f"SWAP:{name}~p{i}"))
+        if (
+            node.args
+            and not isinstance(node.args[0], ast.Starred)
+            and id(node) not in stmt_ids
+        ):
+            alts.append(("unwrap", f"SWAP:{name}~unwrap"))
+        if _SwapMutator._dual_eligible(node, bindings or {}):
+            alts.append(("dual", f"SWAP:{name}~dual"))
+        return alts
 
     def visit_Call(self, node: ast.Call) -> ast.AST:
-        if self.applied or len(node.args) < 2:
+        if self.applied:
             return self.generic_visit(node)
-        if self.current == self.target:
+        for spec, label in self._alternatives(
+            node, self._stmt_ids or set(), self._bindings or {}
+        ):
+            selected = not self.applied and self.current == self.target
+            self._note(label)
+            self.current += 1
+            if not selected:
+                continue
             self._mark_applied(node)
+            if spec == "unwrap":
+                # Returned as-is, unvisited: applied is set, so no site after
+                # this one is consumed anywhere in the tree this pass — the
+                # skipped subtree costs nothing (record mode never fires this
+                # branch, so key alignment is untouched).
+                return node.args[0]
+            if spec == "dual":
+                dual = self._DUALS[_callee_name(node)]
+                if isinstance(node.func, ast.Name):
+                    node.func = ast.copy_location(
+                        ast.Name(id=dual, ctx=ast.Load()), node.func
+                    )
+                elif isinstance(node.func, ast.Attribute):
+                    # Swap only the attr, keep the value (math.floor -> math.ceil).
+                    node.func = ast.copy_location(
+                        ast.Attribute(value=node.func.value, attr=dual, ctx=ast.Load()),
+                        node.func,
+                    )
+                # No third case TODAY: `_callee_name` reports anything that is neither a Name
+                # nor an Attribute as "call", and "call" is not a dual. It was a bare `else`
+                # reading `node.func.value`, so the day someone adds "call" to `_DUALS` the
+                # mutator raises AttributeError on `f[i](x)` instead of declining to mutate it.
+                # Naming the branch it actually handles keeps the invariant checkable.
+                continue
             node.args = list(node.args)
-            node.args[0], node.args[1] = node.args[1], node.args[0]
-        self._note(f"SWAP:{_callee_name(node)}")
-        self.current += 1
+            node.args[spec], node.args[spec + 1] = node.args[spec + 1], node.args[spec]
         return self.generic_visit(node)
 
 
 class _StateMutator(_BaseMutator):
-    """Remove self.x = ... assignments or replace return with return None."""
+    """Remove self.x writes (plain, annotated, and augmented spellings — all
+    three are the same behavioral question per attribute), replace return with
+    return None, or swap break ↔ continue (loop_flow mode) — "leave the loop"
+    and "skip this iteration" are one keyword apart and a classic transposition
+    bug; no other operator can express it (SDL deletes the statement, which
+    crashes nothing and reads as unreachable-code noise instead of the
+    control-flow question). AnnAssign/AugAssign self-writes joined under
+    policy 3 (measured cost: +28 targets / +0.31% on Wesker's own package,
+    +4 / +0.03% on Detective's)."""
 
     def __init__(self, target_index: int = 0, mode: str = "remove_assign"):
         super().__init__(target_index)
@@ -650,16 +1202,63 @@ class _StateMutator(_BaseMutator):
         if self.applied or self.mode != "remove_assign":
             return node
         for target in node.targets:
-            if (
-                isinstance(target, ast.Attribute)
-                and isinstance(target.value, ast.Name)
-                and target.value.id == "self"
-            ):
+            # One predicate for "is this a self.x write", shared by all three
+            # write spellings (Assign / AnnAssign / AugAssign below).
+            if _is_self_assign(target):
                 if self.current == self.target:
                     self._mark_applied(node)
-                    return ast.Pass()
+                    # Un-bind exactly THIS target. `self.a = self.b = x` asks
+                    # two distinct questions (is a's write observed? is b's?),
+                    # and replacing the whole statement answered both with ONE
+                    # mutant — two dimensions whose mutants were byte-identical
+                    # (same content id), and a kill via `a` said nothing about
+                    # `b`. Per-target removal mirrors BOUNDARY's chained-
+                    # compare precedent: mutate one part, keep the rest. A
+                    # statement left with no targets becomes `pass`, which
+                    # keeps every single-target mutant byte-identical to the
+                    # policy-3 universe.
+                    remaining = [t for t in node.targets if t is not target]
+                    if not remaining:
+                        return ast.Pass()
+                    node.targets = remaining
+                    return node
                 self._note(f"STATE:remove_assign:{target.attr}")
                 self.current += 1
+        return node
+
+    def visit_AnnAssign(self, node: ast.AnnAssign) -> ast.AST:
+        # `self.x: T = v` writes state exactly as the unannotated spelling does
+        # (the annotation on an attribute target has no runtime effect), and it
+        # was invisible to this mode until the counter migration exposed the
+        # gap: the old signal filter listed STATE for annotated-assign
+        # __init__s while the engine had zero targets. A valueless
+        # `self.x: T` declares and writes nothing — not a target. Same
+        # dimension label as the plain spelling: however the write is spelled,
+        # "is the write to self.x observed?" is one behavioral question.
+        if self.applied or self.mode != "remove_assign":
+            return node
+        if node.value is not None and _is_self_assign(node.target):
+            if self.current == self.target:
+                self._mark_applied(node)
+                return ast.Pass()
+            self._note(f"STATE:remove_assign:{node.target.attr}")
+            self.current += 1
+        return node
+
+    def visit_AugAssign(self, node: ast.AugAssign) -> ast.AST:
+        # `self.x += v` -> pass keeps the PRIOR value — the same rationale as
+        # STMT's rebinding deletion (`total = abs(total)`): in an original
+        # that runs, the attribute was already readable, so dropping the
+        # update cannot raise; what dies is exactly the state change a
+        # refactor most plausibly loses.
+        if self.applied or self.mode != "remove_assign":
+            return node
+        if _is_self_assign(node.target):
+            if self.current == self.target:
+                self._mark_applied(node)
+                return ast.Pass()
+            self._note(f"STATE:remove_assign:{node.target.attr}")
+            self.current += 1
         return node
 
     def visit_Return(self, node: ast.Return) -> ast.AST:
@@ -671,6 +1270,26 @@ class _StateMutator(_BaseMutator):
                 return ast.Return(value=ast.Constant(value=None))
             self._note("STATE:return_none")
             self.current += 1
+        return node
+
+    def visit_Break(self, node: ast.Break) -> ast.AST:
+        if self.applied or self.mode != "loop_flow":
+            return node
+        if self.current == self.target:
+            self._mark_applied(node)
+            return ast.Continue()
+        self._note("STATE:loop_flow:break")
+        self.current += 1
+        return node
+
+    def visit_Continue(self, node: ast.Continue) -> ast.AST:
+        if self.applied or self.mode != "loop_flow":
+            return node
+        if self.current == self.target:
+            self._mark_applied(node)
+            return ast.Break()
+        self._note("STATE:loop_flow:continue")
+        self.current += 1
         return node
 
 
@@ -786,9 +1405,195 @@ class _ExceptionMutator(_BaseMutator):
         return self.generic_visit(node)
 
 
+class _OutputMutator(_BaseMutator):
+    """Output-space (codomain) perturbation — μ⁻ Form A (return-site rewrite).
+
+    Rewrites ``return <expr>`` to ``return <perturbation>`` for one of three
+    ALWAYS-APPLICABLE sub-modes, so each perturbation is an ordinary AST mutant that rides
+    ``evaluate_mutant`` / ``check_equivalent`` / the greedy cover with no new machinery.
+    All-green covering tests under the perturbation means that output dimension is UNPINNED
+    — the negative-DOF polarity (a surviving mutant): ``unpinned(p) ⇔ ∀t: t(f ⊕ p) passes``.
+
+    The three sub-modes are the independence pair plus existence — the value-space analogues
+    of the MC/DC independence conditions, caught by no positive operator:
+
+      * ``return_none``     — ``return None``: does any test pin that the output EXISTS?
+      * ``return_const``    — ``return 0`` (a fixed, input-independent value): does the output
+        DEPEND ON THE INPUT, or would a constant pass every covering test?
+      * ``return_identity`` — ``return <first param>``: is the output a NON-TRIVIAL TRANSFORM
+        of its input, or would returning an argument unchanged pass?
+
+    All three are total on any value — they never raise on application — so no perturbation
+    here can be mis-typed to the codomain. The type-conditional family (→negate/→empty/→NaN/…)
+    and the UNDEFINED disposition it needs are Fork 2 / Form B, not this skeleton. A
+    perturbation syntactically identical to the original return value is a guaranteed-equivalent
+    and is NOT a target (mirrors _ExceptionMutator's no-op skip), so the universe carries no
+    built-in survivor. Only the TARGET function's own returns are its codomain: a return inside
+    a nested def is that helper's codomain and is skipped.
+    """
+
+    def __init__(self, target: int, mode: str = "return_none", *a, **k) -> None:  # type: ignore[no-untyped-def]
+        super().__init__(target, *a, **k)
+        self.mode = mode
+        self._entered = False
+        self._params: list[str] = []
+
+    def visit_FunctionDef(self, node: ast.FunctionDef) -> ast.AST:
+        if self._entered:
+            # A nested function: its returns are its own codomain, not the target's.
+            return node
+        self._entered = True
+        self._params = [
+            a.arg
+            for a in (node.args.posonlyargs + node.args.args)
+            if a.arg not in ("self", "cls")
+        ]
+        return self.generic_visit(node)
+
+    visit_AsyncFunctionDef = visit_FunctionDef  # type: ignore[assignment]
+
+    def _perturbed(self, value: ast.expr) -> ast.expr | None:
+        """The replacement return-value node for this sub-mode, or None when the
+        perturbation is a no-op on this value (a guaranteed-equivalent, not a target).
+
+        The always-applicable sub-modes (return_none/const/identity, Fork 1) are total on any
+        value. The type-conditional sub-modes (Fork 2) are emitted only for an OBSERVED codomain
+        type (:func:`_output_sub_modes`), so each is applied only where it cannot raise:
+        ``-(x)``/``abs(x)`` on a numeric return, ``type(x)()`` on a sized return (its empty),
+        ``x[::-1]`` on a sequence, ``float('nan')`` on a float."""
+        if self.mode == "return_none":
+            repl: ast.expr = ast.Constant(value=None)
+        elif self.mode == "return_const":
+            repl = ast.Constant(value=0)
+        elif self.mode == "return_identity":
+            if not self._params:
+                return None
+            repl = ast.Name(id=self._params[0], ctx=ast.Load())
+        elif self.mode == "return_negate":
+            repl = ast.UnaryOp(op=ast.USub(), operand=value)
+        elif self.mode == "return_abs":
+            repl = ast.Call(
+                func=ast.Name(id="abs", ctx=ast.Load()), args=[value], keywords=[]
+            )
+        elif self.mode == "return_nan":
+            repl = ast.Call(
+                func=ast.Name(id="float", ctx=ast.Load()),
+                args=[ast.Constant(value="nan")],
+                keywords=[],
+            )
+        elif self.mode == "return_empty":
+            # type(x)() — the observed type's empty inhabitant; safe because the sub-mode is
+            # emitted only for an observed sized type (str/bytes/list/tuple/dict/set).
+            repl = ast.Call(
+                func=ast.Call(
+                    func=ast.Name(id="type", ctx=ast.Load()), args=[value], keywords=[]
+                ),
+                args=[],
+                keywords=[],
+            )
+        elif self.mode == "return_reorder":
+            # x[::-1] — reversal; emitted only for an observed sequence (list/tuple).
+            repl = ast.Subscript(
+                value=value,
+                slice=ast.Slice(
+                    lower=None,
+                    upper=None,
+                    step=ast.UnaryOp(op=ast.USub(), operand=ast.Constant(value=1)),
+                ),
+                ctx=ast.Load(),
+            )
+        else:
+            return None
+        if ast.dump(repl) == ast.dump(value):
+            return None  # no-op: the return already IS this value
+        return repl
+
+    def visit_Return(self, node: ast.Return) -> ast.AST:
+        if self.applied or node.value is None:
+            return self.generic_visit(node)
+        repl = self._perturbed(node.value)
+        if repl is None:
+            return self.generic_visit(node)  # not an eligible target for this sub-mode
+        if self.current == self.target:
+            node.value = repl
+            self._mark_applied(node)
+            return node
+        self._note(f"OUTPUT:{self.mode}:{node.lineno}")
+        self.current += 1
+        return self.generic_visit(node)
+
+
 def _handler_is_noop(node: ast.ExceptHandler) -> bool:
     """True when a handler's body is already a no-op, so swallowing it changes nothing."""
     return len(node.body) == 1 and isinstance(node.body[0], ast.Pass)
+
+
+# str methods that return str when the receiver is str. Small and boring on
+# purpose (the _DUALS discipline): every entry widens what `_statically_str`
+# can prove, and a wrong entry would delete a live dimension — the one error
+# the completeness claim cannot survive.
+_STR_RETURNING_METHODS = frozenset(
+    {
+        "join",
+        "format",
+        "replace",
+        "strip",
+        "lstrip",
+        "rstrip",
+        "upper",
+        "lower",
+        "casefold",
+        "title",
+        "capitalize",
+    }
+)
+
+
+def _statically_str(node: ast.AST) -> bool:
+    """True only when ``node`` PROVABLY evaluates to str in an original that
+    runs: a str literal, an f-string, a str-returning method on a provably-str
+    receiver, or an Add of two provably-str operands. Deliberately excludes
+    annotations (they can lie) and one-sided Adds (``'a' + x`` can meet a
+    custom ``__radd__`` returning anything). Issue #12."""
+    if isinstance(node, ast.Constant):
+        return isinstance(node.value, str)
+    if isinstance(node, ast.JoinedStr):
+        return True
+    if (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr in _STR_RETURNING_METHODS
+    ):
+        return _statically_str(node.func.value)
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+        return _statically_str(node.left) and _statically_str(node.right)
+    return False
+
+
+def _type_impossible_swap(node: ast.BinOp) -> bool:
+    """True when every swap of this operator is crash-only BY TYPE, so the
+    mutant would measure reachability, not specification (issue #12 — the
+    same principle that keeps first-binding deletions and non-mutable
+    constants out of the universe).
+
+    Provable cases only:
+      * ``str + str`` — ``str - str`` fails both dunder lookups on every input;
+      * ``str * int-literal`` (either order) — ``str / int`` likewise.
+    A one-sided ``'a' + x`` stays IN the universe: ``x`` may carry an
+    ``__radd__``/``__rsub__`` that makes the swap behavioral.
+    """
+    if isinstance(node.op, ast.Add):
+        return _statically_str(node.left) and _statically_str(node.right)
+    if isinstance(node.op, ast.Mult):
+
+        def int_literal(n: ast.AST) -> bool:
+            # bool is an int; a bool literal stays in the universe.
+            return isinstance(n, ast.Constant) and type(n.value) is int
+
+        return (_statically_str(node.left) and int_literal(node.right)) or (
+            int_literal(node.left) and _statically_str(node.right)
+        )
+    return False
 
 
 class _ArithmeticMutator(_BaseMutator):
@@ -812,7 +1617,12 @@ class _ArithmeticMutator(_BaseMutator):
         if self.applied:
             return self.generic_visit(node)
         swapped = self._BIN_SWAP.get(type(node.op))
-        if swapped:
+        # A swap that is crash-only BY TYPE (`'a' - 'b'`) is not a behavioral
+        # question — skipping it is Monty Hall elimination, not sampling, and
+        # it stops type-impossible mutants from padding the unproven-equivalent
+        # bucket downstream (issue #12: 8 of 12 "modulo" residuals on a string
+        # builder were this shape).
+        if swapped and not _type_impossible_swap(node):
             if self.current == self.target:
                 self._mark_applied(node)
                 node.op = swapped()
@@ -1027,7 +1837,22 @@ def _stmt_label(node: ast.stmt) -> str:
         return type(node.value).__name__
     if isinstance(node, ast.AugAssign):
         return f"aug:{_assign_target_label(node.target)}"
-    targets = node.targets if isinstance(node, ast.Assign) else [node.target]  # type: ignore[attr-defined]
+    if isinstance(node, ast.Assign):
+        targets: list[ast.AST] = list(node.targets)
+    elif isinstance(node, ast.AnnAssign):
+        targets = [node.target]
+    else:
+        # `_deletable_stmt_ids` admits EXACTLY four statement kinds, and the two branches above
+        # plus the two below `Expr`/`AugAssign` exhaust them — so this is unreachable while the
+        # analysis and this labeller agree. It was written as `else: [node.target]` under a
+        # `type: ignore[attr-defined]`, i.e. an acknowledgement that the type system could not
+        # see the invariant, resolved by silencing the question rather than answering it. Every
+        # other `ast.stmt` (`Return`, `If`, `Import`, …) has no `.target`, so the drift the class
+        # docstring says cannot happen would surface as an AttributeError naming only `.target`,
+        # 127 lines from the analysis that actually broke. Name the node instead.
+        raise TypeError(
+            f"_stmt_label: {type(node).__name__} is not a deletable statement kind"
+        )
     return "=" + ",".join(_assign_target_label(t) for t in targets)
 
 
@@ -1102,10 +1927,279 @@ class _StmtMutator(_BaseMutator):
         return self._consider(node)
 
 
+# The ENROLLED slice is return_sub alone, and that is a measured decision,
+# not a smaller ambition. Measured on real repos before enrollment (the
+# _DUALS discipline): return_sub costs +2.7% targets on Wesker's own package
+# and +2.5% on Detective's — the wrong-live-out question, the highest-value
+# reference fault for refactor verification. name_sub as implemented below
+# (every eligible load × every visible candidate) costs +239% targets / +217%
+# dimensions on Wesker and +205%/+165% on Detective — it TRIPLES the universe,
+# the exact naive combinatorial explosion issue #10 forbids. The machinery
+# stays implemented, record-countable, and tested (_DataflowMutator(mode=
+# "name_sub")) so the next slice is a candidate-restraint design plus one
+# tuple entry — but it does not enter the universe until a restraint brings
+# its measured cost into curated-table territory.
+_DATAFLOW_SUB_MODES = (("return_sub", "substitute returned reference"),)
+
+
+def _dataflow_candidates(root: ast.AST) -> dict[int, tuple[str, str, tuple[str, ...]]]:
+    """``id(Name-load node) → (sub_mode, original name, candidate names)`` for
+    every reference the DATAFLOW family may substitute (issue #10).
+
+    The behavioral question is "does this expression use the CORRECT available
+    value?" — the wrong-reference fault class that preserves every operator
+    and control-flow shape (``return x`` for ``return y``, the wrong helper
+    input, a captured near-name). No other category can express it: SWAP owns
+    argument ORDER and callable identity, VALUE owns constants; reference
+    IDENTITY was outside the universe entirely.
+
+    Conservatism rules, each in the direction that WITHHOLDS a dimension:
+
+    * the candidate pool is parameters (positional/keyword; never ``*args`` /
+      ``**kwargs``, whose shapes make crash noise) and plain single-name
+      assignment targets — never imports, defs, classes, comprehension or
+      loop targets;
+    * a candidate must be bound BEFORE the load's enclosing statement, under
+      ``_deletable_stmt_ids``'s narrow rule — a parameter, or an earlier
+      statement in the SAME block; sibling and inner-block bindings never
+      escape, so no substitution can manufacture an UnboundLocalError (a
+      guaranteed-crash mutant measures reachability, not specification);
+    * loads inside nested functions, lambdas, and comprehensions are skipped
+      whole — their frames own their names, and shadowing across that
+      boundary is exactly where a cheap analysis fabricates false dimensions;
+    * the callee position of a call is skipped — callable identity belongs to
+      SWAP's curated duals;
+    * only loads whose OWN name is in the pool are substituted — ``math`` in
+      ``math.floor`` is not a value that flows.
+
+    One dimension per substitution QUESTION: the label ``DATAFLOW:x→y``
+    deliberately collapses every site asking "is x distinguished from y" into
+    one behavioral dimension, exactly as ``SWAP:<callee>`` collapses call
+    sites — exhaustive mode still visits every site, DOF mode spends one
+    mutant per question.
+    """
+    sites: dict[int, tuple[str, str, tuple[str, ...]]] = {}
+    if not isinstance(root, (ast.FunctionDef, ast.AsyncFunctionDef)):
+        return sites
+
+    pool: dict[str, None] = {}  # insertion-ordered set: signature, then binding order
+    a = root.args
+    for arg in a.posonlyargs + a.args + a.kwonlyargs:
+        # A receiver is not a value that flows: `self.x = 0` asks an aliasing
+        # question (`xs.x = 0`?) this slice does not own, and nearly every
+        # receiver substitution is type-incompatible crash noise.
+        if arg.arg not in ("self", "cls"):
+            pool[arg.arg] = None
+
+    def stmt_bindings(stmt: ast.stmt) -> list[str]:
+        """Plain single-name targets this statement binds — the only binding
+        shape that joins the candidate pool."""
+        names: list[str] = []
+        if isinstance(stmt, ast.Assign):
+            names.extend(t.id for t in stmt.targets if isinstance(t, ast.Name))
+        elif isinstance(stmt, ast.AnnAssign) and stmt.value is not None:
+            if isinstance(stmt.target, ast.Name):
+                names.append(stmt.target.id)
+        elif isinstance(stmt, ast.AugAssign) and isinstance(stmt.target, ast.Name):
+            names.append(stmt.target.id)
+        return names
+
+    def collect_loads(expr: ast.AST, bound: dict[str, None]) -> None:
+        """Register every eligible Name load reachable in ``expr`` without
+        crossing a scope boundary; ``bound`` is the pool bound before the
+        enclosing statement."""
+        stack: list[ast.AST] = [expr]
+        while stack:
+            node = stack.pop()
+            if isinstance(
+                node,
+                (
+                    ast.FunctionDef,
+                    ast.AsyncFunctionDef,
+                    ast.Lambda,
+                    ast.ListComp,
+                    ast.SetComp,
+                    ast.DictComp,
+                    ast.GeneratorExp,
+                ),
+            ):
+                continue  # another frame's names — skipped whole
+            if isinstance(node, ast.Call):
+                # The callee is SWAP's question; arguments are ours.
+                stack.extend(node.args)
+                stack.extend(kw.value for kw in node.keywords)
+                if isinstance(node.func, ast.Attribute):
+                    stack.append(node.func.value)  # obj in obj.method(...) flows
+                continue
+            if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load):
+                if node.id in bound:
+                    cands = tuple(n for n in bound if n != node.id)
+                    if cands:
+                        sites[id(node)] = ("name_sub", node.id, cands)
+                continue
+            stack.extend(ast.iter_child_nodes(node))
+
+    def walk_block(stmts: list[ast.stmt], bound_in: dict[str, None]) -> None:
+        bound = dict(bound_in)
+        for stmt in stmts:
+            if isinstance(stmt, ast.Return):
+                # return_sub owns the whole-Name return; its operand is not
+                # additionally a name_sub site.
+                if isinstance(stmt.value, ast.Name) and isinstance(
+                    stmt.value.ctx, ast.Load
+                ):
+                    if stmt.value.id in bound:
+                        cands = tuple(n for n in bound if n != stmt.value.id)
+                        if cands:
+                            sites[id(stmt.value)] = (
+                                "return_sub",
+                                stmt.value.id,
+                                cands,
+                            )
+                elif stmt.value is not None:
+                    collect_loads(stmt.value, bound)
+            elif isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                pass  # nested frame: neither its loads nor its bindings are ours
+            else:
+                # Loads anywhere in this statement's expressions see the
+                # pool as bound BEFORE the statement (RHS evaluates first).
+                for child in ast.iter_child_nodes(stmt):
+                    if isinstance(child, ast.expr):
+                        collect_loads(child, bound)
+                # Inner blocks see this prefix; their bindings never escape.
+                for field in ("body", "orelse", "finalbody"):
+                    inner = getattr(stmt, field, None)
+                    if inner and isinstance(inner[0], ast.stmt):
+                        walk_block(inner, bound)
+                for handler in getattr(stmt, "handlers", []):
+                    walk_block(handler.body, bound)
+            for name in stmt_bindings(stmt):
+                bound[name] = None
+
+    walk_block(root.body, pool)
+    return sites
+
+
+class _DataflowMutator(_BaseMutator):
+    """Substitute one loaded reference for another visible, compatible one.
+
+    Two sub-modes over one analysis (``_dataflow_candidates``): ``return_sub``
+    rewrites ``return x`` to ``return y`` — the highest-value slice for
+    refactor verification, where returning the wrong live-out is the classic
+    extraction fault — and ``name_sub`` rewrites any other eligible load.
+    The analysis is the single source of truth: record mode, target counting,
+    and mutation all read the same site table, so none can drift.
+    """
+
+    def __init__(self, target_index: int = 0, mode: str = "return_sub"):
+        super().__init__(target_index)
+        self.mode = mode
+        self._sites: dict[int, tuple[str, str, tuple[str, ...]]] | None = None
+
+    def visit(self, node: ast.AST) -> ast.AST:
+        if self._sites is None:
+            self._sites = _dataflow_candidates(node)
+        return super().visit(node)
+
+    def visit_Name(self, node: ast.Name) -> ast.AST:
+        if self.applied or self._sites is None:
+            return node
+        entry = self._sites.get(id(node))
+        if entry is None or entry[0] != self.mode:
+            return node
+        _mode, orig, candidates = entry
+        tag = "return:" if self.mode == "return_sub" else ""
+        for cand in candidates:
+            selected = not self.applied and self.current == self.target
+            self._note(f"DATAFLOW:{tag}{orig}→{cand}")
+            self.current += 1
+            if not selected:
+                continue
+            self._mark_applied(node)
+            return ast.copy_location(ast.Name(id=cand, ctx=ast.Load()), node)
+        return node
+
+
+def _record_dataflow_dimensions(
+    func_node: ast.FunctionDef | ast.AsyncFunctionDef, mode: str
+) -> list[str]:
+    """Dimension keys for one DATAFLOW sub-mode, in transformer-visit order."""
+    tree = copy.deepcopy(func_node)
+    mutator = _DataflowMutator(-1, mode)
+    mutator.keys = []
+    mutator.visit(tree)
+    return mutator.keys
+
+
+def _count_dataflow_targets(
+    func_node: ast.FunctionDef | ast.AsyncFunctionDef, mode: str
+) -> int:
+    """Targets for one DATAFLOW sub-mode — counted by RUNNING the mutator in
+    record mode, the same one-analysis rule as every other category."""
+    return len(_record_dataflow_dimensions(func_node, mode))
+
+
+def _generate_dataflow_mutants(
+    func_node: ast.FunctionDef | ast.AsyncFunctionDef,
+    max_per_category: int | None,
+    greedy: bool = True,
+    pass_index: int = 0,
+) -> list[Mutant]:
+    """Generate DATAFLOW mutants across the sub-modes (return + loaded refs).
+
+    Mirrors ``_generate_exception_mutants``: independent sub-modes, each with
+    its own target index space, each selected against its own budget.
+    """
+    mutants: list[Mutant] = []
+    cat = MutationCategory.DATAFLOW
+
+    for mode, desc in _DATAFLOW_SUB_MODES:
+        all_keys = _record_dataflow_dimensions(func_node, mode)
+        target_count = len(all_keys)
+        keys = all_keys if greedy else []
+        budget = (
+            _live_dimension_count(keys)
+            if max_per_category is None
+            else max_per_category
+        )
+        limit = min(target_count, budget) if budget > 0 else target_count
+
+        if greedy and budget > 0 and target_count > limit:
+            selected = _select_greedy(keys, target_count, limit, pass_index)
+        else:
+            selected = list(range(limit))
+
+        for i in selected:
+            mutated_tree = copy.deepcopy(func_node)
+            transformer = _DataflowMutator(i, mode)
+            mutated_node = transformer.visit(mutated_tree)
+            ast.fix_missing_locations(mutated_node)
+
+            if transformer.applied:
+                mid = _content_mutant_id(cat, mutated_node)
+                mutants.append(
+                    Mutant(
+                        category=cat,
+                        original_node=func_node,
+                        mutated_node=mutated_node,
+                        description=f"{mid}: {desc}",
+                        location=getattr(func_node, "lineno", 0),
+                        mutant_id=mid,
+                        target_index=i,
+                        mutated_line=transformer.mutated_lineno,
+                        dimension=keys[i] if i < len(keys) else "",
+                    )
+                )
+
+    return mutants
+
+
 # ── Mutant Generation ─────────────────────────────────────────────
 
 
-def _docstring_positions(func_node: ast.FunctionDef) -> set[tuple[int, int]]:
+def _docstring_positions(
+    func_node: ast.FunctionDef | ast.AsyncFunctionDef,
+) -> set[tuple[int, int]]:
     """Return (lineno, col_offset) of docstring Constant nodes in a function.
 
     A docstring is the first statement if it's ``Expr(Constant(str))``.
@@ -1124,154 +2218,85 @@ def _docstring_positions(func_node: ast.FunctionDef) -> set[tuple[int, int]]:
     return positions
 
 
-def _count_targets(func_node: ast.FunctionDef, category: MutationCategory) -> int:
-    """Count how many mutation targets exist for a category in a function."""
-    counter = _TARGET_COUNTERS.get(category)
-    if counter is None:
-        return 0
-    # VALUE needs docstring exclusion — pass positions through.
-    if category == MutationCategory.VALUE:
-        ds_pos = _docstring_positions(func_node)
-        return sum(_count_value_target(node, ds_pos) for node in ast.walk(func_node))
-    # STMT deletability depends on what is bound BEFORE a statement, which no per-node
-    # counter can see. Same analysis the mutator runs, so the two cannot drift.
+def _count_targets(
+    func_node: ast.FunctionDef | ast.AsyncFunctionDef,
+    category: MutationCategory,
+    observed: frozenset[str] | None = None,
+) -> int:
+    """Count how many mutation targets exist for a category in a function.
+
+    Every count derives from the SAME analysis the category's mutator runs —
+    record mode for the single-transformer categories, the per-sub-mode
+    recorders for STATE/EXCEPTION, ``_deletable_stmt_ids`` for STMT,
+    ``_SwapMutator._alternatives`` for SWAP — so the counter and the
+    transformer cannot drift. This function used to dispatch over a table of
+    per-node counters that re-encoded each mutator's eligibility predicate by
+    hand; a second copy of an eligibility predicate is a defect class here,
+    not a style issue — issue #9 shipped a false ``✓ COMPLETE`` because SWAP's
+    filter proxy answered a different question than the mutator. Dead
+    dimensions (a site whose op has no swap) are counted, exactly as
+    generation will see them.
+    """
+    # STMT deletability depends on what is bound BEFORE a statement, which no
+    # per-node view can see. Same analysis the mutator runs.
     if category == MutationCategory.STMT:
         return len(_deletable_stmt_ids(func_node))
-    # EXCEPTION's sub-modes each have their own target space, and their skip rules
-    # (bare re-raise, already-``pass`` handler, untyped ``except:``) live in the
-    # mutator — so count by running it, not by re-encoding the rules here.
+    # SWAP eligibility (unwrap) depends on statement position — derive from
+    # _SwapMutator._alternatives over the same tree, so the count cannot drift
+    # from the mutator's _note calls.
+    if category == MutationCategory.SWAP:
+        stmt_ids = _stmt_call_ids(func_node)
+        bindings = _scope_bindings(func_node)
+        return sum(
+            len(_SwapMutator._alternatives(node, stmt_ids, bindings))
+            for node in ast.walk(func_node)
+            if isinstance(node, ast.Call)
+        )
+    # STATE and EXCEPTION carry independent sub-modes, each with its own
+    # target index space; count them the way generation iterates them.
+    if category == MutationCategory.STATE:
+        return sum(
+            _count_state_targets(func_node, mode) for mode, _desc in _STATE_SUB_MODES
+        )
     if category == MutationCategory.EXCEPTION:
         return sum(
             _count_exception_targets(func_node, mode)
             for mode, _desc in _EXCEPTION_SUB_MODES
         )
-    return sum(counter(node) for node in ast.walk(func_node))
+    if category == MutationCategory.DATAFLOW:
+        return sum(
+            _count_dataflow_targets(func_node, mode)
+            for mode, _desc in _DATAFLOW_SUB_MODES
+        )
+    # OUTPUT (μ⁻ Form A): independent sub-modes over return sites, same shape as EXCEPTION.
+    if category == MutationCategory.OUTPUT:
+        return (
+            sum(
+                _count_output_targets(func_node, mode)
+                for mode, _desc in _output_sub_modes(observed)
+            )
+            + _count_output_wrapper_targets(
+                func_node
+            )  # Form B: generator yield perturbations
+        )
+    # Single-transformer categories: run the mutator in record mode and count
+    # its notes. VALUE additionally needs docstring positions so documentation
+    # constants stay out of the universe.
+    ds_pos = (
+        _docstring_positions(func_node) if category == MutationCategory.VALUE else None
+    )
+    return len(_record_dimensions(func_node, category, ds_pos))
 
 
-def _count_value_target(
-    node: ast.AST,
-    docstring_positions: set[tuple[int, int]] | None = None,
-) -> int:
-    # Only count constants whose types _ValueMutator can actually mutate.
-    # None, bytes, complex, and Ellipsis are left unchanged by _mutate_constant,
-    # so counting them produces phantom mutants that always survive.
-    # Skip docstring constants — they produce equivalent mutants that waste budget.
-    if isinstance(node, ast.Constant) and isinstance(
-        node.value, _ValueMutator._MUTABLE_TYPES
-    ):
-        if (
-            docstring_positions
-            and isinstance(node.value, str)
-            and (node.lineno, node.col_offset) in docstring_positions
-        ):
-            return 0
-        return 1
-    return 0
-
-
-def _count_boundary_target(node: ast.AST) -> int:
-    if not isinstance(node, ast.Compare):
-        return 0
-    # One dimension per alternative per op (a dead op still notes once) — derive
-    # from _alternatives so this never drifts from _BoundaryMutator's _note count.
-    return sum(len(_BoundaryMutator._alternatives(op)) or 1 for op in node.ops)
-
-
-def _count_swap_target(node: ast.AST) -> int:
-    return 1 if isinstance(node, ast.Call) and len(node.args) >= 2 else 0
-
-
-def _is_self_assign(target: ast.AST) -> bool:
+def _is_self_assign(target: ast.AST) -> TypeGuard[ast.Attribute]:
+    """True exactly for a ``self.x`` write target. A TypeGuard so the caller
+    keeps the ``ast.Attribute`` narrowing (``target.attr``) the inline
+    isinstance chain used to provide."""
     return (
         isinstance(target, ast.Attribute)
         and isinstance(target.value, ast.Name)
         and target.value.id == "self"
     )
-
-
-def _count_state_assign_target(node: ast.AST) -> int:
-    """Count self.x = ... assignments (remove_assign mode)."""
-    if isinstance(node, ast.Assign):
-        return sum(1 for t in node.targets if _is_self_assign(t))
-    return 0
-
-
-def _count_state_return_target(node: ast.AST) -> int:
-    """Count return-with-value nodes (return_none mode)."""
-    if isinstance(node, ast.Return) and node.value is not None:
-        return 1
-    return 0
-
-
-def _count_state_target(node: ast.AST) -> int:
-    return _count_state_assign_target(node) + _count_state_return_target(node)
-
-
-def _count_type_target(node: ast.AST) -> int:
-    return (
-        1
-        if isinstance(node, ast.Call)
-        and isinstance(node.func, ast.Name)
-        and node.func.id == "isinstance"
-        else 0
-    )
-
-
-def _count_arithmetic_target(node: ast.AST) -> int:
-    """Count arithmetic mutation targets (BinOp + AugAssign + unary negation).
-
-    Must stay in lockstep with ``_ArithmeticMutator``'s ``visit_*`` methods —
-    the count defines the index range generation iterates, and it has to equal
-    the number of ``_note`` calls the mutator makes over the same constructs.
-    """
-    if isinstance(node, ast.BinOp) and type(node.op) in _ArithmeticMutator._BIN_SWAP:
-        return 1
-    if (
-        isinstance(node, ast.AugAssign)
-        and type(node.op) in _ArithmeticMutator._BIN_SWAP
-    ):
-        return 1
-    if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.USub):
-        return 1
-    return 0
-
-
-def _count_logical_target(node: ast.AST) -> int:
-    """Count logical mutation targets (BoolOp + not removal)."""
-    if isinstance(node, ast.BoolOp) and type(node.op) in _LogicalMutator._BOOL_SWAP:
-        return 1
-    if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.Not):
-        return 1
-    return 0
-
-
-def _count_stmt_target(node: ast.AST) -> int:
-    """Per-node STMT counter — NOT used for STMT.
-
-    STMT deletability is a FUNCTION-level property (is this name already bound?), so it
-    cannot be decided from a node in isolation the way every other category's counter can.
-    ``_count_targets`` therefore special-cases STMT and calls :func:`_deletable_stmt_ids`
-    over the whole function, exactly as ``_StmtMutator`` does — one analysis, so the
-    counter and the mutator cannot disagree about how many targets exist.
-
-    Retained only so the ``_TARGET_COUNTERS`` dispatch stays total.
-    """
-    return 0
-
-
-_TARGET_COUNTERS: dict[MutationCategory, Callable[[ast.AST], int]] = {
-    MutationCategory.VALUE: _count_value_target,
-    MutationCategory.BOUNDARY: _count_boundary_target,
-    MutationCategory.SWAP: _count_swap_target,
-    MutationCategory.STATE: _count_state_target,
-    MutationCategory.TYPE: _count_type_target,
-    MutationCategory.ARITHMETIC: _count_arithmetic_target,
-    MutationCategory.LOGICAL: _count_logical_target,
-    MutationCategory.STMT: _count_stmt_target,
-    # Like STMT, a stub: EXCEPTION is counted per sub-mode in _count_targets, which
-    # cannot be expressed as a per-node function. Present so the dispatch stays total.
-    MutationCategory.EXCEPTION: lambda _node: 0,
-}
 
 
 def _content_mutant_id(category: MutationCategory, mutated_node: ast.AST) -> str:
@@ -1290,39 +2315,57 @@ def _content_mutant_id(category: MutationCategory, mutated_node: ast.AST) -> str
     return f"{category.value}_{digest}"
 
 
+def _mutant_module(mutated_node: ast.AST) -> ast.Module:
+    """Wrap a mutant's function definition in a compilable module.
+
+    ``Mutant.mutated_node`` is declared ``ast.AST`` because it is whatever the transformer
+    returned; every producer hands back the visited ``FunctionDef``, so it is a statement in
+    practice, and ``ast.Module(body=...)`` requires exactly that. Both construction sites carried
+    ``# type: ignore[list-item]`` — the SAME silenced question written twice, which is how two
+    call sites drift into two behaviours. One owner asks it once, and a violation names the node
+    it was handed instead of failing inside ``compile``.
+    """
+    if not isinstance(mutated_node, ast.stmt):
+        raise TypeError(
+            f"a mutant body must be a statement, got {type(mutated_node).__name__}"
+        )
+    return ast.Module(body=[mutated_node], type_ignores=[])
+
+
 def _generate_state_mutants(
-    func_node: ast.FunctionDef,
+    func_node: ast.FunctionDef | ast.AsyncFunctionDef,
     max_per_category: int | None,
     greedy: bool = True,
     pass_index: int = 0,
 ) -> list[Mutant]:
-    """Generate STATE mutants across both sub-modes (assign + return).
+    """Generate STATE mutants across the sub-modes (assign + return + loop flow).
 
-    STATE has two independent sub-modes with separate target indices:
+    STATE has independent sub-modes with separate target indices:
     - remove_assign: replaces ``self.x = expr`` with ``pass``
     - return_none: replaces ``return expr`` with ``return None``
+    - loop_flow: swaps ``break`` ↔ ``continue``
 
     Each sub-mode gets its own target count and transformer pass so that
-    target indices align correctly with what the transformer visits. Under
-    ``greedy`` the assign sub-mode is ordered by distinct attribute (its
-    behavioral dimension) so a budget spreads across state fields before
-    repeating one; both sub-modes are always represented (they are two
-    distinct dimensions the greedy never collapses).
+    target indices align correctly with what the transformer visits. The
+    target count IS the record run's note count — one analysis, so the count
+    and the visit order cannot disagree. Under ``greedy`` the assign sub-mode
+    is ordered by distinct attribute (its behavioral dimension) so a budget
+    spreads across state fields before repeating one; both sub-modes are
+    always represented (they are two distinct dimensions the greedy never
+    collapses).
     """
     mutants: list[Mutant] = []
     cat = MutationCategory.STATE
 
-    sub_modes = [
-        ("remove_assign", "remove state assignment", _count_state_assign_target),
-        ("return_none", "replace return with None", _count_state_return_target),
-    ]
-
-    for mode, desc, counter in sub_modes:
-        target_count = sum(counter(node) for node in ast.walk(func_node))
+    for mode, desc in _STATE_SUB_MODES:
+        all_keys = _record_state_dimensions(func_node, mode)
+        target_count = len(all_keys)
+        # Greedy selection consumes the keys; the non-greedy path never did,
+        # and keeps its historical empty list so mutant.dimension stays "".
+        keys = all_keys if greedy else []
         # Each sub-mode is selected against its own budget; in DOF mode that is
         # the sub-mode's own degrees of freedom (distinct state fields, or the
         # single return_none dimension).
-        keys = _record_state_dimensions(func_node, mode) if greedy else []
         budget = (
             _live_dimension_count(keys)
             if max_per_category is None
@@ -1382,6 +2425,60 @@ def _is_dead(dim_key: str) -> bool:
     return dim_key == _DEAD_DIM
 
 
+def _scope_bindings(root: ast.AST) -> dict[str, str]:
+    """Provenance of every name the analyzed function's OWN scope binds (issue #5,
+    second round): ``"shadow"`` for params/assignments/def/class names — the user's
+    object, whose dual the curated table never promised — and ``"import:<module>"``
+    for import bindings, which RESOLVE: ``from math import floor`` is the curated
+    callee however it is spelled, ``from custom import min`` is not, and
+    ``import numpy as math`` makes the literal spelling ``math.floor`` a lie.
+
+    Own scope only: a nested function's parameters and locals bind ITS frame, so
+    ``def g(min): ...`` must not suppress the outer builtin ``min``'s dual — only the
+    nested def's NAME binds here. Comprehension targets are counted as shadows
+    (over-approximate: can only withhold a dimension, never fabricate one)."""
+    bindings: dict[str, str] = {}
+
+    def bind_params(fn: ast.FunctionDef | ast.AsyncFunctionDef | ast.Lambda) -> None:
+        a = fn.args
+        for x in a.posonlyargs + a.args + a.kwonlyargs:
+            bindings[x.arg] = "shadow"
+        if a.vararg:
+            bindings[a.vararg.arg] = "shadow"
+        if a.kwarg:
+            bindings[a.kwarg.arg] = "shadow"
+
+    def visit(node: ast.AST) -> None:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            bindings[node.name] = "shadow"
+            return  # a nested scope's params/locals bind ITS frame, not this one
+        if isinstance(node, ast.Lambda):
+            return
+        if isinstance(node, (ast.Import, ast.ImportFrom)):
+            for alias in node.names:
+                bound = alias.asname or alias.name.split(".")[0]
+                module = (
+                    node.module
+                    if isinstance(node, ast.ImportFrom)
+                    else alias.name.split(".")[0]
+                )
+                bindings[bound] = f"import:{module or '?'}"
+            return
+        if isinstance(node, ast.Name) and isinstance(node.ctx, (ast.Store, ast.Del)):
+            bindings[node.id] = "shadow"
+        for child in ast.iter_child_nodes(node):
+            visit(child)
+
+    if isinstance(root, (ast.FunctionDef, ast.AsyncFunctionDef)):
+        bind_params(root)
+        for stmt in root.body:
+            visit(stmt)
+    else:
+        for child in ast.iter_child_nodes(root):
+            visit(child)
+    return bindings
+
+
 def _callee_name(node: ast.Call) -> str:
     """Best-effort callable name for SWAP dimension keys."""
     f = node.func
@@ -1423,7 +2520,7 @@ _RECORD_MUTATOR_FACTORIES: dict[
 
 
 def _record_dimensions(
-    func_node: ast.FunctionDef,
+    func_node: ast.FunctionDef | ast.AsyncFunctionDef,
     category: MutationCategory,
     docstring_positions: set[tuple[int, int]] | None = None,
 ) -> list[str]:
@@ -1445,7 +2542,9 @@ def _record_dimensions(
     return mutator.keys
 
 
-def _record_state_dimensions(func_node: ast.FunctionDef, mode: str) -> list[str]:
+def _record_state_dimensions(
+    func_node: ast.FunctionDef | ast.AsyncFunctionDef, mode: str
+) -> list[str]:
     """Dimension keys for one STATE sub-mode, in transformer-visit order."""
     tree = copy.deepcopy(func_node)
     mutator = _StateMutator(-1, mode)
@@ -1454,7 +2553,25 @@ def _record_state_dimensions(func_node: ast.FunctionDef, mode: str) -> list[str]
     return mutator.keys
 
 
-def _record_exception_dimensions(func_node: ast.FunctionDef, mode: str) -> list[str]:
+_STATE_SUB_MODES = (
+    ("remove_assign", "remove state assignment"),
+    ("return_none", "replace return with None"),
+    ("loop_flow", "swap break/continue"),
+)
+
+
+def _count_state_targets(
+    func_node: ast.FunctionDef | ast.AsyncFunctionDef, mode: str
+) -> int:
+    """Targets for one STATE sub-mode. Counted by RUNNING the mutator in record
+    mode — the same one-analysis rule as ``_count_exception_targets``, so the
+    counter and the transformer cannot drift."""
+    return len(_record_state_dimensions(func_node, mode))
+
+
+def _record_exception_dimensions(
+    func_node: ast.FunctionDef | ast.AsyncFunctionDef, mode: str
+) -> list[str]:
     """Dimension keys for one EXCEPTION sub-mode, in transformer-visit order."""
     tree = copy.deepcopy(func_node)
     mutator = _ExceptionMutator(-1, mode)
@@ -1463,7 +2580,9 @@ def _record_exception_dimensions(func_node: ast.FunctionDef, mode: str) -> list[
     return mutator.keys
 
 
-def _count_exception_targets(func_node: ast.FunctionDef, mode: str) -> int:
+def _count_exception_targets(
+    func_node: ast.FunctionDef | ast.AsyncFunctionDef, mode: str
+) -> int:
     """Targets for one EXCEPTION sub-mode. Counted by RUNNING the mutator in record
     mode, so the counter and the transformer cannot drift — the skip rules (a bare
     ``raise``, an already-``pass`` handler, an untyped ``except:``) live in one place."""
@@ -1476,9 +2595,285 @@ _EXCEPTION_SUB_MODES = (
     ("handler_broaden", "widen caught exception type"),
 )
 
+# μ⁻ Form A — the always-applicable output perturbations (the independence pair + existence).
+_OUTPUT_SUB_MODES = (
+    ("return_none", "return value -> None (does any test pin that the output exists?)"),
+    ("return_const", "return value -> 0 (does the output depend on the input?)"),
+    (
+        "return_identity",
+        "return value -> first argument (is the output a non-trivial transform?)",
+    ),
+)
+
+# μ⁻ Fork 2 — the type-conditional output perturbations, keyed by observed codomain type name.
+# Emitted ONLY for an OBSERVED return type, so each is applied only where it cannot raise (the
+# type-directed AST in _OutputMutator._perturbed). The certificate then names the observed codomain
+# as its observing set; the two-sign policy id and the static census stay Fork-1, so Fork 2's reach
+# is a per-run observing-set extension, not a policy change.
+_OUTPUT_TYPE_CONDITIONAL = (
+    (
+        "return_negate",
+        "return value -> its negation (is the sign load-bearing?)",
+        frozenset({"int", "float"}),
+    ),
+    (
+        "return_abs",
+        "return value -> its absolute value (can the output be negative?)",
+        frozenset({"int", "float"}),
+    ),
+    (
+        "return_nan",
+        "return value -> NaN (must the output be a finite number?)",
+        frozenset({"float"}),
+    ),
+    (
+        "return_empty",
+        "return value -> the type's empty (is length/content load-bearing?)",
+        frozenset({"str", "bytes", "list", "tuple", "dict", "set", "frozenset"}),
+    ),
+    (
+        "return_reorder",
+        "return value -> reversed (is order load-bearing?)",
+        frozenset({"list", "tuple"}),
+    ),
+)
+
+
+def output_mode_applies(observed: frozenset[str], applicable: frozenset[str]) -> bool:
+    """Whether a type-conditional μ⁻ OUTPUT perturbation is APPLICABLE to an observed return set
+    (Def. 11.10/Prop. 11.11, pure — pinned).
+
+    Fork 2 rewrites the return SITE STATICALLY — `return X` -> `return -X` fires on every branch — so a
+    perturbation is only sound if it applies to EVERY observed return, not merely to one. The engine used
+    `observed & types` (any-intersection), which for a heterogeneous return like `int | str` generated
+    `return_negate` off the `int` and then raised on the `str` branch: the mis-typed perturbation Def. 7.3
+    calls a source-(b) `undefined`. Requiring `observed <= applicable` (every observed type applicable)
+    makes Fork 2 "sound by restriction" as the paper claims — the perturbation is never generated where it
+    could raise, so no `undefined` ever arises. A heterogeneous return simply forgoes the type-conditional
+    perturbation (the honest Fork-1-style restriction), never a crash-scored phantom value gap.
+
+    Empty ``observed`` (nothing harvested / an unobservable return) is NOT applicable to any
+    type-conditional mode — only the always-applicable Fork-1 set is emitted there, handled by the caller.
+    """
+    return bool(observed) and observed <= applicable
+
+
+def _output_sub_modes(
+    observed: frozenset[str] | None = None,
+) -> tuple[tuple[str, str], ...]:
+    """The OUTPUT sub-mode list — the SINGLE SOURCE for both counting and generation, so
+    count == generation by construction (the issue-#9 invariant) whatever ``observed`` is.
+
+    ``observed`` is the set of return-type names harvested from a baseline run (μ⁻ Fork 2). With it,
+    the type-conditional perturbations whose type is present are appended; without it (the static
+    census, or an unobservable return) only the always-applicable Fork-1 set is returned.
+    """
+    modes = list(_OUTPUT_SUB_MODES)
+    if observed:
+        modes.extend(
+            (name, desc)
+            for name, desc, types in _OUTPUT_TYPE_CONDITIONAL
+            if output_mode_applies(observed, types)
+        )
+    return tuple(modes)
+
+
+# μ⁻ Form B — runtime-wrapper perturbations of the NON-RETURN codomain. First sibling: generators,
+# whose codomain is the yielded SEQUENCE (the return-site rewrite of Form A cannot reach it). One
+# wrapper mutant per sub-mode; the perturbation is a pure iterator transform, so it never raises.
+_OUTPUT_YIELD_SUB_MODES = (
+    (
+        "yield_truncate",
+        "yielded sequence -> drop the last item (is the final yield pinned?)",
+    ),
+    (
+        "yield_drop_first",
+        "yielded sequence -> drop the first item (is the first yield pinned?)",
+    ),
+    (
+        "yield_duplicate_last",
+        "yielded sequence -> repeat the last item (is multiplicity pinned?)",
+    ),
+    (
+        "yield_empty",
+        "yielded sequence -> nothing (does any test pin that it yields at all?)",
+    ),
+)
+
+# Bounds an INFINITE generator so a wrapper can never hang the evaluator; high enough not to bite a
+# real finite sequence. A wrapper materializes at most this many items before perturbing.
+_GENERATOR_MATERIALIZE_CAP = 10_000
+
+
+def _has_own_yield(func_node: ast.FunctionDef | ast.AsyncFunctionDef) -> bool:
+    """True when the function's OWN body yields — its codomain is the yielded sequence. A yield
+    inside a NESTED def/lambda is that scope's, not this function's, so nested scopes are not
+    descended into."""
+    stack = list(func_node.body)
+    while stack:
+        n = stack.pop()
+        if isinstance(n, (ast.Yield, ast.YieldFrom)):
+            return True
+        if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+            continue  # a nested scope's yields are not this function's codomain
+        stack.extend(ast.iter_child_nodes(n))
+    return False
+
+
+def _perturb_yields(items: list, mode: str) -> list:
+    """The yielded-sequence perturbation for one Form-B sub-mode. Pure list transform; a no-op on
+    some inputs (e.g. truncate/drop on an empty sequence) simply yields a runtime candidate-equivalent."""
+    if mode == "yield_truncate":
+        return items[:-1]
+    if mode == "yield_drop_first":
+        return items[1:]
+    if mode == "yield_duplicate_last":
+        return items + items[-1:]
+    if mode == "yield_empty":
+        return []
+    return items
+
+
+def _make_generator_wrapper(
+    mode: str,
+) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
+    """A factory ``original -> wrapped``: the wrapped generator materializes the original's yields
+    (bounded by :data:`_GENERATOR_MATERIALIZE_CAP`), perturbs the sequence, and re-yields. Returned
+    from generation and CALLED by ``evaluate_mutant`` on the live original — never compiled."""
+
+    def factory(original: Callable[..., Any]) -> Callable[..., Any]:
+        def wrapped(*args: Any, **kwargs: Any) -> Any:
+            items = list(
+                itertools.islice(original(*args, **kwargs), _GENERATOR_MATERIALIZE_CAP)
+            )
+            yield from _perturb_yields(items, mode)
+
+        return wrapped
+
+    return factory
+
+
+def _generate_output_wrappers(
+    func_node: ast.FunctionDef | ast.AsyncFunctionDef,
+) -> list[Mutant]:
+    """μ⁻ Form B wrapper mutants for a generator target — one per yield sub-mode, or none if the
+    function does not yield. Each is a :class:`Mutant` carrying a ``wrapper_factory`` (so
+    ``evaluate_mutant`` builds the object by wrapping the original) and a per-mode SYNTHETIC marker
+    node, present only so the content-addressed id and diff stay distinct — it is never compiled."""
+    if not _has_own_yield(func_node):
+        return []
+    cat = MutationCategory.OUTPUT
+    lineno = getattr(func_node, "lineno", 0)
+    mutants: list[Mutant] = []
+    for mode, desc in _OUTPUT_YIELD_SUB_MODES:
+        marker = ast.Expr(value=ast.Constant(value=f"WRAPPER:{mode}:{lineno}"))
+        ast.fix_missing_locations(marker)
+        mid = _content_mutant_id(cat, marker)
+        mutants.append(
+            Mutant(
+                category=cat,
+                original_node=func_node,
+                mutated_node=marker,
+                description=f"{mid}: {desc}",
+                location=lineno,
+                mutant_id=mid,
+                target_index=0,
+                mutated_line=lineno,
+                dimension=f"OUTPUT:{mode}:{lineno}",
+                wrapper_factory=_make_generator_wrapper(mode),
+            )
+        )
+    return mutants
+
+
+def _count_output_wrapper_targets(
+    func_node: ast.FunctionDef | ast.AsyncFunctionDef,
+) -> int:
+    """Wrapper (Form B) OUTPUT targets — one per yield sub-mode for a generator, else zero. Derived
+    from the same generator test the generator uses, so count == generation."""
+    return len(_OUTPUT_YIELD_SUB_MODES) if _has_own_yield(func_node) else 0
+
+
+def _record_output_dimensions(
+    func_node: ast.FunctionDef | ast.AsyncFunctionDef, mode: str
+) -> list[str]:
+    """Dimension keys for one OUTPUT (μ⁻) sub-mode, in transformer-visit order."""
+    tree = copy.deepcopy(func_node)
+    mutator = _OutputMutator(-1, mode)
+    mutator.keys = []
+    mutator.visit(tree)
+    return mutator.keys
+
+
+def _count_output_targets(
+    func_node: ast.FunctionDef | ast.AsyncFunctionDef, mode: str
+) -> int:
+    """Targets for one OUTPUT sub-mode. Counted by RUNNING the mutator in record mode, so the
+    counter and the transformer cannot drift — the no-op and eligibility skips live in exactly
+    one place (``_OutputMutator._perturbed``)."""
+    return len(_record_output_dimensions(func_node, mode))
+
+
+def _generate_output_perturbations(
+    func_node: ast.FunctionDef | ast.AsyncFunctionDef,
+    max_per_category: int | None,
+    greedy: bool = True,
+    pass_index: int = 0,
+    observed: frozenset[str] | None = None,
+) -> list[Mutant]:
+    """Generate OUTPUT (μ⁻ Form A) perturbations across all sub-modes.
+
+    Same shape as :func:`_generate_exception_mutants`: each sub-mode has its own target index
+    space and budget, so a function with no eligible identity target spends nothing on
+    ``return_identity``. Each perturbation is an ordinary :class:`Mutant` carrying a real
+    ``mutated_node`` (a rewritten return), so it flows through the shared evaluate/score/cover
+    pipeline unchanged.
+    """
+    mutants: list[Mutant] = []
+    cat = MutationCategory.OUTPUT
+
+    for mode, desc in _output_sub_modes(observed):
+        keys = _record_output_dimensions(func_node, mode) if greedy else []
+        target_count = len(keys) if greedy else _count_output_targets(func_node, mode)
+        budget = (
+            _live_dimension_count(keys)
+            if max_per_category is None
+            else max_per_category
+        )
+        limit = min(target_count, budget) if budget > 0 else target_count
+
+        if greedy and budget > 0 and target_count > limit:
+            selected = _select_greedy(keys, target_count, limit, pass_index)
+        else:
+            selected = list(range(limit))
+
+        for i in selected:
+            mutated_tree = copy.deepcopy(func_node)
+            transformer = _OutputMutator(i, mode)
+            mutated_node = transformer.visit(mutated_tree)
+            ast.fix_missing_locations(mutated_node)
+
+            if transformer.applied:
+                mid = _content_mutant_id(cat, mutated_node)
+                mutants.append(
+                    Mutant(
+                        category=cat,
+                        original_node=func_node,
+                        mutated_node=mutated_node,
+                        description=f"{mid}: {desc}",
+                        location=getattr(func_node, "lineno", 0),
+                        mutant_id=mid,
+                        target_index=i,
+                        mutated_line=transformer.mutated_lineno,
+                        dimension=keys[i] if i < len(keys) else "",
+                    )
+                )
+
+    return mutants
+
 
 def _generate_exception_mutants(
-    func_node: ast.FunctionDef,
+    func_node: ast.FunctionDef | ast.AsyncFunctionDef,
     max_per_category: int | None,
     greedy: bool = True,
     pass_index: int = 0,
@@ -1573,7 +2968,20 @@ class SessionBaseline:
     which would turn a timing accident into a false completeness verdict.
     """
 
-    __slots__ = ("traced", "failing", "inert", "n_tests", "truncated")
+    __slots__ = (
+        "traced",
+        "failing",
+        "inert",
+        "n_tests",
+        "truncated",
+        "inert_ids",
+        "uncontained",
+        "arcs",
+        "replayed",
+        "identity_standing",
+        "identity_conflicts",
+        "proof_basis",
+    )
 
     def __init__(
         self,
@@ -1582,12 +2990,47 @@ class SessionBaseline:
         inert: set[int],
         n_tests: int,
         truncated: set[str] | None = None,
+        inert_ids: set[str] | None = None,
+        uncontained: set[str] | None = None,
+        arcs: dict[str, dict[str, set[tuple[int, int]]]] | None = None,
+        replayed: set[str] | None = None,
     ) -> None:
         self.traced = traced
         self.failing = failing
         self.inert = inert
         self.n_tests = n_tests
         self.truncated = truncated or set()
+        # Per-TestId branch edges, keyed exactly like `traced` (#17). Empty on an older baseline or
+        # a build that did not request arcs; a consumer reads it as "no arc evidence", never as
+        # "no branch reached". Spliced by `affected` in `replaced`, since it is test-id-keyed.
+        self.arcs = arcs or {}
+        # `inert` addressed by TEST ID rather than `id()` (issue #17). The `id()` form is a
+        # fact about THIS heap and cannot key the traced map, which is why line completeness
+        # was judged from a union that still contained baseline-failing tests: the engine knew
+        # which CALLABLES were barred from kill attribution and had no way to say which TRACE
+        # ENTRIES they owned. Both are kept — `inert` stays the attribution filter (exact, and
+        # cheap on object identity), this is the evidence filter.
+        self.inert_ids = inert_ids or set()
+        # Tests whose traced worker hit the budget and could NOT be confirmed stopped (#19).
+        # Strictly worse than `truncated`: that one is under-counted coverage, this one means a
+        # runaway is still executing in this process, so every LATER measurement in the session
+        # shares it. #14 made the mutation runner refuse to gate on that condition; the baseline
+        # trace reached it through a path that discarded the answer.
+        self.uncontained = uncontained or set()
+        # Tests whose reach was REPLAYED from the trace cache, not measured this session (#20). Kept
+        # apart from the freshly-traced ones so the proof view can refuse a replay (source-keyed reach
+        # can go stale under a fixture/config change) while routing still uses it. Empty on a cold
+        # cache or the pre-#20 path — nothing replayed means every trace is fresh and admissible.
+        self.replayed = replayed or set()
+        # The live collection's OWN module-identity standing, conflicting names, and node-ID proof
+        # basis (#58), captured ONCE under the session scope by `build_session_baseline`, where the
+        # manifest is admissible. Defaulted here so a baseline built by any other path reads as
+        # `unobserved` with an empty basis — never a false frozen basis. The per-mutant collect-only
+        # discoveries overwrite `_LAST_MANIFEST`, so a read at result-assembly time finds scope 0;
+        # storing it on the once-per-session baseline is the one place it stays admissible.
+        self.identity_standing: str = "unobserved"
+        self.identity_conflicts: tuple[str, ...] = ()
+        self.proof_basis: tuple[tuple[str, str], ...] = ()
 
     def replaced(
         self,
@@ -1621,12 +3064,30 @@ class SessionBaseline:
         """
         traced = {k: v for k, v in self.traced.items() if k not in affected}
         traced.update(partial.traced)
+        # Arcs splice exactly like `traced` — same test-id keys, same affected set — so a rewritten
+        # test's old branch edges drop with its old line trace and the re-measured ones take over.
+        arcs = {k: v for k, v in self.arcs.items() if k not in affected}
+        arcs.update(partial.arcs)
         return SessionBaseline(
             traced,
             [n for n in self.failing if n not in affected] + partial.failing,
             {i for i in self.inert if i not in removed_ids} | partial.inert,
             n_tests,
             {n for n in self.truncated if n not in affected} | partial.truncated,
+            # Spliced by AFFECTED like the other id-keyed sets, not by `removed_ids`: this one
+            # is addressed by test id, so a re-measured test's old verdict must drop with its
+            # old trace entry or a rewritten test keeps the previous version's outcome.
+            {n for n in self.inert_ids if n not in affected} | partial.inert_ids,
+            # NOT spliced by `affected`: a runaway this session could not stop is a fact about
+            # the PROCESS, not about the test that started it. Re-tracing that test cannot
+            # retract it, and dropping the entry would let a rewritten file quietly restore
+            # gateability to a session that is still hosting the thread.
+            self.uncontained | partial.uncontained,
+            arcs,
+            # A re-traced test is FRESHLY measured, so it LEAVES `replayed` — spliced by `affected`
+            # like the other id-keyed sets. `partial.replayed` is a fresh miss (empty), so this just
+            # drops the re-measured names from the replay set, promoting them back to admissible (#20).
+            {n for n in self.replayed if n not in affected} | partial.replayed,
         )
 
 
@@ -1652,12 +3113,13 @@ class LazySessionBaseline:
     Whatever wraps this must therefore live in the closure, not around the site that stores it.
     """
 
-    __slots__ = ("_build", "_value", "_built", "_budgets")
+    __slots__ = ("_build", "_value", "_built", "_budgets", "_regime_digest")
 
     def __init__(
         self,
         build: Callable[..., SessionBaseline],
         budgets: tuple[float | None, float | None] | None = None,
+        regime_digest: str = "",
     ) -> None:
         # Takes an optional subset of callables: the same closure builds the whole baseline
         # (subset=None) and the partial one `refresh` splices in, so both are measured under
@@ -1666,13 +3128,29 @@ class LazySessionBaseline:
         self._value: SessionBaseline | None = None
         self._built = False
         self._budgets = budgets
+        # The pytest execution-regime digest of THIS session's collection (#63), fixed when the
+        # closure is stored — like the budgets above, readable without forcing the trace, so a cache
+        # key can bind the regime a verdict was measured under before deciding to measure at all.
+        self._regime_digest = regime_digest
 
     def get(self) -> SessionBaseline:
-        """The baseline, building it on first call. Memoised — the pass runs at most once."""
+        """The baseline, building it on first call. Memoised — the pass runs at most once.
+
+        `_built` and `_value` encode ONE state in two fields, and only their agreement made the
+        return type honest — `_built is True` implies `_value is not None`, which nothing checks
+        and which a future `reset()` or a partial-refresh splice could break without touching
+        this method. The invariant is now asserted where it is relied on, so a violation names
+        the broken memo instead of returning `None` to a caller annotated `SessionBaseline`.
+        """
         if not self._built:
             self._value = self._build()
             self._built = True
-        return self._value  # type: ignore[return-value]
+        if self._value is None:
+            raise RuntimeError(
+                "LazySessionBaseline memo is inconsistent: built but empty. "
+                "The build closure must return a SessionBaseline, never None."
+            )
+        return self._value
 
     @property
     def built(self) -> bool:
@@ -1690,6 +3168,18 @@ class LazySessionBaseline:
         to avoid would defeat the laziness above.
         """
         return self._budgets
+
+    @property
+    def regime_digest(self) -> str:
+        """The pytest execution-regime digest of this session's collection, or ``""`` (#63).
+
+        Readable WITHOUT forcing the build, for the same reason and the same caller as ``budgets``:
+        the regime is fixed by the session's collection (which already happened when this holder was
+        stored), so a cache key can bind it before deciding whether it needs to measure at all. Empty
+        outside a live session or when no manifest was captured — the caller must then leave its key
+        unchanged, never invent a regime.
+        """
+        return self._regime_digest
 
     def invalidate(self) -> None:
         """Discard the built baseline so the next read rebuilds it from the CURRENT suite.
@@ -1745,6 +3235,117 @@ class LazySessionBaseline:
             return False
         return True
 
+    def freshen_proof(self, covering: list[Callable[..., None]]) -> bool:
+        """Re-observe the PROOF-facing tests FRESH this session, so their reach leaves `replayed`.
+
+        The persistent trace cache serves a test's line reach by source key, and a replayed reach is
+        inadmissible for proof (#20): it was not observed under THIS session's fixtures / conftest /
+        config, so a warm run's certificate rested on an empty admissible ledger and reported a false
+        gap. `refresh` cannot fix it — its partial `_build` consults the same cache and simply replays
+        the rows. This re-traces exactly `covering` with the cache BYPASSED (`fresh=True`), so
+        `partial.replayed` is empty and `replaced` promotes those tests back to admissible. The cache
+        stays a shortlist; execution this session is the certificate. SELECTIVE by design — only this
+        function's covering tests are re-measured, never the suite — and it DEGRADES to a no-op on any
+        failure, exactly like `refresh`: a half-spliced basis would under-report coverage, which is the
+        false survivor the live session exists to prevent.
+        """
+        from Wesker.ci import callable_test_id
+
+        if not self._built or self._value is None or not covering:
+            return False
+        # Only a test whose reach was REPLAYED needs re-observing; a freshly-traced one is already
+        # admissible and re-tracing it is a wasted double-trace on a cold run. Nothing replayed in the
+        # covering set means nothing to promote — a true no-op.
+        replayed = self._value.replayed
+        covering = [t for t in covering if callable_test_id(t) in replayed]
+        if not covering:
+            return False
+        try:
+            affected = {callable_test_id(t) for t in covering}
+            # Drop the affected callables' id-keyed `inert` entries too: a cache-FAILING test that
+            # PASSES fresh this session must leave `inert`, not only `inert_ids`, or a rebuilt scope
+            # keeps excluding a freshly-green test. Same objects (re-traced, not re-collected) so ids
+            # match; `partial.inert` re-adds only the ones that still fail.
+            removed = {id(t) for t in covering}
+            partial = self._build(covering, fresh=True)
+            spliced = self._value.replaced(
+                affected, removed, partial, self._value.n_tests
+            )
+            # Collection IDENTITY (#58) is about WHICH tests were collected; freshening RE-TRACES
+            # existing items, it does not re-collect, so self's basis is authoritative. Set it HERE,
+            # not in shared `replaced`: its other caller (`refresh` after a write) DID re-collect and
+            # must not inherit a stale-confirmed basis.
+            spliced.identity_standing = self._value.identity_standing
+            spliced.identity_conflicts = self._value.identity_conflicts
+            spliced.proof_basis = self._value.proof_basis
+            self._value = spliced
+        except Exception:  # noqa: BLE001 — see `refresh`: correctness over speed
+            self.invalidate()
+            return False
+        return True
+
+    def seed(self, candidates: list[Callable[..., None]]) -> None:
+        """Build the baseline over ONLY the routed candidate subset, not the whole suite (#15,
+        target-first). The first forced read measures ``candidates`` instead of ``get()``'s full
+        collection, so a function whose teaching basis is a handful of tests never traces the other
+        hundreds. A no-op once built (seeded or full), so the once-per-session guarantee holds; the
+        DRIVER widens a seeded basis with :meth:`expand` when a mutant survives the seed.
+        """
+        if self._built:
+            return
+        # A prior trace may decide ORDER, never proof. In particular, a cached negative can become
+        # positive after fixture/module context changes; measuring the small candidate basis fresh
+        # makes stale reach structurally incapable of producing a false survivor (#15/#20).
+        self._value = self._build(candidates, fresh=True)
+        self._built = True
+
+    def expand(self, more: list[Callable[..., None]]) -> bool:
+        """Widen a seeded baseline by measuring ``more`` and splicing them in — lazy widening.
+
+        Nothing is dropped (``affected`` is empty): the existing seeded coverage stays and the new
+        tests are added, so a mutant that survived the seed can be re-evaluated against the widened
+        basis. Returns False (a no-op) when there is nothing built to widen or nothing to add.
+
+        DEGRADES to :meth:`invalidate`, never to a wrong answer — exactly like :meth:`refresh`. A
+        partial build runs the consumer's test code and can fail; a half-spliced basis would
+        under-report coverage, and an under-covered test is one the mutation loop never runs — a
+        false survivor. So the widening can be skipped (the next read re-traces in full) but can
+        never be half-applied.
+        """
+        if not self._built or self._value is None or not more:
+            return False
+        try:
+            # fresh=True bypasses the trace cache: a widened test's reach must be observed THIS
+            # session, never replayed. A stale cached "covers no target line" would drop the test
+            # from `_tests_for`, hiding a real kill as a false survivor (#Fix-B/#20) — the one thing
+            # the widen exists to prevent. The seed's own reach is freshened separately by
+            # `freshen_proof`; the widened tests have no such pass, so they must be fresh here.
+            partial = self._build(more, fresh=True)
+            self._value = self._value.replaced(
+                set(), set(), partial, self._value.n_tests + partial.n_tests
+            )
+        except Exception:  # noqa: BLE001 — see `refresh`: correctness over speed
+            self.invalidate()
+            return False
+        return True
+
+    def fork(self) -> "LazySessionBaseline":
+        """A fresh, UNBUILT holder over the same build closure, budgets, and regime — for a
+        per-function seeded baseline that must not contaminate the session's shared holder (Fix B #1).
+
+        The session baseline is shared across every function profiled in a session; seeding it with
+        ONE function's candidates leaves a truthy trace map whose entries intersect a SIBLING's lines
+        to empty sets, so ``_tests_for`` selects nothing and the sibling reports false survivors
+        (reproduced: a baseline seeded for `alpha` killed 0/3 of `beta`'s mutants). A target-first
+        driver therefore forks its OWN holder, seeds its candidates, and installs it for the duration
+        of that one function's profiling — the shared holder and every other function's are untouched.
+        Session identity is read from :func:`session_identity`, not from the baseline, so a fork
+        carries no per-function identity to lose.
+        """
+        return LazySessionBaseline(
+            self._build, budgets=self._budgets, regime_digest=self._regime_digest
+        )
+
 
 # Set only by the live-session path; None everywhere else, so every existing caller
 # (Detective included) keeps the exact per-function behaviour it has today.
@@ -1763,6 +3364,59 @@ def session_baseline() -> SessionBaseline | None:
     return holder.get() if holder is not None else None
 
 
+# Session-level module identity (#5/#58), captured ONCE at session setup where the collection manifest
+# is admissible. It lives HERE, not on any function's baseline: a per-function fork or a widen splice
+# mutates the baseline, and identity is a SESSION fact (about the collection), so an exact kill matrix
+# must never ship with a discarded certificate basis (`identity=unobserved, proof_basis=()`).
+_SESSION_IDENTITY: ContextVar[
+    tuple[str, tuple[str, ...], tuple[tuple[str, str], ...]] | None
+] = ContextVar("wesker_session_identity", default=None)
+
+
+def session_identity() -> (
+    tuple[str, tuple[str, ...], tuple[tuple[str, str], ...]] | None
+):
+    """The live collection's ``(standing, conflicts, proof_basis)`` for THIS session, or None outside
+    one. Read from the session ContextVar, never from a (mutable) baseline — see ``_SESSION_IDENTITY``.
+    A standalone profile has no session identity here and does its own ``_live_collection_identity``.
+    """
+    return _SESSION_IDENTITY.get()
+
+
+def _freshen_proof_covering(
+    test_functions: list[Callable[..., None]],
+    line_cov: dict[str, list[int]],
+    exec_lines: list[int],
+    scope_tests: bool,
+) -> bool:
+    """Re-observe THIS function's covering tests FRESH before the mutation loop, so a reach the
+    trace cache replayed leaves the admissible ledger — the certificate then stops reporting a false
+    gap on a warm run (#20). The persistent cache keeps its ROUTING value (``line_cov`` here was
+    built through it), but PROOF rests on execution this session. Selective: only tests whose reach
+    touches this function's executable lines are re-measured, never the suite. Called from BOTH
+    profiling entry points, next to the shared ``_build_test_scope``, so the two cannot drift.
+
+    Returns True iff the baseline was spliced — the caller MUST then re-derive its whole scope
+    (`_tests_for`, `line_cov`, arcs, `failing`) from the freshened basis with FRESH containers, or it
+    keeps consuming the pre-freshen local coverage and relabels those STALE cached lines admissible
+    (the very thing this exists to stop). No-op (False) without a live session, without scoping, or
+    when nothing covering was replayed.
+    """
+    holder = _SESSION_BASELINE.get()
+    if holder is None or not scope_tests or not exec_lines:
+        return False
+    from Wesker.ci import callable_test_id
+
+    exec_set = set(exec_lines)
+    covering_ids = {
+        tid for tid, lines in line_cov.items() if exec_set.intersection(lines)
+    }
+    if not covering_ids:
+        return False
+    covering = [t for t in test_functions if callable_test_id(t) in covering_ids]
+    return bool(covering) and holder.freshen_proof(covering)
+
+
 def session_budgets() -> tuple[float | None, float | None] | None:
     """The ``(per_test, session)`` trace budgets the live session's baseline is built under, or
     None outside a live session. Does NOT force the build.
@@ -1778,6 +3432,19 @@ def session_budgets() -> tuple[float | None, float | None] | None:
     return holder.budgets if holder is not None else None
 
 
+def session_regime_digest() -> str:
+    """The pytest execution-regime digest the live session's baseline is built under, or ``""``
+    outside a live session (#63). Does NOT force the build — mirrors :func:`session_budgets`.
+
+    The read point for "which pytest regime produced this verdict". A consumer that caches a verdict
+    must key it on this, or a warm verdict measured under one regime (plugin set / import mode /
+    rootdir / ini) is served to a run under another. Empty means no live session or no captured
+    manifest — the caller leaves its key unchanged rather than invent a regime.
+    """
+    holder = _SESSION_BASELINE.get()
+    return holder.regime_digest if holder is not None else ""
+
+
 def build_session_baseline(
     test_functions: list[Callable[..., None]],
     target_files: set[str],
@@ -1786,6 +3453,9 @@ def build_session_baseline(
     trace_progress: Callable[[int, int, float], None] | None = None,
     trace_session_budget_s: float | None = DEFAULT_TRACE_SESSION_BUDGET_S,
     project_root: str | None = None,
+    fresh: bool = False,
+    regime_digest: str = "",
+    within_run: dict | None = None,
 ) -> SessionBaseline:
     """Run the suite-global baseline passes ONCE. See :class:`SessionBaseline`.
 
@@ -1806,6 +3476,13 @@ def build_session_baseline(
     silent hang, not a slow answer. ``None`` = unbounded = the historical behavior.
     """
     from Wesker import trace_cache  # local: trace_cache imports nothing from engine
+    from Wesker.ci import _PROJECT_ROOT, callable_test_id
+
+    # Publish the session root BEFORE anything is keyed. Every id minted from here on —
+    # the traced map below, and the kill vocabulary inside `evaluate_mutant` several frames
+    # away — reads it, so the two agree by construction rather than by threading (issue #16).
+    if project_root is not None:
+        _PROJECT_ROOT.set(project_root)
 
     # Both passes below measure a CONSTANT: the trace is function-independent (see `trace_suite`),
     # and so is "does this test pass on the unmutated original". They were re-run per invocation
@@ -1813,12 +3490,23 @@ def build_session_baseline(
     # every later one does not. Off (project_root=None) it behaves exactly as before.
     budgets = (trace_budget_s, trace_session_budget_s)
     targets_fp = trace_cache.targets_fingerprint(target_files) if project_root else ""
-    cache = (
-        trace_cache.load(project_root, targets_fp, budgets) if project_root else None
+    persisted_cache = (
+        trace_cache.load(project_root, targets_fp, budgets, regime_digest)
+        if project_root
+        else None
     )
-    before = len(cache) if cache is not None else 0
+    # A proof-facing partial bypasses every cache READ, but still writes its fresh observation back
+    # below. That is how one function's widen becomes routing evidence for a sibling in the same
+    # file without ever becoming the sibling's proof basis (#15/#20).
+    cache = {} if (fresh and project_root) else persisted_cache
 
     truncated: set[str] = set()
+    uncontained: set[str] = set()
+    # Reach served from the cache, not measured this session (#20) — routing-usable, proof-inadmissible.
+    replayed: set[str] = set()
+    # Branch edges alongside statements (#17), populated from the v4 cache cell on a hit and from a
+    # fresh trace on a miss — so a warm session carries arcs without re-tracing for them.
+    arcs: dict[str, dict[str, set[tuple[int, int]]]] = {}
     traced = _trace_suite(
         test_functions,
         target_files,
@@ -1827,44 +3515,153 @@ def build_session_baseline(
         trace_progress,
         trace_session_budget_s,
         cache,
+        uncontained,
+        arcs,
+        replayed,
+        within_run=within_run,
     )
     failing: list[str] = []
     inert: set[int] = set()
     # `inert` is keyed by id() — a fact about THIS heap — so it can never be read from disk.
     # The NAMES are what persist; the ids are rebuilt here against the live callables. Same
     # information, addressed by something that survives a process boundary.
-    cached_failing, cached_inert = (
-        trace_cache.load_outcomes(project_root)
-        if (project_root and cache)
-        else ([], [])
+    prior_failing, prior_inert, prior_outcomes, prior_outcome_fps = (
+        trace_cache.load_outcomes(project_root, targets_fp, budgets, regime_digest)
+        if (project_root and persisted_cache)
+        else ([], [], [], {})
     )
-    reuse_outcomes = bool(cache) and before > 0 and len(cache) == before
-    if reuse_outcomes:
-        inert_names = set(cached_inert)
-        failing = list(cached_failing)
-        inert = {
-            id(t) for t in test_functions if getattr(t, "__name__", "") in inert_names
-        }
-    else:
-        inert_names_out: list[str] = []
-        for test_fn in test_functions:
-            outcome = _run_test_with_timeout(test_fn, None, True, timeout_ms)
-            if outcome is not None:
-                inert.add(id(test_fn))
-                inert_names_out.append(getattr(test_fn, "__name__", "unknown"))
-                if outcome == "assertion":
-                    # An assertion that fails on correct code is a WRONG EXPECTATION — the
-                    # narrower thing failing_on_baseline reports to a human. Other outcomes
-                    # are ambiguous and are barred from attribution without accusation.
-                    failing.append(getattr(test_fn, "__name__", "unknown"))
-        cached_inert = inert_names_out
-    if project_root and cache is not None and not truncated:
-        # Never persist a truncated pass: what a budget cut is absent, not zero, and a cache
-        # that remembers the cut serves a false gap forever.
+    entries_out = dict(persisted_cache or {})
+    entries_out.update(cache or {})
+    if project_root and cache is not None:
+        # CHECKPOINT REACH BEFORE the second (plain outcome) pass. An interruption there must not
+        # erase the exact trace just paid for. Outcome qualification is separately keyed per TestId
+        # below, so a checkpointed item with no outcome is re-run, never assumed green (#15/#17).
         trace_cache.save(
-            project_root, targets_fp, budgets, cache, failing, list(cached_inert)
+            project_root,
+            targets_fp,
+            budgets,
+            entries_out,
+            prior_failing,
+            prior_inert,
+            regime_digest,
+            prior_outcomes,
+            prior_outcome_fps,
         )
-    return SessionBaseline(traced, failing, inert, len(test_functions), truncated)
+
+    prior_failing_set = set(prior_failing)
+    prior_inert_set = set(prior_inert)
+    prior_outcome_set = set(prior_outcomes)
+    current_ids = {callable_test_id(t) for t in test_functions}
+    current_inert: list[str] = []
+    current_outcomes: set[str] = set()
+    current_outcome_fps: dict[str, str] = {}
+    for test_fn in test_functions:
+        test_id = callable_test_id(test_fn)
+        test_fp = trace_cache.test_fingerprint(test_fn)
+        # A proof-facing fresh partial re-observes outcome as well as reach. A normal warm build may
+        # reuse an exact per-TestId outcome; absence means unmeasured, not green.
+        if (
+            not fresh
+            and test_id in prior_outcome_set
+            and prior_outcome_fps.get(test_id) == test_fp
+        ):
+            outcome = (
+                "assertion"
+                if test_id in prior_failing_set
+                else ("inert" if test_id in prior_inert_set else None)
+            )
+        else:
+            outcome = _run_test_with_timeout(test_fn, None, True, timeout_ms)
+        current_outcomes.add(test_id)
+        current_outcome_fps[test_id] = test_fp
+        if outcome is not None:
+            inert.add(id(test_fn))
+            current_inert.append(test_id)
+            if outcome == "assertion":
+                # An assertion that fails on correct code is a WRONG EXPECTATION — the
+                # narrower thing failing_on_baseline reports to a human. Other outcomes
+                # are ambiguous and are barred from attribution without accusation.
+                failing.append(test_id)
+    if project_root and cache is not None:
+        # Persist the individually COMPLETE cells even when a sibling was cut. `trace_suite` never
+        # inserts a cut cell, so that TestId remains absent/UNKNOWN on the next run; discarding the
+        # other N-1 exact observations because one item timed out defeats per-TestId routing and is
+        # unnecessary. What is forbidden is persisting the CUT item, not the safe remainder (#15).
+        # Replace the current subset's outcome cells and preserve every other TestId. This is the
+        # outcome analogue of the trace splice above; exact identities make partial persistence
+        # deterministic rather than all-or-nothing.
+        failing_out = [tid for tid in prior_failing if tid not in current_ids] + failing
+        inert_out = [
+            tid for tid in prior_inert if tid not in current_ids
+        ] + current_inert
+        outcomes_out = sorted((prior_outcome_set - current_ids) | current_outcomes)
+        outcome_fps_out = {
+            tid: fp for tid, fp in prior_outcome_fps.items() if tid not in current_ids
+        }
+        outcome_fps_out.update(current_outcome_fps)
+        trace_cache.save(
+            project_root,
+            targets_fp,
+            budgets,
+            entries_out,
+            failing_out,
+            inert_out,
+            regime_digest,
+            outcomes_out,
+            outcome_fps_out,
+        )
+    # Capture the live collection's OWN identity + node-ID proof basis HERE (#58), inside the
+    # session scope where the manifest is admissible — the per-mutant collect-only discoveries run
+    # later and would leave `_LAST_MANIFEST` at scope 0 for a result-assembly read. The passes above
+    # call the test callables directly (no pytest collection), so the scoped manifest is still current.
+    _standing, _conflicts, _basis = _live_collection_identity()
+    _sb = SessionBaseline(
+        traced,
+        failing,
+        inert,
+        len(test_functions),
+        truncated,
+        set(current_inert),
+        uncontained,
+        arcs,
+        replayed,
+    )
+    _sb.identity_standing = _standing
+    _sb.identity_conflicts = _conflicts
+    _sb.proof_basis = _basis
+    return _sb
+
+
+def baseline_probe_disposition(outcome: str | None) -> str:
+    """What a baseline probe's outcome MEANS for the measurement (#14, pure — pinned).
+
+    ``_run_test_with_timeout`` answers two different questions through one ``str | None``
+    channel, and that conflation is the whole defect this splits. Four of its values name a
+    KILL REASON — the test did not pass, so it cannot distinguish a mutant from the original
+    and is inert for attribution. ``"uncontained"`` is not a kill reason at all: it says the
+    worker is STILL RUNNING, may still be mutating shared state, and therefore that no
+    measurement taken afterwards can be trusted. Its docstring listed only the four, so every
+    caller written against the documented contract read ``is not None`` as "some kill reason"
+    and filed a live worker as merely inert. That is exactly what happened at three call
+    sites, and why #14's fix reached the mutant loop — the only caller it rewrote — and
+    nowhere else.
+
+    Returns a NAMED state rather than a bool because the three are not two. "passed", "did
+    not pass", and "we could not tell, and the process is now untrustworthy" have genuinely
+    different consequences: the first is usable evidence, the second is dropped from
+    attribution, the third must invalidate the whole run. Collapsing any pair reintroduces
+    the bug — folding uncontained into inert silently discards a containment failure, and
+    folding it into usable credits a kill to a test that may not have finished.
+
+    Total over the channel: an outcome this does not recognise is INERT, not usable. A new
+    kill reason added later is by construction "did not pass", so the conservative default is
+    the correct one; only ``None`` — an actual clean pass — earns ``usable``.
+    """
+    if outcome is None:
+        return "usable"
+    if outcome == "uncontained":
+        return "uncontained"
+    return "inert"
 
 
 def _baseline_failures(
@@ -1872,9 +3669,14 @@ def _baseline_failures(
     original_func: Callable[..., Any] | None,
     qualname: str | None,
     timeout_ms: float = 5000,
-) -> set[int]:
+) -> tuple[set[int], bool]:
     """``id()`` of every test that FAILS against the UNMUTATED function, under
-    ``evaluate_mutant``'s own call convention.
+    ``evaluate_mutant``'s own call convention, AND whether any probe went uncontained.
+
+    The second element is not decoration. This runs the suite BEFORE any mutant exists, so an
+    uncontained worker here poisons every measurement that follows — and the old ``set[int]``
+    return had nowhere to say so, which is precisely why it said nothing and the caller
+    reported a gateable profile over zero usable tests (#14).
 
     Such a test fails no matter what the mutation does, so crediting it with a kill
     measures the harness, not the suite. It cannot distinguish correct code from a
@@ -1898,7 +3700,7 @@ def _baseline_failures(
     TypeError before reaching the function under test, identically on the original.
     """
     if original_func is None or not qualname:
-        return set()
+        return set(), False
     func_name = qualname.split(".")[-1]
     # A baseline is only meaningful against the GENUINE original. Several callers
     # deliberately STUB original_func (e.g. ``lambda *_a: None``) when they only want
@@ -1908,24 +3710,40 @@ def _baseline_failures(
     # the callable must actually be the function we are mutating.
     probe = _unwrap_descriptor(original_func)
     if getattr(probe, "__name__", None) != func_name:
-        return set()
+        return set(), False
     inert: set[int] = set()
+    uncontained = False
     for test_fn in test_functions:
-        patched, saved, patch_target = _patch_mutant_into_test(
-            test_fn, qualname, original_func
-        )
-        try:
-            if _run_test_with_timeout(test_fn, probe, patched, timeout_ms) is not None:
+        # THE GUARD BELONGS HERE TOO, and this is the site the proof requirement found. This
+        # function patches the same namespaces through the same helpers as `evaluate_mutant`,
+        # but it is NOT `evaluate_mutant`, so serializing that one left this one racing — the
+        # sibling-path miss. Held across patch → run → restore, because a restore visible to
+        # another thread is exactly the mid-test body change that was measured.
+        with _execution_guard() as _proof:
+            patched, saved, patch_target = _patch_mutant_into_test(
+                _proof, test_fn, qualname, original_func
+            )
+            try:
+                disposition = baseline_probe_disposition(
+                    _run_test_with_timeout(test_fn, probe, patched, timeout_ms)
+                )
+                # An uncontained probe is BOTH: inert, because a test that never finished cannot
+                # be credited with distinguishing anything; and a containment failure, because
+                # the worker is still live. Recording only the first is the bug — it is what let
+                # a live thread read as an ordinary unrunnable test.
+                if disposition == "uncontained":
+                    uncontained = True
+                if disposition != "usable":
+                    inert.add(id(test_fn))
+            except Exception:  # noqa: BLE001 — an unrunnable baseline is itself inert
                 inert.add(id(test_fn))
-        except Exception:  # noqa: BLE001 — an unrunnable baseline is itself inert
-            inert.add(id(test_fn))
-        finally:
-            _unpatch_mutant(patched, saved, patch_target, func_name)
-    return inert
+            finally:
+                _unpatch_mutant(_proof, patched, saved, patch_target, func_name)
+    return inert, uncontained
 
 
 def _build_test_scope(
-    func_node: ast.FunctionDef,
+    func_node: ast.FunctionDef | ast.AsyncFunctionDef,
     test_functions: list[Callable[..., None]],
     original_func: Callable[..., Any] | None,
     scope_tests: bool,
@@ -1935,6 +3753,8 @@ def _build_test_scope(
     truncated: set[str] | None = None,
     trace_progress: Callable[[int, int, float], None] | None = None,
     trace_session_budget_s: float | None = None,
+    uncontained: set[str] | None = None,
+    arcs_out: dict[str, list[tuple[int, int]]] | None = None,
 ) -> tuple[
     Callable[[Mutant], list[Callable[..., None]]],
     dict[str, list[int]],
@@ -1985,7 +3805,9 @@ def _build_test_scope(
         # reuse it so a probe + follow-up run don't trace twice. Deterministic, so the
         # reused map is identical to what a fresh trace would produce here.
         line_cov, failing = precomputed_line_data
-        inert = _baseline_failures(test_functions, original_func, qualname)
+        inert, _unc = _baseline_failures(test_functions, original_func, qualname)
+        if _unc and uncontained is not None:
+            uncontained.add("baseline_probe")
     elif session is not None:
         # Suite-global baseline, already paid for once. Only the per-function
         # intersection is left, and it is a set operation over data in hand.
@@ -1995,12 +3817,26 @@ def _build_test_scope(
         line_cov = _coverage_from_trace(
             session.traced, target_file or "", set(exec_lines)
         )
+        # Arcs come from the SAME session baseline, filtered to this function's lines (#17). Only
+        # the session path carries them — a precomputed-probe or per-function trace has no arc
+        # map — so a consumer that asked for arcs but hit those paths reads an empty ledger, not
+        # a false "no branch reached".
+        if arcs_out is not None:
+            arcs_out.update(
+                _arcs_from_trace(session.arcs, target_file or "", set(exec_lines))
+            )
         failing = session.failing
         inert = session.inert
         if truncated is not None:
             truncated |= (
                 session.truncated
             )  # the suite-level cut is this function's cut too
+        # The suite-level containment failure is this function's too, for the same reason. It
+        # was computed once for the whole session and read by ONE of the two profiling paths
+        # (#19 wired it into the exhaustive one only), so routing it through the shared scope
+        # builder is what stops the two drifting apart again.
+        if session.uncontained and uncontained is not None:
+            uncontained.add("session_baseline")
     elif original_func is not None:
         line_cov = _trace_line_coverage(
             test_functions,
@@ -2012,7 +3848,9 @@ def _build_test_scope(
             trace_session_budget_s,
         )
         failing = _failing_on_baseline(test_functions, original_func)
-        inert = _baseline_failures(test_functions, original_func, qualname)
+        inert, _unc = _baseline_failures(test_functions, original_func, qualname)
+        if _unc and uncontained is not None:
+            uncontained.add("baseline_probe")
     else:
         line_cov, failing = {}, []
 
@@ -2021,16 +3859,49 @@ def _build_test_scope(
         [t for t in test_functions if id(t) not in inert] if inert else test_functions
     )
 
-    # Parametrized cases share a __name__, so one name maps to many callables.
+    # Keyed by TEST ID, because `line_cov` is (issue #16) — `trace_suite` and
+    # `trace_line_coverage` both key on `ci.callable_test_id`, and this table is what those
+    # keys are looked up IN. Keyed by `__name__` against TestId keys every lookup misses,
+    # `covering_by_line` comes back empty, and every mutant is evaluated against no tests at
+    # all: a silent 0-killed verdict under `scope_tests=True` that still agrees with itself.
+    # `test_scoped_and_unscoped_verdicts_agree` is the guard that catches exactly this.
+    #
+    # The list value is retained though a TestId now identifies ONE item: a backend that
+    # yields the same id twice must not lose an owner, and the cost is a one-element list.
+    from Wesker.ci import (
+        callable_test_id,
+    )  # local: `ci` imports this module at module scope
+
     tests_by_name: dict[str, list[Callable[..., None]]] = {}
     for _tf in usable:
-        tests_by_name.setdefault(getattr(_tf, "__name__", "unknown"), []).append(_tf)
+        tests_by_name.setdefault(callable_test_id(_tf), []).append(_tf)
     covering_by_line: dict[int, list[Callable[..., None]]] = {}
     if scope_tests and line_cov:
         for tname, lines in line_cov.items():
             fns = tests_by_name.get(tname, [])
             for ln in lines:
                 covering_by_line.setdefault(ln, []).extend(fns)
+
+    # HERMETIC-FIRST ordering for the kill loop (perf, VERDICT-INDEPENDENT). `evaluate_mutant`
+    # short-circuits on the first assertion/exception kill, so a fast HERMETIC test that kills a
+    # mutant should run BEFORE a shape-hazardous one (subprocess / thread / signal — typically SLOW,
+    # e.g. a 50s live-game system test), sparing that slow test on every mutant a cheap test already
+    # kills; only genuine survivors — and lines ONLY the slow test covers — then pay it. The kill
+    # VERDICT is order-independent (any assertion kill wins regardless of order, see `evaluate_mutant`),
+    # so this reorders and never changes `killed`/`killed_by`. A STABLE sort keeps discovery order
+    # within each group. Hermeticity is computed ONCE over `usable` (the resilient check re-derives
+    # shape from source on the live path, where the `__wesker_shape__` stamp is absent) and reused.
+    from Wesker.isolation import callable_is_hermetic
+
+    _herm = {id(t): callable_is_hermetic(t) for t in usable}
+
+    def _hermetic_first(fns: list[Callable[..., None]]) -> list[Callable[..., None]]:
+        return sorted(fns, key=lambda t: not _herm.get(id(t), True))
+
+    usable = _hermetic_first(usable)
+    covering_by_line = {
+        ln: _hermetic_first(fns) for ln, fns in covering_by_line.items()
+    }
 
     exec_line_set = set(exec_lines)
 
@@ -2045,7 +3916,7 @@ def _build_test_scope(
 
 
 def dimension_budget(
-    func_node: ast.FunctionDef,
+    func_node: ast.FunctionDef | ast.AsyncFunctionDef,
     category: MutationCategory,
     docstring_positions: set[tuple[int, int]] | None = None,
 ) -> int:
@@ -2073,12 +3944,17 @@ def dimension_budget(
     if category is MutationCategory.STATE:
         return sum(
             _live_dimension_count(_record_state_dimensions(func_node, mode))
-            for mode in ("remove_assign", "return_none")
+            for mode, _desc in _STATE_SUB_MODES
         )
     if category is MutationCategory.EXCEPTION:
         return sum(
             _live_dimension_count(_record_exception_dimensions(func_node, mode))
             for mode, _desc in _EXCEPTION_SUB_MODES
+        )
+    if category is MutationCategory.DATAFLOW:
+        return sum(
+            _live_dimension_count(_record_dataflow_dimensions(func_node, mode))
+            for mode, _desc in _DATAFLOW_SUB_MODES
         )
     return _live_dimension_count(
         _record_dimensions(func_node, category, docstring_positions)
@@ -2086,7 +3962,7 @@ def dimension_budget(
 
 
 def dof_universe(
-    func_node: ast.FunctionDef,
+    func_node: ast.FunctionDef | ast.AsyncFunctionDef,
     categories: set[MutationCategory],
 ) -> int:
     """Total degrees of freedom of a function — the DOF-coverage denominator.
@@ -2158,13 +4034,14 @@ def _select_greedy(
 
 
 def generate_mutants(
-    func_node: ast.FunctionDef,
+    func_node: ast.FunctionDef | ast.AsyncFunctionDef,
     categories: set[MutationCategory],
     max_per_category: int | None = 0,
     seed: int | None = None,
     category_order: list[MutationCategory] | None = None,
     greedy: bool = True,
     pass_index: int = 0,
+    observed_return_types: frozenset[str] | None = None,
 ) -> list[Mutant]:
     """Generate mutants for a function across specified categories.
 
@@ -2222,6 +4099,29 @@ def generate_mutants(
                     func_node, max_per_category, greedy=greedy, pass_index=pass_index
                 )
             )
+            continue
+        # DATAFLOW: same independent-sub-mode shape (return_sub / name_sub).
+        if cat == MutationCategory.DATAFLOW:
+            mutants.extend(
+                _generate_dataflow_mutants(
+                    func_node, max_per_category, greedy=greedy, pass_index=pass_index
+                )
+            )
+            continue
+        # OUTPUT (μ⁻ Form A): independent sub-modes over return sites; each perturbation is
+        # an ordinary Mutant with a rewritten return, so it rejoins the shared pipeline.
+        if cat == MutationCategory.OUTPUT:
+            mutants.extend(
+                _generate_output_perturbations(
+                    func_node,
+                    max_per_category,
+                    greedy=greedy,
+                    pass_index=pass_index,
+                    observed=observed_return_types,
+                )
+            )
+            # Form B: runtime-wrapper perturbations of the non-return codomain (generators).
+            mutants.extend(_generate_output_wrappers(func_node))
             continue
 
         target_count = _count_targets(func_node, cat)
@@ -2315,6 +4215,10 @@ def _make_transformer(
         # Reached only by a caller doing single-transformer generation; the normal path
         # routes EXCEPTION through _generate_exception_mutants (independent sub-modes).
         return _ExceptionMutator(index, "raise_type"), "replace raised exception type"
+    if category == MutationCategory.DATAFLOW:
+        # Same caveat: the normal path routes DATAFLOW through
+        # _generate_dataflow_mutants (independent sub-modes).
+        return _DataflowMutator(index, "return_sub"), "substitute returned reference"
     msg = f"Unknown category: {category}"
     raise ValueError(msg)
 
@@ -2421,12 +4325,16 @@ def _is_private_copy(module_name: str, private_prefix: str) -> bool:
 
 
 def _patch_module_qualified(
+    _proof: _PatchProof,
     func_name: str | None,
     mutated_obj: Any,
     source_path: str | None,
     qualname: str | None = None,
 ) -> list[tuple[Any, Any]]:
     """Patch every module-level binding of the ORIGINAL function to the mutant.
+
+    Requires `_PatchProof` (#19): this mutates process-global state, so calling it without the
+    execution lock is a type error rather than a race nobody notices. See `_PatchProof`.
 
     Real-world suites call functions through the imported module
     (``import pkg as p; p.func(...)``) rather than a bare name in the test's
@@ -2535,11 +4443,14 @@ def _co_filename_matches(co_filename: str | None, source_path: str | None) -> bo
 
 
 def _patch_mutant_into_test(
+    _proof: _PatchProof,
     test_fn: Callable[..., None],
     qualname: str | None,
     mutated_obj: Any,
 ) -> tuple[bool, Any, Any]:
     """Patch mutated function into the test's namespace.
+
+    Requires `_PatchProof` (#19) — see there.
 
     Tries __globals__ first (works for dynamically imported modules),
     then falls back to inspect.getmodule.
@@ -2711,17 +4622,68 @@ def _unwrap_descriptor(obj: Any) -> Any:
     return obj
 
 
+def _entry_probe(fn: Any) -> Any:
+    """Wrap a compiled mutant so that ENTERING it is observable (issue #18).
+
+    Installing a mutant and the test CALLING it are different events, and the engine could
+    only see the first. `_patch_mutant_into_test` returns a bool meaning "an attribute was
+    rebound somewhere", which says nothing about the call path: a decorator, `lru_cache`,
+    `functools.partial`, a closure cell, a registry list or an object field can all hold the
+    ORIGINAL while the namespace holds the mutant. The test then passes for the honest reason
+    that nothing changed, and the mutant is reported as a surviving specification gap — a
+    statement about the user's tests derived from a fact about ours.
+
+    A wrapper rather than a tracer: `line_coverage` already owns per-line tracing and is
+    documented as the dominant wall-clock cost of a run, so paying it per mutant per test is
+    not affordable. This costs one call frame and one attribute store per invocation. It is
+    also not an AST-injected marker, which would shift `mutant.mutated_line` — the key
+    `_build_test_scope` scopes on.
+
+    A real function, not a callable object: the unpatched path injects the mutant positionally
+    (`test_fn(mutated_func)`) and `_preserve_descriptor_shape` may re-wrap it in
+    `classmethod`/`staticmethod`, both of which want ordinary function shape. `__code__` is
+    deliberately NOT copied across — it would make the probe run the mutant's code without
+    passing through the recorder, which is the entire point.
+    """
+
+    def probe(*args: Any, **kwargs: Any) -> Any:
+        probe.entered = True  # type: ignore[attr-defined]  # ty: ignore[unresolved-attribute]
+        return fn(*args, **kwargs)
+
+    probe.entered = False  # type: ignore[attr-defined]  # ty: ignore[unresolved-attribute]
+    probe.__name__ = getattr(fn, "__name__", "mutant")
+    probe.__qualname__ = getattr(fn, "__qualname__", probe.__name__)
+    probe.__doc__ = getattr(fn, "__doc__", None)
+    probe.__module__ = getattr(fn, "__module__", probe.__module__)
+    return probe
+
+
 def _preserve_descriptor_shape(original: Any, mutated_obj: Any) -> Any:
-    """Wrap the mutant to match the original descriptor semantics."""
+    """Wrap the mutant to match the original descriptor semantics.
+
+    A classmethod mutant can arrive here already BOUND: accessing ``Class.method`` for a
+    ``@classmethod`` yields a bound ``method`` object with ``cls`` captured (signature ``(n)``, not
+    ``(cls, n)``). Wrapping THAT in ``classmethod(...)`` binds ``cls`` a SECOND time, so the patched
+    call passes an extra positional and raises ``TypeError`` — which the runner reads as a spurious
+    ``crash`` instead of the ``assertion`` that would credit the kill, and every such classmethod
+    mutant then reads as a false survivor (issue #25: a method target's kills weren't counted). So
+    peel a bound method to its underlying function before re-wrapping, so ``cls``/``self`` is bound
+    exactly once. A raw classmethod/staticmethod mutant is still returned as-is (already the right
+    shape); a plain function is unchanged."""
+    raw = (
+        mutated_obj.__func__
+        if isinstance(mutated_obj, types.MethodType)
+        else _unwrap_descriptor(mutated_obj)
+    )
     if isinstance(original, classmethod):
         if isinstance(mutated_obj, classmethod):
             return mutated_obj
-        return classmethod(_unwrap_descriptor(mutated_obj))
+        return classmethod(raw)
     if isinstance(original, staticmethod):
         if isinstance(mutated_obj, staticmethod):
             return mutated_obj
-        return staticmethod(_unwrap_descriptor(mutated_obj))
-    return _unwrap_descriptor(mutated_obj)
+        return staticmethod(raw)
+    return raw
 
 
 def _preserve_closure_binding_shape(original: Any, mutated_obj: Any) -> Any:
@@ -2732,12 +4694,18 @@ def _preserve_closure_binding_shape(original: Any, mutated_obj: Any) -> Any:
 
 
 def _unpatch_mutant(
+    _proof: _PatchProof,
     patched: bool,
     saved: Any,
     patch_target: Any,
     func_name: str | None,
 ) -> None:
-    """Restore the original function after mutation evaluation."""
+    """Restore the original function after mutation evaluation.
+
+    Requires `_PatchProof` (#19). RESTORING is as lock-sensitive as patching: an unguarded
+    restore is what let one thread hand another thread's test the ORIGINAL body mid-run
+    (measured: `('b', 0.5, 2)`).
+    """
     if not patched or saved is None or func_name is None:
         return
     if isinstance(patch_target, dict):
@@ -2752,10 +4720,243 @@ def _unpatch_mutant(
         setattr(patch_target, func_name, saved)
 
 
+# Adaptive per-mutant timeout (#13): a single mutant's allowance is derived from how fast the
+# ORIGINAL runs the same tests, not a flat cap — so a millisecond-scale function's runaway mutant
+# is cut in milliseconds, not seconds. The multiplier tolerates legitimate variance and slower
+# mutant paths; the floor absorbs thread/patch startup and timer granularity. Both are calibration
+# targets tested against the corpus (see the #13 regression tests), not magic constants.
+_MUTANT_ALLOWANCE_FLOOR_MS = 50.0
+_MUTANT_ALLOWANCE_MULTIPLIER = 50.0
+
+
+def _adaptive_allowance(
+    baseline_ms: float | None, cap_ms: float, remaining_ms: float
+) -> float:
+    """The wall-clock a single mutant evaluation gets (#13).
+
+    ``baseline_ms`` is the ORIGINAL's live runtime over the same tests, or None when no trustworthy
+    baseline exists (no original, or a red one) — then fall back to the configured cap rather than
+    invent precision. The allowance is at least the floor and at most the cap, and it NEVER exceeds
+    ``remaining_ms``, the remaining aggregate deadline, which is always the final upper bound.
+    """
+    if baseline_ms is None:
+        base = cap_ms
+    else:
+        base = max(
+            _MUTANT_ALLOWANCE_FLOOR_MS, baseline_ms * _MUTANT_ALLOWANCE_MULTIPLIER
+        )
+    return min(base, cap_ms, remaining_ms)
+
+
+def _live_collection_identity() -> tuple[
+    str, tuple[str, ...], tuple[tuple[str, str], ...]
+]:
+    """The live session's module-identity standing, conflicting names, and node-ID proof basis (#58).
+
+    Defensive throughout: this describes a measurement and must never break one. No manifest —
+    an older Wesker, a direct-call path that never collected, an import that failed — yields
+    ``unobserved`` with an empty basis, which changes no verdict.
+
+    The proof basis is the admissible manifest's items as ``(node_id, origin_digest)`` — the runner's
+    own address for each selected test plus its content digest, so a certificate can freeze the exact
+    items pytest collected instead of a file set re-derived from the kill matrix. Surfaced whenever the
+    manifest is admissible; a consumer freezes on it only when the standing is ``confirmed``
+    (``collection_conflicts`` empty), never when ``ambiguous``.
+    """
+    try:
+        from .pytest_discovery import current_measurement_scope, last_session_manifest
+        from .session_manifest import (
+            collection_identity_standing,
+            manifest_admissibility,
+        )
+
+        manifest = last_session_manifest()
+        scope = current_measurement_scope() or 0
+    except Exception:  # noqa: BLE001 — describing the run must not fail the run
+        return "unobserved", (), ()
+    # Admit the manifest only if THIS live session captured it (#26). A prior project's collection
+    # left in the ContextVar, or a collect-only manifest never stamped by a live session, is
+    # inadmissible — and inadmissible reads as `unobserved`, exactly as a missing manifest does,
+    # so the pre-flight prediction stands alone and no measurement is authorized on another
+    # session's collection.
+    manifest_scope = getattr(manifest, "scope", 0) if manifest is not None else 0
+    if manifest is None or manifest_admissibility(manifest_scope, scope) != "admit":
+        return "unobserved", (), ()
+    conflicts = tuple(getattr(manifest, "conflicting_modules", ()) or ())
+    # The runner's own node-ID basis: each admissible item by (node_id, content digest).
+    basis = tuple(
+        (it.node_id, it.origin_digest)
+        for it in (getattr(manifest, "items", ()) or ())
+        if it.node_id
+    )
+    return collection_identity_standing(True, conflicts), conflicts, basis
+
+
+def _measurement_gateable(
+    base_gateable: bool,
+    all_contained: bool,
+    budget_ok: bool,
+    identity_unambiguous: bool = True,
+    fast_shape_ok: bool = True,
+    deterministic_ok: bool = True,
+) -> bool:
+    """Whether a profiling result may gate a downstream verdict (COMPLETE, auto-apply, CI).
+
+    A gateable result must be COMPLETE and VALID. ``base_gateable`` is the coverage-depth basis —
+    an exhaustive/profiled run, not a sampled one. ``all_contained`` is False when any timed-out
+    worker could not be stopped (#14). ``budget_ok`` is False when the aggregate or memory budget
+    was cut (#13). ``identity_unambiguous`` is False when the live collection resolved a dotted
+    module name to more than one file (#58) — the counts may be perfectly measured and still be
+    about the wrong copy of the code, which no other conjunct here can see. ``fast_shape_ok`` is
+    False when this ran in the in_process FAST mode over a NON-hermetic test shape (#19) — a
+    subprocess/thread/signal/custom-collector the mode's thread-abandon cannot contain — so the
+    counts may be perturbed by state the run could not isolate; the isolated mode passes True here
+    because a whole process is killable. ``deterministic_ok`` is False when a repeated fresh baseline
+    disagreed on outcome or covered lines (#19) — an unrepeatable baseline cannot ground a verdict.
+    Any one False makes the counts a floor, not a verdict.
+
+    Defaults True so a caller that has not OBSERVED a conjunct keeps its previous meaning; an
+    unasked question must not become a refusal.
+    """
+    return (
+        base_gateable
+        and all_contained
+        and budget_ok
+        and identity_unambiguous
+        and fast_shape_ok
+        and deterministic_ok
+    )
+
+
+def _measure_scoped_baseline(
+    test_functions: list[Callable[..., None]],
+    original_func: Callable[..., Any] | None,
+    cap_ms: float,
+) -> tuple[float | None, bool]:
+    """The ORIGINAL's live wall-clock over ``test_functions``, UNTRACED like the mutant loop, for
+    sizing an adaptive per-mutant allowance (#13), AND whether any probe went uncontained.
+
+    The clock is None when there is no trustworthy baseline — no original, no tests, or a test
+    that does not pass cleanly on the original (a red baseline is not a clock). Each test is
+    bounded by ``cap_ms`` so a pathological baseline test cannot hang the sizing itself.
+
+    The second element exists because #13's fix introduced this function and gave it a single
+    ``float | None`` channel, so an uncontained probe here — a live worker — was indistinguishable
+    from the benign "this baseline is red, fall back to the configured cap". A sizing failure is
+    recoverable; a containment failure is not, and folding the second into the first is how a
+    fix for one issue opened a new door into another (#14).
+    """
+    if original_func is None or not test_functions:
+        return None, False
+    t0 = time.monotonic()
+    for test_fn in test_functions:
+        disposition = baseline_probe_disposition(
+            _run_test_with_timeout(test_fn, original_func, True, cap_ms)
+        )
+        if disposition == "uncontained":
+            return None, True
+        if disposition != "usable":
+            return None, False
+    return _elapsed(t0), False
+
+
+# PROCESS-WIDE EXECUTION LOCK (#19). Mutant evaluation monkey-patches a module global, runs a
+# test against it, and restores it. That sequence is only correct if nothing else patches the
+# same namespace in between, and until now nothing enforced it: two concurrent profiles (MCP and
+# CLI, or two MCP requests) patched and restored across one another.
+#
+# MEASURED, two threads evaluating different mutants of one function, 5/5 runs. Thread B's mutant
+# was "replace return with None", so under its own mutant the target returns None. It observed
+# None in ZERO runs -- it saw thread A's arithmetic mutant (0.5) every time, and in 2 of 5 runs
+# the value CHANGED mid-test (0.5 then 2, A's mutant then the restored original). Every result
+# thread B recorded was a verdict about a body that was never installed for it: a survivor of a
+# mutant that never ran, or a kill earned by someone else's code.
+#
+# RLock, not Lock, and the deviation from #19's "non-reentrant" wording is deliberate. The race
+# being closed is BETWEEN THREADS, and an RLock blocks other threads exactly as a Lock does. A
+# plain Lock additionally deadlocks a thread that re-enters -- which is reachable here, because
+# Wesker profiles code, and the code under analysis can be Wesker (the dogfood path). Trading a
+# silent cross-thread corruption for a silent self-deadlock is not an improvement. Nested
+# patch/restore on ONE thread is sequential rather than torn, and is a separate concern.
+_EXECUTION_LOCK = threading.RLock()
+
+
+class _PatchProof:
+    """Evidence that the execution lock is held. Required to mutate a global namespace.
+
+    THE LOCK ALONE IS A RUNTIME GUARANTEE WITH NO STATIC HALF. Serializing `evaluate_mutant`
+    closes the race that exists; it does nothing about the next patch site someone adds, which
+    is how this defect arrived in the first place. Requiring proof makes an unguarded patch a
+    TYPE ERROR — `ty` rejects the call before it can run.
+
+    Measured on a probe: passing `None`, a bare `object()`, or the guard itself where a proof is
+    required are all caught. Forging one (`_PatchProof()` written out by hand) is NOT caught, and
+    cannot be in Python. That is the honest limit — the pattern converts "did someone forget the
+    lock?" from invisible into visibly deliberate. An omission nobody can see becomes a line a
+    reviewer reads.
+
+    IT PAID FOR ITSELF IMMEDIATELY. Adding it surfaced `_baseline_failures`, which patches the
+    same namespaces through the same helpers and is NOT `evaluate_mutant`, so the serializing
+    decorator never covered it — the sibling-path miss, again.
+    """
+
+    __slots__ = ()
+
+
+@contextlib.contextmanager
+def _execution_guard() -> Iterator[_PatchProof]:
+    """Hold the process-wide execution lock and yield proof of it.
+
+    Re-entrant by construction (`_EXECUTION_LOCK` is an RLock), so a coarse holder such as
+    `evaluate_mutant` and the fine-grained patch sites inside it nest without deadlock.
+    """
+    with _EXECUTION_LOCK:
+        yield _PatchProof()
+
+
+def _held_patch_proof() -> _PatchProof:
+    """Proof for a caller that ALREADY holds the lock — e.g. anything under `@_serialized`.
+
+    VERIFIES the claim instead of trusting it. A token handed to a thread that does not hold the
+    lock would make the type signature a lie, which is worse than no signature: the reader would
+    be entitled to believe the call site was checked. `_is_owned()` is private, and it is also
+    the only way to ask the question; the alternative is a proof that means nothing.
+
+    This also narrows the forging hole the probe measured. `_PatchProof()` can still be written
+    out by hand, but every path this module offers requires actually holding the lock.
+    """
+    if not _EXECUTION_LOCK._is_owned():  # type: ignore[attr-defined]  # ty: ignore[unresolved-attribute]  # noqa: SLF001
+        raise RuntimeError(
+            "patch proof requested without holding the execution lock (#19): "
+            "wrap the call in `with _execution_guard() as proof:`"
+        )
+    return _PatchProof()
+
+
+def _serialized(fn):
+    """Serialize a function that mutates process-global interpreter state.
+
+    Applied rather than inlined because the region to protect is the WHOLE evaluation -- compile,
+    install, run, restore -- and re-indenting 280 lines to wrap them in a `with` is a large
+    diff whose risk is entirely unrelated to the defect.
+    """
+
+    @functools.wraps(fn)
+    def _wrapped(*args, **kwargs):
+        with _EXECUTION_LOCK:
+            return fn(*args, **kwargs)
+
+    return _wrapped
+
+
+@_serialized
 def evaluate_mutant(
     mutant: Mutant,
     test_functions: list[Callable[..., None]],
-    original_func: Callable[..., Any],
+    # Optional in fact: the namespace seed below is `getattr(original_func, "__globals__",
+    # None) or {}`, which is documented to degrade to an empty namespace when no original is
+    # supplied. `run_function_profiling` passes whatever its own caller had, including None.
+    original_func: Callable[..., Any] | None,
     timeout_ms: float = 5000,
     qualname: str | None = None,
     record_all_killers: bool = False,
@@ -2794,35 +4995,70 @@ def evaluate_mutant(
             getattr(original_func, "__code__", None), "co_filename", None
         )
 
-    # Compile mutated function
+    # Compile the mutated function — or, for a μ⁻ Form-B wrapper mutant, BUILD it by wrapping the
+    # original at runtime (its mutated_node is a synthetic marker that is never compiled).
     try:
-        module_ast = ast.Module(body=[mutant.mutated_node], type_ignores=[])  # type: ignore[list-item]
-        ast.fix_missing_locations(module_ast)
-        code = compile(module_ast, "<mutant>", "exec")
-        # Seed the mutant's namespace with the source module's globals so it can
-        # resolve sibling helpers, module constants, and imports. Without this a
-        # function that calls a module-level helper raises NameError under EVERY
-        # mutant — a false all-crash 100% that hides whether the mutation's
-        # behavior is actually caught. Degrades to an empty namespace (the prior
-        # behavior) when the caller passes no original_func.
-        namespace: dict[str, Any] = dict(
-            getattr(original_func, "__globals__", None) or {}
-        )
-        exec(code, namespace)  # noqa: S102  # nosec B102 — intentional: compiling AST mutants
-        func_name = getattr(mutant.mutated_node, "name", None)
-        mutated_obj = namespace.get(func_name) if func_name else None
-        if mutated_obj is None:
+        if mutant.wrapper_factory is not None:
+            # Form B: the codomain is delivered otherwise than by the return value (a generator's
+            # yields), so the perturbation is a runtime wrapper, not an AST rewrite. func_name comes
+            # from the ORIGINAL so the patch rebinds the same name the tests call; a missing original
+            # leaves mutated_obj None and the constructed=False guard below routes it to
+            # harness_error, exactly as an un-built AST mutant does.
+            func_name = getattr(mutant.original_node, "name", None) or getattr(
+                original_func, "__name__", None
+            )
+            mutated_obj = (
+                _entry_probe(mutant.wrapper_factory(original_func))
+                if original_func is not None
+                else None
+            )
+        else:
+            module_ast = _mutant_module(mutant.mutated_node)
+            ast.fix_missing_locations(module_ast)
+            code = compile(module_ast, "<mutant>", "exec")
+            # Seed the mutant's namespace with the source module's globals so it can
+            # resolve sibling helpers, module constants, and imports. Without this a
+            # function that calls a module-level helper raises NameError under EVERY
+            # mutant — a false all-crash 100% that hides whether the mutation's
+            # behavior is actually caught. Degrades to an empty namespace (the prior
+            # behavior) when the caller passes no original_func.
+            namespace: dict[str, Any] = dict(
+                getattr(original_func, "__globals__", None) or {}
+            )
+            exec(code, namespace)  # noqa: S102  # nosec B102 — intentional: compiling AST mutants
+            func_name = getattr(mutant.mutated_node, "name", None)
+            mutated_obj = namespace.get(func_name) if func_name else None
+            if mutated_obj is not None:
+                # Make ENTERING the mutant observable, not just installing it (#18). Wrapped here,
+                # at the single point the object is built, so every install path downstream —
+                # `_patch_mutant_into_test`'s four strategies and `_patch_module_qualified`'s
+                # module/owner loops — carries the same recorder without knowing about it.
+                mutated_obj = _entry_probe(mutated_obj)
+        # `func_name is None` is already implied (the lookup above yields None without it), but
+        # saying it here is what narrows the name for the patch/restore code below — where an
+        # unrestored binding would leak this mutant into the NEXT one's evaluation.
+        if mutated_obj is None or func_name is None:
+            # The mutant was never BUILT — the compiled module has no such name. That is a
+            # fact about this engine, not about the user's tests, and it used to return
+            # `killed=True, killed_by="crash"`: a harness failure counted straight into the
+            # adequacy numerator, indistinguishable from a suite that caught something (#18).
+            # `constructed=False` routes it to `harness_error`, outside the denominator.
+            # The enclosing loop already takes this direction when `evaluate_mutant` itself
+            # raises ("un-evaluable survivor — conservative, never inflates the kill score");
+            # these two returns were the one place that inflated it.
             return MutantResult(
                 mutant=mutant,
-                killed=True,
-                killed_by="crash",
+                killed=False,
+                constructed=False,
                 elapsed_ms=_elapsed(start),
             )
     except Exception:
+        # Compile/exec of the mutated AST failed. Same category as above: no mutant exists,
+        # so no test can have detected one.
         return MutantResult(
             mutant=mutant,
-            killed=True,
-            killed_by="crash",
+            killed=False,
+            constructed=False,
             elapsed_ms=_elapsed(start),
         )
 
@@ -2831,8 +5067,12 @@ def evaluate_mutant(
     # the mutant — not only tests that call a bare imported name. Restored in the
     # finally regardless of how the loop exits. No-op when source_path is absent,
     # so existing callers/output are unchanged.
+    # `@_serialized` holds the execution lock for this whole call, so one proof covers the entire
+    # patch/run/restore phase below. The decorator owns EXCLUSION; the proof owns the type-level
+    # evidence that a patch site was reached with it held (#19).
+    _proof = _held_patch_proof()
     module_saved = _patch_module_qualified(
-        func_name, mutated_obj, source_path, qualname
+        _proof, func_name, mutated_obj, source_path, qualname
     )
     try:
         # Run tests against mutated function
@@ -2842,6 +5082,16 @@ def evaluate_mutant(
             None  # provisional crash/timeout kill (no assertion yet)
         )
         first_killer: str | None = None
+        saw_uncontained = False  # a timed-out worker that could not be stopped (#14)
+        # How many tests actually got to run against this mutant. `entered` is only
+        # INTERPRETABLE when at least one did: with an empty scoped set — which is the normal
+        # state of Detective's synthesis path, where the tests do not exist yet — the probe is
+        # never called, and reading that `False` as "installed but bypassed" routes every
+        # mutant to `not_entered`, empties the denominator, and reports a function with no
+        # tests at all as fully specified. A false COMPLETE is the one outcome this engine
+        # must never produce, so with `ran == 0` entry stays UNOBSERVED (None) and the mutant
+        # is scored a plain survivor, exactly as before #18.
+        ran = 0
         for test_fn in test_functions:
             remaining_ms = timeout_ms - _elapsed(start)
             if remaining_ms <= 0:
@@ -2853,6 +5103,8 @@ def evaluate_mutant(
                     mutant=mutant,
                     killed=True,
                     killed_by="timeout",
+                    contained=not saw_uncontained,
+                    entered=(getattr(mutated_obj, "entered", None) if ran else None),
                     elapsed_ms=_elapsed(start),
                 )
             # Strategy: monkey-patch the mutated function into the test's namespace
@@ -2862,8 +5114,9 @@ def evaluate_mutant(
             # inspect.getmodule for inline test callables without __globals__.
             patch_name = qualname or func_name
             patched, saved, patch_target = _patch_mutant_into_test(
-                test_fn, patch_name, mutated_obj
+                _proof, test_fn, patch_name, mutated_obj
             )
+            ran += 1
             try:
                 result = _run_test_with_timeout(
                     test_fn,
@@ -2871,6 +5124,12 @@ def evaluate_mutant(
                     patched,
                     remaining_ms,
                 )
+                if result == "uncontained":
+                    # Timed out AND the worker could not be stopped. It still counts as a run-only
+                    # timeout kill, but the measurement is uncontained — carry the fact so the
+                    # profile refuses to gate on it (#14). Normalize to "timeout" for kill counting.
+                    saw_uncontained = True
+                    result = "timeout"
                 # A failure is only a KILL if the mutation CAUSED it. When the mutant
                 # could not be patched into the test's namespace, the unpatched path
                 # INJECTS it as a positional argument — a contract only Wesker's own
@@ -2901,7 +5160,19 @@ def evaluate_mutant(
                         else result
                     )
                 if result is not None:
-                    tname = getattr(test_fn, "__name__", "unknown")
+                    # The kill vocabulary (issue #16). Coverage is keyed the same way in
+                    # `trace_suite`, and a caller runs set-cover over BOTH — two vocabularies
+                    # would intersect to nothing and report every mutant a covered test kills
+                    # as an unpinned survivor. Root comes from `ci._PROJECT_ROOT`, not an
+                    # argument, so the two sites cannot drift apart.
+                    #
+                    # Imported HERE, not at module scope: `ci` imports `run_function_converged`
+                    # from this module at module scope, so the reverse edge can only ever be
+                    # lazy. This branch runs on a KILL, not per test, and the cost after the
+                    # first is a `sys.modules` lookup.
+                    from Wesker.ci import callable_test_id
+
+                    tname = callable_test_id(test_fn)
                     if record_all_killers:
                         killers.append(tname)
                         reasons.append(result)
@@ -2918,6 +5189,10 @@ def evaluate_mutant(
                             killed=True,
                             killed_by=result,
                             test_name=tname,
+                            contained=not saw_uncontained,
+                            entered=(
+                                getattr(mutated_obj, "entered", None) if ran else None
+                            ),
                             elapsed_ms=_elapsed(start),
                         )
                     elif first_reason is None:
@@ -2925,7 +5200,7 @@ def evaluate_mutant(
                         # scanning: a later test may pin the value by assertion.
                         first_reason, first_killer = result, tname
             finally:
-                _unpatch_mutant(patched, saved, patch_target, func_name)
+                _unpatch_mutant(_proof, patched, saved, patch_target, func_name)
 
         if record_all_killers and killers:
             return MutantResult(
@@ -2940,6 +5215,8 @@ def evaluate_mutant(
                 ),
                 test_name=killers[0],
                 killed_by_tests=killers,
+                contained=not saw_uncontained,
+                entered=(getattr(mutated_obj, "entered", None) if ran else None),
                 elapsed_ms=_elapsed(start),
             )
         if first_reason is not None:
@@ -2949,9 +5226,24 @@ def evaluate_mutant(
                 killed=True,
                 killed_by=first_reason,
                 test_name=first_killer,
+                contained=not saw_uncontained,
+                entered=(getattr(mutated_obj, "entered", None) if ran else None),
                 elapsed_ms=_elapsed(start),
             )
-        return MutantResult(mutant=mutant, killed=False, elapsed_ms=_elapsed(start))
+        # THE survivor return, and the one #18 exists for: "no test detected this" and "no test
+        # ever called this" are the same silence here, and only `entered` tells them apart.
+        return MutantResult(
+            mutant=mutant,
+            killed=False,
+            # The plain-survivor return, and the ONE of the five that omitted this — so it took
+            # the dataclass default `True` and reported a survivor as contained even when a
+            # worker had outlived `abandon`. Reachable whenever an uncontained timeout is nulled
+            # by the `_outcome_on_original` attribution control, i.e. the `patched is False`
+            # path this function's own comment names as every parametrized test.
+            contained=not saw_uncontained,
+            entered=(getattr(mutated_obj, "entered", None) if ran else None),
+            elapsed_ms=_elapsed(start),
+        )
     finally:
         for _mod, _orig in module_saved:
             try:
@@ -2982,6 +5274,14 @@ def _outcome_on_original(
     The live patched objects are captured and re-installed verbatim afterwards, which keeps
     the descriptor shape ``_patch_module_qualified`` built for class-method owners.
     """
+    if func_name is None:
+        # Without a name there is nothing to rebind, and the loop below would fail on every
+        # target INSIDE its own `except: continue` — leaving the mutant installed and running
+        # this control against itself. The two runs would then agree trivially and the caller
+        # would discard a real kill, which is the exact artifact this function exists to
+        # prevent. `None` cannot equal the caller's `result` (it checks `is not None` first),
+        # so declining here preserves the kill rather than silently erasing it.
+        return None
     live: list[tuple[Any, Any]] = []
     for target, saved in module_saved:
         try:
@@ -3050,6 +5350,14 @@ def _run_test_with_timeout(
     Returns the kill reason ("assertion", "exception", "crash", "timeout") if killed,
     or None if the test passed (mutant survived this test).
 
+    AND ONE VALUE THAT IS NOT A KILL REASON: "uncontained" (#14). It means the timed-out
+    worker outlived `abandon` and may still be running, so nothing measured after it is
+    trustworthy. This list omitted it for a release, and three baseline callers written
+    against the omission read `is not None` as "some kill reason" and filed a live worker as
+    an inert test — a zero-evidence profile that then reported itself gateable. Callers must
+    route the outcome through `baseline_probe_disposition`, which names the three states,
+    rather than testing it against None.
+
     The timeout bounds the WAIT and, via `interrupt.abandon`, the thread itself — see there for what
     that can and cannot reach.
     """
@@ -3089,6 +5397,7 @@ def _run_test_with_timeout(
     # report. Set up in the main thread around start+join so restoration is
     # guaranteed even when the worker hangs and is abandoned as a timeout.
     timed_out = False
+    contained = True
     with (
         contextlib.redirect_stdout(io.StringIO()),
         contextlib.redirect_stderr(io.StringIO()),
@@ -3117,9 +5426,15 @@ def _run_test_with_timeout(
             # `__exit__` is the last writer.
             _abandon(thread)
             thread.join(timeout=_ABANDON_UNWIND_S)
+            # `abandon` injects an async exception that CANNOT land while the worker is blocked
+            # OUTSIDE the interpreter (subprocess/socket/C-extension) — it only lands at the next
+            # bytecode. If the thread is still alive after the unwind allowance, the timed-out work
+            # is UNCONTAINED: it may still be running and mutating shared state, so reporting it as
+            # a clean "timeout" is a false measurement. The caller must refuse to gate on it (#14).
+            contained = not thread.is_alive()
 
     if timed_out:
-        return "timeout"
+        return "timeout" if contained else "uncontained"
 
     return result_box[0]
 
@@ -3183,7 +5498,7 @@ def _mutant_diff(mutant: Mutant) -> str:
 
 
 def run_function_sampling(
-    func_node: ast.FunctionDef,
+    func_node: ast.FunctionDef | ast.AsyncFunctionDef,
     func_key: str,
     categories: set[MutationCategory],
     test_functions: list[Callable[..., None]],
@@ -3247,8 +5562,18 @@ def run_function_sampling(
         cr = results_by_cat.setdefault(
             mutant.category, CategoryResult(category=mutant.category)
         )
-        cr.total += 1
-        if result.killed:
+        # Same denominator rule as the other two entry points (#18): a mutant that was never
+        # built measures this engine, not the sampled suite. Sampling already reports a
+        # PARTIAL universe, which is exactly why the partiality must stay honest — a harness
+        # failure silently scored as a kill inflates the one number a sample is read for.
+        disposition = mutant_disposition(
+            result.constructed, result.installed, result.entered, True, result.killed
+        )
+        if disposition not in SCORED_DISPOSITIONS:
+            cr.unscored += 1
+            cr.unscored_by[disposition] = cr.unscored_by.get(disposition, 0) + 1
+        elif result.killed:
+            cr.total += 1
             cr.killed += 1
             if result.killed_by == "assertion":
                 cr.killed_by_assertion += 1
@@ -3259,6 +5584,7 @@ def run_function_sampling(
             elif result.killed_by == "crash":
                 cr.killed_by_crash += 1
         else:
+            cr.total += 1
             cr.survived += 1
 
     per_cat = list(results_by_cat.values())
@@ -3279,12 +5605,179 @@ def run_function_sampling(
     )
 
 
+# How many mutants one isolated worker evaluates before it is recycled to a fresh process (#19).
+# A reused interpreter can accumulate application state a per-test lifecycle does not reset (a
+# singleton, a registry, a module cache); a bounded count discards that drift before it can perturb
+# a verdict. Tunable; `should_recycle` treats 0 as "never recycle on count".
+_ISOLATED_WORKER_RECYCLE = 100
+
+# Floor for the isolated per-mutant timeout (#19). The isolated worker runs a full pytest invocation
+# per mutant — the first on a fresh worker paying interpreter+collection startup — so a cap tuned for
+# in-process microsecond calls would time out honest mutants and read them as false kills. `select`
+# returns as soon as the worker answers, so this floor never slows a normal mutant; it only sets how
+# long a genuine hang runs before the process group is killed.
+_ISOLATED_MIN_TIMEOUT_S = 10.0
+
+
+def _isolated_result(
+    mutant: Mutant, run: IsolatedRun, elapsed_ms: float
+) -> MutantResult:
+    """One isolated worker verdict -> a MutantResult with the SAME inputs the in-process path feeds
+    `mutant_disposition` (#18/#19).
+
+    The worker now PROVES installation and entry (#18): `installed` is True only when an owner was
+    rebound to the mutant, and `entry_disposition(ran, entered_probe)` names whether a node that ran
+    actually CALLED it — so a mutant installed but never entered (a decorator/lru_cache/capture
+    holding the original) scores `not_entered`, outside the denominator, instead of a false survivor.
+    An empty run stays `unobserved` (entered=None, the conservative pre-#18 default) so a function
+    whose covering tests never executed cannot read as fully specified. A timed-out run is a run-only
+    `timeout` kill; a verdict that measured the HARNESS — the mutant would not compile, or its
+    covering tests could not be collected — is `constructed=False`, scored `harness_error`.
+    """
+    if run.memory_cut:
+        # W#21: the mutant hit the worker's address-space cap. This is a budget CUT, not a kill —
+        # `contained=False` routes it to the `cut` disposition (unscored) and makes the run
+        # non-gateable via the same #14 path; the typed memory reason is surfaced on the result.
+        return MutantResult(
+            mutant=mutant, killed=False, contained=False, elapsed_ms=elapsed_ms
+        )
+    _entered_map = {"entered": True, "not_entered": False, "unobserved": None}
+    entered = _entered_map[entry_disposition(run.ran, run.entered_probe)]
+    if run.timed_out:
+        return MutantResult(
+            mutant=mutant,
+            killed=True,
+            killed_by="timeout",
+            contained=run.contained,
+            test_name=run.test_name,
+            installed=run.installed,
+            entered=entered,
+            elapsed_ms=elapsed_ms,
+        )
+    verdict = mutant_verdict(run.outcome)
+    if not run.constructed or verdict == "harness":
+        return MutantResult(
+            mutant=mutant,
+            killed=False,
+            constructed=False,
+            contained=run.contained,
+            elapsed_ms=elapsed_ms,
+        )
+    if verdict == "killed":
+        return MutantResult(
+            mutant=mutant,
+            killed=True,
+            killed_by=run.killed_by or "crash",
+            test_name=run.test_name,
+            contained=run.contained,
+            installed=run.installed,
+            entered=entered,
+            elapsed_ms=elapsed_ms,
+        )
+    return MutantResult(
+        mutant=mutant,
+        killed=False,
+        contained=run.contained,
+        installed=run.installed,
+        entered=entered,
+        elapsed_ms=elapsed_ms,
+    )
+
+
+def _evaluate_isolated(
+    worker: IsolatedMutantWorker | None,
+    mutant: Mutant,
+    scoped_tests: list[Callable[..., None]],
+    iso_ctx: tuple[str, str, str, int, int | None],
+    per_mutant_timeout_ms: float,
+) -> tuple[MutantResult, IsolatedMutantWorker | None, IsolatedRun | None]:
+    """Evaluate one mutant in a killable isolated worker, recycling the worker when spent (#19).
+
+    Returns the verdict AND the (possibly fresh) worker, which the caller threads forward — a hang
+    or a reached recycle cap retires the current worker and a new one takes the next mutant. A mutant
+    whose covering tests carry no real pytest nodeid (the whole scoped set is empty) is a plain
+    survivor — `entered=None -> survived_after_entry`, matching the in-process empty-scope path — and
+    is NEVER handed to pytest with an empty argv, which would collect the ENTIRE suite instead.
+
+    THE TIMEOUT IS THE CONFIGURED CAP, NOT THE IN-PROCESS ADAPTIVE ALLOWANCE. The allowance the loop
+    tightens per mutant is calibrated for a bare in-process function CALL (microseconds); the isolated
+    worker runs a whole pytest invocation per mutant (tens to hundreds of ms), so the allowance
+    expires mid-collection and every slower mutant reads as a spurious `timeout` KILL — inflating
+    adequacy, the one direction that must never happen. The cap, floored to cover pytest startup, is
+    the hang bound instead; `select` returns the instant the worker answers, so the generous floor
+    costs a normal mutant nothing and only bounds a true runaway.
+    """
+    from Wesker.ci import callable_test_id
+
+    root, target, qualname, recycle_cap, mem_limit = iso_ctx
+    node_ids = [tid for c in scoped_tests if "::" in (tid := callable_test_id(c))]
+    if not node_ids:
+        return MutantResult(mutant=mutant, killed=False, elapsed_ms=0.0), worker, None
+    if (
+        worker is None
+        or not worker.alive
+        or should_recycle(worker.evaluated, recycle_cap)
+    ):
+        if worker is not None:
+            worker.close()
+        worker = IsolatedMutantWorker(
+            root, [], target, qualname, mem_limit_bytes=mem_limit
+        )
+    try:
+        source = ast.unparse(mutant.mutated_node)
+    except Exception:  # noqa: BLE001 — an un-unparseable mutant is un-evaluable: conservative survivor
+        return MutantResult(mutant=mutant, killed=False, elapsed_ms=0.0), worker, None
+    timeout_s = max(per_mutant_timeout_ms / 1000.0, _ISOLATED_MIN_TIMEOUT_S)
+    t0 = time.monotonic()
+    run = worker.evaluate(source, timeout_s, node_ids=node_ids)
+    return _isolated_result(mutant, run, _elapsed(t0)), worker, run
+
+
+def next_routing_action(
+    has_open_obligations: bool,
+    has_remaining_items: bool,
+    containment_lost: bool,
+) -> str:
+    """Decide the next step of an item-incremental widen — the stop/continue rule (#15, pure — pinned).
+
+    The widen traces routed tests in stratum order to discharge a seed's remaining PROOF OBLIGATIONS,
+    and must trace only as far as it needs to. "Open obligation" is the NORMALIZED proof fact, never
+    `bool(surviving_mutants)`: a surviving mutant, a provisionally-equivalent mutant the seed's partial
+    basis could not disprove (the converged path widens these deliberately — an empty/partial seed can
+    misclassify a mutant equivalent), OR an uncovered executable target line all count.
+
+    * ``not has_open_obligations`` — every mutation/equivalence AND line obligation is discharged.
+      ``"complete"``: stop now. Tracing the remaining eligible items cannot change a settled verdict —
+      a killed mutant stays killed, a covered line stays covered — so the low-stratum unknowns are
+      never traced. This is the efficiency win, and it is checked FIRST: a fully-discharged run is
+      complete even if containment was later lost, because nothing negative rests on the trace.
+    * ``containment_lost`` — a budget cut, a truncation, or an uncontained worker crossed the run
+      mid-widen, so an obligation could not be resolved. A negative conclusion is valid only once
+      every unknown is resolved, so an unfinished widen yields ``"unresolved"`` — a typed non-gateable
+      result, never a false gap.
+    * ``has_remaining_items`` — an eligible test remains that MIGHT discharge an obligation:
+      ``"trace_next"``, widen one more stratum/micro-batch and re-evaluate.
+    * otherwise every eligible unknown was traced and an obligation still stands — ``"gap"``: the
+      honest specification gap, sound precisely because the unknown set is now exhausted.
+    """
+    if not has_open_obligations:
+        return "complete"
+    if containment_lost:
+        return "unresolved"
+    if has_remaining_items:
+        return "trace_next"
+    return "gap"
+
+
 def run_function_profiling(
-    func_node: ast.FunctionDef,
+    func_node: ast.FunctionDef | ast.AsyncFunctionDef,
     func_key: str,
     categories: set[MutationCategory],
     test_functions: list[Callable[..., None]],
-    original_func: Callable[..., Any],
+    # Optional in fact and by design: `evaluate_mutant` degrades to an empty namespace when
+    # no original is supplied, and says so. Declaring it required made every honest caller
+    # silence the checker at the call site, which is where a real type error would have shown.
+    original_func: Callable[..., Any] | None,
     per_mutant_timeout_ms: float = 5000,
     budget_ms: float | None = None,
     mem_budget_mb: int | None = None,
@@ -3298,6 +5791,12 @@ def run_function_profiling(
     trace_budget_s: float | None = DEFAULT_TRACE_BUDGET_S,
     trace_progress: Callable[[int, int, float], None] | None = None,
     trace_session_budget_s: float | None = DEFAULT_TRACE_SESSION_BUDGET_S,
+    isolated: bool = False,
+    check_determinism: bool = False,
+    worker_mem_limit_mb: int | None = None,
+    is_pure: bool = False,
+    widen_tests: list[Callable[..., None]] | None = None,
+    observed_return_types: frozenset[str] | None = None,
 ) -> ProfilingResult:
     """Profiling mode — generate mutants (exhaustive by default), evaluate with budget.
 
@@ -3337,6 +5836,7 @@ def run_function_profiling(
             categories,
             max_per_category=max_per_category,
             pass_index=pass_index,
+            observed_return_types=observed_return_types,
         )
     )
     # Shard for parallel evaluation: generation is deterministic, so mutants[a:b] here is
@@ -3360,6 +5860,8 @@ def run_function_profiling(
     source_path = func_key.split("::", 1)[0] if "::" in func_key else None
 
     _trace_truncated: set[str] = set()
+    _baseline_uncontained: set[str] = set()
+    _arc_cov: dict[str, list[tuple[int, int]]] = {}
     _tests_for, line_cov, exec_lines, failing = _build_test_scope(
         func_node,
         test_functions,
@@ -3371,16 +5873,93 @@ def run_function_profiling(
         _trace_truncated,
         trace_progress,
         trace_session_budget_s,
+        _baseline_uncontained,
+        _arc_cov,
     )
+    # Before the mutation loop: re-observe this function's covering tests fresh, so a warm run's
+    # replayed reach is promoted back to admissible and the certificate rests on this session (#20).
+    # If it spliced, RE-DERIVE the whole scope from the freshened basis with FRESH containers — else
+    # the ledger below keeps the pre-freshen local coverage/arcs and relabels those STALE cached
+    # lines admissible, and stale truncated/uncontained flags would union back in. `None` precomputed
+    # forces the re-read off the freshened SessionBaseline, not the pre-freshen local data.
+    if _freshen_proof_covering(test_functions, line_cov, exec_lines, scope_tests):
+        _trace_truncated = set()
+        _baseline_uncontained = set()
+        _arc_cov = {}
+        _tests_for, line_cov, exec_lines, failing = _build_test_scope(
+            func_node,
+            test_functions,
+            original_func,
+            scope_tests,
+            None,
+            qualname,
+            trace_budget_s,
+            _trace_truncated,
+            trace_progress,
+            trace_session_budget_s,
+            _baseline_uncontained,
+            _arc_cov,
+        )
+
+    # Live baseline for the adaptive per-mutant allowance (#13): time the ORIGINAL over the tests
+    # once, untraced (the mutant loop is untraced too). None → fall back to the configured cap.
+    # Time only the COVERING tests (closeout #3): those are the ones the mutant loop actually runs.
+    # Sizing over the whole collection re-runs the unknowns a target-first seed deliberately deferred
+    # — the fixture-execution cost that dominated ARC — and over-sizes the allowance. Under scope
+    # the covering set is exactly `line_cov`'s keys; unscoped (the A/B path) keeps the full set.
+    from Wesker.ci import callable_test_id as _ctid_for_sizing
+
+    _sizing_tests = (
+        [t for t in test_functions if _ctid_for_sizing(t) in line_cov]
+        if scope_tests and line_cov
+        else test_functions
+    )
+    baseline_ms, _sizing_uncontained = _measure_scoped_baseline(
+        _sizing_tests, original_func, per_mutant_timeout_ms
+    )
+    if _sizing_uncontained:
+        _baseline_uncontained.add("baseline_sizing")
 
     results_by_cat: dict[MutationCategory, CategoryResult] = {}
     kill_matrix: dict[str, list[str]] = {}
     survivor_records: list[dict] = []
     killed_records: list[dict] = []
+    # The Mutant objects of survivors, for the Fix B widen pass to re-evaluate against unknowns.
+    _survivor_mutants: dict[str, Mutant] = {}
     budget_exhausted = False
-
+    all_contained = True  # #14: cleared if any timed-out worker could not be stopped
     mem_budget = _resolve_budget(mem_budget_mb)
+    # THE BASELINE IS WHAT MAKES THE BUDGET ABOUT THIS RUN (W#21). Captured before the loop:
+    # `ru_maxrss` is a process LIFETIME peak and never falls, so an absolute comparison meant one
+    # earlier spike left every later low-budget run in a long-lived MCP process reading as
+    # exhausted before it allocated anything.
+    mem_baseline = _mem_baseline()
     total_m = len(mutants)
+    # Isolated mode routes each mutant through a killable worker PROCESS (the gateable execution
+    # mode, #19) instead of the in-process `evaluate_mutant`; `in_process` (the default) stays the
+    # fast path. The worker is threaded through the loop so it can be recycled on a hang or a reached
+    # cap; its context — session root, relative target file, qualname, recycle cap — is fixed for the
+    # whole function. Root comes from the session ContextVar the baseline tracer already used, so the
+    # worker's cwd matches the measured collection rather than a re-derived guess.
+    _iso_worker: IsolatedMutantWorker | None = None
+    _iso_ctx: tuple[str, str, str, int, int | None] | None = None
+    _mem_cut = False
+    _mem_enforced = False
+    if isolated:
+        import os
+
+        from Wesker.ci import _PROJECT_ROOT
+
+        _iso_ctx = (
+            _PROJECT_ROOT.get() or os.getcwd(),
+            source_path or "",
+            qualname or "",
+            _ISOLATED_WORKER_RECYCLE,
+            # The worker's address-space cap (W#21). Opt-in: None leaves the worker uncapped
+            # (telemetry only). A whole-worker ceiling, so a runaway mutant fails as a catchable
+            # MemoryError instead of taking the box down — a hard budget only where the OS accepts it.
+            worker_mem_limit_mb * 1024 * 1024 if worker_mem_limit_mb else None,
+        )
     for count, mutant in enumerate(mutants):
         if progress is not None:
             progress(count, total_m, _elapsed(start))
@@ -3390,20 +5969,40 @@ def run_function_profiling(
         # Memory guard: if this run has crossed the (capacity-derived, user-
         # selectable) RAM budget, stop accumulating and reclaim rather than climb
         # past the ceiling — the guarantee that a profile cannot take over the box.
-        if count % 16 == 0 and _over_budget(mem_budget):
+        if count % 16 == 0 and _over_budget(mem_budget, mem_baseline):
             budget_exhausted = True
             _reclaim()
             break
 
-        try:
-            result = evaluate_mutant(
-                mutant,
-                _tests_for(mutant),
-                original_func,
-                timeout_ms=per_mutant_timeout_ms,
-                qualname=qualname,
-                source_path=source_path,
+        # The allowance is derived from the live baseline and — critically — never exceeds the
+        # remaining aggregate deadline, so a single mutant cannot overshoot the budget by a full
+        # cap (#13). No budget → the cap is the bound.
+        remaining_ms = (
+            budget_ms - _elapsed(start)
+            if budget_ms is not None
+            else per_mutant_timeout_ms
+        )
+        allowance_ms = _adaptive_allowance(
+            baseline_ms, per_mutant_timeout_ms, remaining_ms
+        )
+        if isolated:
+            assert _iso_ctx is not None
+            result, _iso_worker, _iso_run = _evaluate_isolated(
+                _iso_worker, mutant, _tests_for(mutant), _iso_ctx, per_mutant_timeout_ms
             )
+            if _iso_run is not None:
+                _mem_cut = _mem_cut or _iso_run.memory_cut
+                _mem_enforced = _mem_enforced or _iso_run.mem_enforced
+        try:
+            if not isolated:
+                result = evaluate_mutant(
+                    mutant,
+                    _tests_for(mutant),
+                    original_func,
+                    timeout_ms=allowance_ms,
+                    qualname=qualname,
+                    source_path=source_path,
+                )
         except Exception as exc:  # noqa: BLE001
             # A pathological mutant can crash the evaluation harness itself —
             # e.g. self-profiling the engine's own internals, where the mutant
@@ -3430,11 +6029,27 @@ def run_function_profiling(
             )
             continue
 
+        if not result.contained:
+            all_contained = False
         cr = results_by_cat.setdefault(
             mutant.category, CategoryResult(category=mutant.category)
         )
-        cr.total += 1
-        if result.killed:
+        # What is this outcome EVIDENCE OF (#18)? Only a mutant that was built, installed and
+        # entered measures the SUITE; anything earlier measures this engine, and belongs
+        # outside the denominator rather than on either side of it.
+        #
+        # `contained=True` is passed deliberately: containment already has an owner in the #14
+        # break below (`all_contained` -> non-gateable, coverage_depth "cut"), and routing it
+        # through here too would silently move mutants out of a shipped contract's denominator.
+        # #18 owns the install/entry phases; W#19 revisits containment.
+        disposition = mutant_disposition(
+            result.constructed, result.installed, result.entered, True, result.killed
+        )
+        if disposition not in SCORED_DISPOSITIONS:
+            cr.unscored += 1
+            cr.unscored_by[disposition] = cr.unscored_by.get(disposition, 0) + 1
+        elif result.killed:
+            cr.total += 1
             cr.killed += 1
             if result.killed_by == "assertion":
                 cr.killed_by_assertion += 1
@@ -3466,6 +6081,7 @@ def run_function_profiling(
                 }
             )
         else:
+            cr.total += 1
             cr.survived += 1
             survivor_records.append(
                 {
@@ -3479,13 +6095,306 @@ def run_function_profiling(
                     "elapsed_ms": round(result.elapsed_ms, 1),
                 }
             )
+            # A survivor of the seed: the Fix B widen pass may kill it with an unknown test the seed
+            # never traced. (Profiling runs no equivalence check, so every else-branch mutant is a
+            # plain survivor eligible for the widen.)
+            _survivor_mutants[mutant.mutant_id] = mutant
 
+        # #14 (reopened): an uncontained worker (abandon could not stop it) is STILL ALIVE — burning
+        # a core and able to perturb every later mutant's timing. This mutant's result is kept
+        # (partial evidence), but stop NOW rather than measure more against a compromised process:
+        # `all_contained` already forces non-gateable, and coverage_depth becomes "cut" below.
+        if not result.contained:
+            break
+        # #13 (reopened): the aggregate deadline is checked AFTER evaluation too. The pre-loop check
+        # catches an overrun only before the NEXT iteration, and the FINAL mutant has none — so a run
+        # whose last mutant crossed the wall would otherwise stay budget_exhausted=False /
+        # coverage_depth="profiled" / gateable. Mark it cut here so the overrun is honestly non-gateable.
+        if budget_ms is not None and _elapsed(start) > budget_ms:
+            budget_exhausted = True
+            break
+
+    if _iso_worker is not None:
+        _iso_worker.close()
     if progress is not None:
         progress(total_m, total_m, _elapsed(start))
+
+    # ── LAZY WIDENING (Fix B) ──────────────────────────────────────────────────────────────
+    # The loop ran against the SEEDED baseline (candidate tests only). Before conceding a survivor,
+    # widen with `widen_tests` and re-evaluate the survivors against it. `seed(A)+expand(B)` is
+    # byte-identical to a full trace over `A∪B`, so a survivor can only move survivor->killed here
+    # (the differential oracle pins it). in_process only — the seed/fork model is the fast path and
+    # the isolated worker is already closed. On an expand degrade the holder invalidates, so the
+    # re-derived scope rebuilds the FULL baseline — never a seed-only false survivor.
+    #
+    # The widen ALSO fires when a target line is not yet covered by the seed (closeout, line axis):
+    # a mutant-less executable line reached only by an UNKNOWN test would otherwise read as a false
+    # line gap. One `expand` traces every unknown, so a single fire completes BOTH the kill matrix
+    # (survivors re-evaluated) and the line-coverage denominator, matching a full run on each axis.
+    _covered_lines = {ln for lines in line_cov.values() for ln in lines}
+    _lines_incomplete = bool(
+        scope_tests and exec_lines and not set(exec_lines).issubset(_covered_lines)
+    )
+    _widen_holder = _SESSION_BASELINE.get()
+    # ── ITEM-INCREMENTAL WIDEN (Fix B / #15 C) ──────────────────────────────────────────────────
+    # Trace the routed unknowns ONE micro-batch at a time in the order the caller handed them (a
+    # stratum order — most-likely reacher first), re-evaluating the open obligations after each and
+    # STOPPING the instant they discharge. `next_routing_action` is the pinned stop rule: the
+    # low-stratum unknowns are never traced once every survivor is killed and every line is covered.
+    # `seed(A)+expand(b1)+expand(b2)…` composes to a full trace over A∪(traced b) — expand splices
+    # additively — so the DISPOSITION equals the full-baseline disposition over whatever was traced
+    # (the differential oracle pins it); early-stop only skips UNNEEDED tests, never a verdict. A
+    # budget cut mid-widen is `unresolved` (non-gateable via `budget_exhausted`), never a false gap;
+    # a true gap is declared only once the unknown list is exhausted. Batch of 1 gives the tightest
+    # early-stop and the least exposure to a single hanging integration test (#19-adjacent).
+    _remaining_widen = (
+        list(widen_tests)
+        if (
+            widen_tests
+            and not isolated
+            and not budget_exhausted
+            and _widen_holder is not None
+            and (budget_ms is None or _elapsed(start) <= budget_ms)
+        )
+        else []
+    )
+    while (
+        next_routing_action(
+            has_open_obligations=bool(_survivor_mutants) or _lines_incomplete,
+            has_remaining_items=bool(_remaining_widen),
+            containment_lost=budget_exhausted,
+        )
+        == "trace_next"
+    ):
+        if budget_ms is not None and _elapsed(start) > budget_ms:
+            budget_exhausted = True
+            break
+        _batch, _remaining_widen = _remaining_widen[:1], _remaining_widen[1:]
+        # `_remaining_widen` is non-empty only when the holder is non-None (they are set together
+        # above), so this narrowing always holds; the assert states the invariant for reader and ty.
+        assert _widen_holder is not None
+        _widen_holder.expand(_batch)
+        # The widen runs tests and can cross the aggregate deadline even with NO survivors to enter
+        # the loop below (line-only closeout). Consume that elapsed signal here; a cut unknown
+        # partition is unresolved and can never remain gateable (#15 closeout #6).
+        if budget_ms is not None and _elapsed(start) > budget_ms:
+            budget_exhausted = True
+        _wt: set[str] = set()
+        _wu: set[str] = set()
+        _wa: dict[str, list[tuple[int, int]]] = {}
+        _tests_for, line_cov, exec_lines, failing = _build_test_scope(
+            func_node,
+            test_functions,
+            original_func,
+            scope_tests,
+            None,
+            qualname,
+            trace_budget_s,
+            _wt,
+            trace_progress,
+            trace_session_budget_s,
+            _wu,
+            _wa,
+        )
+        _trace_truncated |= _wt
+        _baseline_uncontained |= _wu
+        _arc_cov.update(_wa)
+        # Recompute the line obligation against the widened basis, so the next `next_routing_action`
+        # sees this batch's coverage — a line-only widen ends the moment every executable line is hit.
+        _covered_lines = {ln for lines in line_cov.values() for ln in lines}
+        _lines_incomplete = bool(
+            scope_tests and exec_lines and not set(exec_lines).issubset(_covered_lines)
+        )
+        for _mid, _mutant in list(_survivor_mutants.items()):
+            if budget_ms is not None and _elapsed(start) > budget_ms:
+                # A cut widen leaves some survivors NOT re-evaluated against the unknowns
+                # (closeout #6): a negative gap is only valid once every unknown is resolved, so
+                # mark the run exhausted — non-gateable, never a false gap or a synthesis target.
+                budget_exhausted = True
+                break
+            _remaining_ms = (
+                budget_ms - _elapsed(start)
+                if budget_ms is not None
+                else per_mutant_timeout_ms
+            )
+            _res = evaluate_mutant(
+                _mutant,
+                _tests_for(_mutant),
+                original_func,
+                timeout_ms=_adaptive_allowance(
+                    baseline_ms, per_mutant_timeout_ms, _remaining_ms
+                ),
+                qualname=qualname,
+                source_path=source_path,
+            )
+            if not _res.killed:
+                continue
+            # Prune the now-killed mutant so the incremental obligation check and the next micro-batch
+            # no longer see it as open — the run-once widen never needed to, as it re-evaluated the
+            # whole survivor set exactly once.
+            del _survivor_mutants[_mid]
+            # Move survivor -> killed on its category (inline aggregation): `total` stays, survived--,
+            # killed++, and the kill-reason counter `value_killed`/the report read. Then move the
+            # record and credit the killer.
+            _cr = results_by_cat.setdefault(
+                _mutant.category, CategoryResult(category=_mutant.category)
+            )
+            _cr.survived -= 1
+            _cr.killed += 1
+            if _res.killed_by == "assertion":
+                _cr.killed_by_assertion += 1
+            elif _res.killed_by == "exception":
+                _cr.killed_by_exception += 1
+            elif _res.killed_by == "crash":
+                _cr.killed_by_crash += 1
+            elif _res.killed_by == "timeout":
+                _cr.timed_out += 1
+            survivor_records[:] = [
+                r for r in survivor_records if r["mutant_id"] != _mid
+            ]
+            if _res.test_name:
+                kill_matrix.setdefault(_mutant.description, []).append(_res.test_name)
+            killed_records.append(
+                {
+                    "mutant_id": _mutant.mutant_id,
+                    "mutant": _mutant.description,
+                    "category": _mutant.category.value,
+                    "mutated_line": _mutant.mutated_line,
+                    "dimension": _mutant.dimension,
+                    "change": _mutant_change(_mutant),
+                    "killed_by": _res.killed_by,
+                    "test": _res.test_name,
+                    "diff_summary": _mutant_diff(_mutant),
+                    "elapsed_ms": round(_res.elapsed_ms, 1),
+                }
+            )
+
     per_cat = list(results_by_cat.values())
     total = sum(cr.total for cr in per_cat)
     killed = sum(cr.killed for cr in per_cat)
     survived = total - killed
+
+    # Who may not discharge a line obligation (#17). Read from the SAME baseline
+    # `_build_test_scope` resolved, so the proof view and the scoping view disagree only where
+    # they are meant to. Without a live session the per-function pass computed `failing` and
+    # `_trace_truncated` directly and those are the whole story.
+    _sb = session_baseline()
+    # `uncontained` belongs here too (#D4 repair 4, §4.6): an unstoppable worker's trace may still be
+    # running and mutating state, so its coverage cannot discharge a line obligation — the same
+    # exclusion `admissible_line_coverage` already applies. It is TEST IDS (`trace_suite` adds
+    # `callable_test_id(t)` on a containment failure), the same space as `inert_ids`/`truncated`/
+    # `replayed`. Disposition-exact: an uncontained result is non-gateable anyway, so this only makes
+    # the coverage view honest BEFORE the refuse. The per-function fallback has no per-test containment
+    # set, so it stays as it was.
+    _barred = sorted(
+        (_sb.inert_ids | _sb.truncated | _sb.replayed | _sb.uncontained)
+        if _sb is not None
+        else (set(failing) | set(_trace_truncated))
+    )
+    # `all_contained` tracks the MUTATION loop. A worker the BASELINE trace could not stop is
+    # the same condition one phase earlier, and it was invisible here (#19): the run reported
+    # gateable while a runaway from the trace was still executing in the process, perturbing
+    # every mutant timing that followed. Containment is absorbing — one failure anywhere in the
+    # measurement invalidates the whole of it.
+    # `_baseline_uncontained` now carries every pre-mutation source — the session baseline this
+    # line used to read directly, the per-function inert probe, and #13's sizing pass — because
+    # reading ONE of them is how the other two stayed invisible.
+    _contained = all_contained and not _baseline_uncontained
+    # Read ONCE per result, next to the gate that consumes it (#58): the live collection's
+    # own answer about module identity, not a reconstruction of it.
+    # Read the collection identity the SESSION BASELINE captured under scope (#58): a live read here
+    # would find `_LAST_MANIFEST` overwritten to scope 0 by the per-mutant discoveries and report
+    # `unobserved`. Fall back to a live read only when there is no session baseline (a standalone
+    # profile outside a live session), where the direct answer is the only one available.
+    # Read session identity from the session ContextVar (#5), never from the (mutable) baseline — a
+    # per-function fork or a widen splice would drop a baseline copy. Fall back to a direct live read
+    # ONLY for a standalone profile outside a live session (where no session identity was captured).
+    _ident = session_identity()
+    if _ident is None:
+        _ident = _live_collection_identity()
+    _identity_standing, _identity_conflicts, _identity_basis = _ident
+
+    # Fast-mode SHAPE gate (#19): the in_process mode contains a runaway only by asking a thread to
+    # stop, so it is gateable only over HERMETIC covering tests; a subprocess/thread/signal/
+    # custom-collector shape it cannot contain refuses the whole scope. The isolated mode kills a
+    # whole process, so shape is irrelevant there — it is "n/a" and always passes the gate. Computed
+    # once over the discovered tests from the shape stamped at collection (an inline/legacy callable
+    # carries no stamp and reads hermetic — those paths have no shape signal to refuse on).
+    if isolated:
+        _fast_mode = "n/a"
+        _fast_shape_ok = True
+    else:
+        _fast_mode = scope_fast_mode_standing(
+            [fast_mode_standing(**callable_shape_hazards(t)) for t in test_functions]
+        )
+        _fast_shape_ok = _fast_mode == "hermetic"
+
+    # Repeated-fresh-baseline nondeterminism check (#19), OPT-IN. Two baselines from matched fresh
+    # ISOLATED state, compared on outcome AND covered lines: an unrepeatable baseline cannot ground a
+    # gateable verdict. Isolated only — the in_process fast path shares an interpreter, so "fresh
+    # state" is not available and the check is meaningless there. Default off: a second full baseline
+    # doubles that cost, and only a proof-facing run needs it.
+    _determinism = "unchecked"
+    if isolated and check_determinism:
+        import os
+
+        from Wesker.ci import _PROJECT_ROOT, callable_test_id
+
+        _dnodes = [tid for t in test_functions if "::" in (tid := callable_test_id(t))]
+        _dtarget = source_path or ""
+        if _dnodes and _dtarget:
+            _droot = _PROJECT_ROOT.get() or os.getcwd()
+            _dtimeout = max(per_mutant_timeout_ms / 1000.0, _ISOLATED_MIN_TIMEOUT_S)
+            _la, _oa, _ca = run_baseline_traced_isolated(
+                _droot, _dnodes, _dtarget, _dtimeout
+            )
+            _lb, _ob, _cb = run_baseline_traced_isolated(
+                _droot, _dnodes, _dtarget, _dtimeout
+            )
+            # A run that could not be contained is not a trustworthy baseline either.
+            _determinism = (
+                baseline_determinism(_la, _oa, _lb, _ob)
+                if (_ca and _cb)
+                else "nondeterministic"
+            )
+    _determinism_ok = _determinism != "nondeterministic"
+
+    # W#21 memory standing: "cut" when a mutant hit the worker's address-space cap (already
+    # non-gateable through that mutant's `contained=False`), else the HONEST enforcement capability —
+    # "enforced" only where the OS accepted the cap, "telemetry_only" otherwise, so a run over an
+    # unenforced limit is never described as memory-guaranteed. "n/a" on the in_process path.
+    if not isolated:
+        _memory_standing = "n/a"
+    elif _mem_cut:
+        _memory_standing = "cut"
+    else:
+        _memory_standing = memory_enforcement_standing(_mem_enforced)
+
+    # The per-TestId outcome-qualified ledger (#17), from the SAME failed/truncated sets `_barred`
+    # is built from, so the typed view and the derived `admissible_line_coverage` cannot disagree.
+    # Containment is measurement-wide (absorbing), so it is stamped on every item. (The converged
+    # entry point emits no per-TestId line data, so it carries no ledger — nothing is lost there.)
+    _failed_ids = _sb.inert_ids if _sb is not None else set(failing)
+    _truncated_ids = _sb.truncated if _sb is not None else set(_trace_truncated)
+    # Reach REPLAYED from the cache (#20): kept out of the admissible proof basis — a source-keyed
+    # cache hit is routing, not a trace observed this session. Empty without a live session.
+    _replayed_ids = _sb.replayed if _sb is not None else set()
+    _evidence = build_trace_ledger(
+        line_cov,
+        _failed_ids,
+        _truncated_ids,
+        _contained,
+        arc_coverage=_arc_cov,
+        replayed_ids=_replayed_ids,
+    )
+
+    # The candidate-operator policy census (#22), a first-class field on every profile so what the
+    # policy withheld and WHY is auditable per run. Derived from the SAME `category_census` the
+    # category filter is (`filter.filter_categories`), so the census and the tested set cannot
+    # disagree. Local import: `filter` imports `MutationCategory` from this module.
+    from Wesker.filter import category_census
+
+    _operator_census = category_census(func_node, is_pure)
 
     return ProfilingResult(
         function_key=func_key,
@@ -3499,11 +6408,43 @@ def run_function_profiling(
         survivor_records=survivor_records,
         killed_records=killed_records,
         budget_exhausted=budget_exhausted,
+        is_gateable=_measurement_gateable(
+            True,
+            _contained,
+            not budget_exhausted,
+            _identity_standing != "ambiguous",
+            _fast_shape_ok,
+            _determinism_ok,
+        ),
+        collection_conflicts=_identity_conflicts,
+        proof_basis=_identity_basis,
+        # A cut is any invalid measurement — budget overrun OR an uncontained worker (#13/#14),
+        # from the mutation loop OR the baseline trace (#19): the depth must not read "profiled"
+        # when the run stopped short or ran against a live abandoned worker. is_gateable already
+        # reflects both; coverage_depth now agrees.
+        coverage_depth="cut" if (budget_exhausted or not _contained) else "profiled",
+        # Which execution mode measured this (#19): `isolated` ran each mutant in a killable worker
+        # PROCESS — containment is a real guarantee — while `in_process` shares the interpreter and
+        # can only ASK a runaway thread to stop. `execution_mode_standing` (4c) turns this into a
+        # gateability tier; Detective #60 consumes it.
+        execution_mode="isolated" if isolated else "in_process",
+        # The NAMED fast-mode shape standing (#19): why an in_process result is (not) gateable — a
+        # "refuse_<hazard>" is the explicit refusal the issue asks for, "n/a" under isolated.
+        fast_mode=_fast_mode,
+        # W#21: "cut" when a mutant hit the worker's memory cap (non-gateable), else the honest
+        # enforced/telemetry capability, "n/a" in-process.
+        memory_standing=_memory_standing,
+        # The repeated-fresh-baseline determinism standing (#19): "nondeterministic" here is why an
+        # otherwise-complete run is not gateable; "unchecked" when the opt-in did not run.
+        determinism=_determinism,
         elapsed_ms=_elapsed(start),
         line_coverage=line_cov,
+        admissible_line_coverage=_admissible_coverage(line_cov, _barred),
+        trace_evidence=_evidence,
         executable_lines=exec_lines,
         failing_tests=failing,
         tests_discovered=len(test_functions),
+        operator_census=_operator_census,
         trace_truncated=sorted(_trace_truncated),
     )
 
@@ -3512,15 +6453,20 @@ def run_function_profiling(
 
 
 def estimate_universe_size(
-    func_node: ast.FunctionDef,
+    func_node: ast.FunctionDef | ast.AsyncFunctionDef,
     categories: set[MutationCategory],
+    observed: frozenset[str] | None = None,
 ) -> int:
     """Count total possible mutation targets without generating mutants.
 
     Cheap (AST walk only, no compilation or test execution). Used to
     report sampling coverage: tested/killed out of universe_size.
+
+    ``observed`` (μ⁻ Fork 2) threads the observed codomain type into the OUTPUT count, so the
+    reported universe matches the type-conditional perturbations generation will produce; None
+    (the static census default) counts only the always-applicable Fork-1 OUTPUT sub-modes.
     """
-    return sum(_count_targets(func_node, cat) for cat in categories)
+    return sum(_count_targets(func_node, cat, observed) for cat in categories)
 
 
 def coverage_floor(
@@ -3561,7 +6507,7 @@ def coverage_floor(
 
 
 def greedy_coverage_guarantee(
-    func_node: ast.FunctionDef,
+    func_node: ast.FunctionDef | ast.AsyncFunctionDef,
     categories: set[MutationCategory],
     max_per_category: int,
     passes: int,
@@ -3579,7 +6525,7 @@ def greedy_coverage_guarantee(
 
 
 def _generate_boundary_inputs(
-    func_node: ast.FunctionDef,
+    func_node: ast.FunctionDef | ast.AsyncFunctionDef,
 ) -> list[tuple]:
     """Generate boundary test inputs based on parameter count.
 
@@ -3612,8 +6558,73 @@ def _generate_boundary_inputs(
     return [tuple(base[i % len(base)] for _ in range(n_params)) for i in range(5)]
 
 
+def form_b_equivalence(outcomes: list[str]) -> str:
+    """The Form-B (runtime-wrapper) μ⁻ equivalence verdict over per-boundary-input outcomes (§18 Q3, pure
+    — pinned). Form A resolves equivalence by COMPILING the perturbation-as-mutant (Prop. 11.5); a Form-B
+    perturbation is a runtime ``wrapper_factory`` with no compilable mutant, so :func:`check_equivalent`
+    cannot see it and it needs this negative mirror. Each outcome is ``match`` (the wrapper is
+    indistinguishable from the original on that input), ``differ`` (a witness distinguishes them), or
+    ``raised`` (the original raised — no codomain evidence). The two non-equivalent reasons are DISTINCT and
+    must not fuse — a distinguished perturbation is a real μ⁻ kill, an all-raised one is simply unmeasured:
+
+    * ``distinguished`` — ANY input differs: the perturbation is a real kill, NOT equivalent.
+    * ``no_evidence``   — no ``differ`` but no ``match`` either (every input raised): equivalence unclaimable.
+    * ``equivalent``    — at least one ``match`` and no ``differ``: a runtime candidate-equivalent, the
+                          Form-B mirror of :func:`check_equivalent`'s ``successful_comparisons > 0`` rule.
+    """
+    if "differ" in outcomes:
+        return "distinguished"
+    if "match" not in outcomes:
+        return "no_evidence"
+    return "equivalent"
+
+
+def _check_equivalent_wrapper(
+    func_node: ast.FunctionDef | ast.AsyncFunctionDef,
+    mutant: Mutant,
+) -> bool:
+    """Form-B (runtime-wrapper) equivalence — the negative mirror of :func:`check_equivalent` for a μ⁻
+    perturbation with NO compilable mutant (§18 Q3). Compiles the ORIGINAL, builds the wrapper
+    (``mutant.wrapper_factory(original)``), runs BOTH on the same boundary inputs, and compares the
+    observable codomain — the materialized yield sequence (capped by :data:`_GENERATOR_MATERIALIZE_CAP`,
+    the same cap the wrapper uses). Equivalent iff the wrapper is indistinguishable from the original on
+    every boundary input with at least one real comparison (:func:`form_b_equivalence`): a generator that
+    yields nothing on those inputs makes truncate/drop/duplicate a no-op — a runtime candidate-equivalent.
+    Skips methods, exactly as :func:`check_equivalent` does (no synthesizable receiver)."""
+    if mutant.wrapper_factory is None:
+        return False  # not a Form-B mutant; caller should not have routed here
+    if func_node.args.args and func_node.args.args[0].arg in ("self", "cls"):
+        return False
+    try:
+        orig_mod = ast.Module(body=[func_node], type_ignores=[])  # type: ignore[list-item]
+        ast.fix_missing_locations(orig_mod)
+        orig_ns: dict[str, Any] = {}
+        exec(compile(orig_mod, "<original>", "exec"), orig_ns)  # noqa: S102
+        orig_fn = orig_ns.get(func_node.name)
+        if orig_fn is None:
+            return False
+        wrapped = mutant.wrapper_factory(orig_fn)
+        outcomes: list[str] = []
+        for args in _generate_boundary_inputs(func_node):
+            try:
+                orig_items = list(
+                    itertools.islice(orig_fn(*args), _GENERATOR_MATERIALIZE_CAP)
+                )
+                # +2 so a duplicate-last perturbation's extra element is observed, not clipped by the cap.
+                pert_items = list(
+                    itertools.islice(wrapped(*args), _GENERATOR_MATERIALIZE_CAP + 2)
+                )
+            except Exception:  # noqa: BLE001 — the original raised on this input; no codomain evidence
+                outcomes.append("raised")
+                continue
+            outcomes.append("match" if pert_items == orig_items else "differ")
+        return form_b_equivalence(outcomes) == "equivalent"
+    except Exception:  # noqa: BLE001 — a non-generator or un-compilable original is conservatively NOT equivalent
+        return False
+
+
 def check_equivalent(
-    func_node: ast.FunctionDef,
+    func_node: ast.FunctionDef | ast.AsyncFunctionDef,
     mutant: Mutant,
 ) -> bool:
     """Check if a surviving mutant is semantically equivalent.
@@ -3625,6 +6636,10 @@ def check_equivalent(
     Skips methods (self/cls parameter) since we cannot synthesize a
     meaningful instance for boundary testing.
     """
+    # μ⁻ Form B (§18 Q3): a runtime-wrapper perturbation has no compilable mutant, so route it to the
+    # runtime mirror rather than compile a synthetic marker (which would except → a false NOT-equivalent).
+    if mutant.wrapper_factory is not None:
+        return _check_equivalent_wrapper(func_node, mutant)
     # Methods: can't provide meaningful self — skip equivalence check
     if func_node.args.args and func_node.args.args[0].arg in ("self", "cls"):
         return False
@@ -3636,7 +6651,7 @@ def check_equivalent(
         orig_ns: dict[str, Any] = {}
         exec(orig_code, orig_ns)  # noqa: S102
 
-        mut_mod = ast.Module(body=[mutant.mutated_node], type_ignores=[])  # type: ignore[list-item]
+        mut_mod = _mutant_module(mutant.mutated_node)
         ast.fix_missing_locations(mut_mod)
         mut_code = compile(mut_mod, "<mutant>", "exec")
         mut_ns: dict[str, Any] = {}
@@ -3688,7 +6703,7 @@ def check_equivalent(
 
 
 def run_function_converged(
-    func_node: ast.FunctionDef,
+    func_node: ast.FunctionDef | ast.AsyncFunctionDef,
     func_key: str,
     categories: set[MutationCategory],
     test_functions: list[Callable[..., None]],
@@ -3704,6 +6719,7 @@ def run_function_converged(
     trace_budget_s: float | None = DEFAULT_TRACE_BUDGET_S,
     trace_progress: Callable[[int, int, float], None] | None = None,
     trace_session_budget_s: float | None = DEFAULT_TRACE_SESSION_BUDGET_S,
+    widen_tests: list[Callable[..., None]] | None = None,
 ) -> ProfilingResult:
     """Multi-pass convergence with integrated equivalence detection.
 
@@ -3789,6 +6805,7 @@ def run_function_converged(
     # real callable to trace against; callers that stub it get the full test set, which
     # is always sound, just slower.
     _trace_truncated: set[str] = set()
+    _baseline_uncontained: set[str] = set()
     _tests_for, line_cov, exec_lines, failing = _build_test_scope(
         func_node,
         test_functions,
@@ -3800,12 +6817,39 @@ def run_function_converged(
         _trace_truncated,
         trace_progress,
         trace_session_budget_s,
+        _baseline_uncontained,
     )
+    # Before the mutation loop: re-observe this function's covering tests fresh (same seam as the
+    # profiling path), so a warm run's replayed reach is promoted back to admissible (#20). If it
+    # spliced, RE-DERIVE the scope from the freshened basis with FRESH containers (see the profiling
+    # path for why the pre-freshen locals must not be reused).
+    if _freshen_proof_covering(test_functions, line_cov, exec_lines, scope_tests):
+        _trace_truncated = set()
+        _baseline_uncontained = set()
+        _tests_for, line_cov, exec_lines, failing = _build_test_scope(
+            func_node,
+            test_functions,
+            original_func,
+            scope_tests,
+            None,
+            qualname,
+            trace_budget_s,
+            _trace_truncated,
+            trace_progress,
+            trace_session_budget_s,
+            _baseline_uncontained,
+        )
 
     seen: dict[str, MutantResult] = {}
     kill_matrix: dict[str, list[str]] = {}
     survivor_records: list[dict] = []
     killed_records: list[dict] = []
+    # The Mutant OBJECTS of the true survivors (not equivalents), for the Fix B widen pass to
+    # re-evaluate against unknowns. Keyed by id so the widen can drop one as it moves to killed.
+    _survivor_mutants: dict[str, Mutant] = {}
+    uncontained_stop = (
+        False  # #14: set when a worker could not be stopped — halt all remaining passes
+    )
 
     for pass_idx in range(passes):
         if _elapsed(start) > budget_ms:
@@ -3826,17 +6870,27 @@ def run_function_converged(
             # Only the tests that EXECUTE this mutant's line can kill it; the rest
             # behave identically under the mutation, so running them is pure cost.
             scoped = _tests_for(mutant)
+            # Full-matrix mode runs every test, so budget for the whole suite (~50ms/test)
+            # rather than the first-killer per-mutant cap.
+            _cap_ms = (
+                max(per_mutant_timeout_ms, 50.0 * len(scoped))
+                if full_matrix
+                else per_mutant_timeout_ms
+            )
+            # …and the cap NEVER exceeds the remaining aggregate deadline, exactly as the
+            # exhaustive path does it (#13). This loop checked the budget before each mutant and
+            # then handed `evaluate_mutant` the flat cap, so one mutant could overrun the entire
+            # remaining wall. Measured on the same function and suite: this path's elapsed time
+            # was INVARIANT to the budget (25ms -> 525ms, 150ms -> 524ms) while the exhaustive
+            # path tracked it (25ms -> 40ms, 150ms -> 165ms). #13 reached the exhaustive path
+            # only — and this is the one `ci.profile_function` -> `profile_file` ->
+            # `profile_codebase` -> the GitHub Action actually runs.
+            _remaining_ms = budget_ms - _elapsed(start)
             result = evaluate_mutant(
                 mutant,
                 scoped,
                 original_func,  # type: ignore[arg-type]
-                # Full-matrix mode runs every test, so budget for the whole
-                # suite (~50ms/test) rather than the first-killer per-mutant cap.
-                timeout_ms=(
-                    max(per_mutant_timeout_ms, 50.0 * len(scoped))
-                    if full_matrix
-                    else per_mutant_timeout_ms
-                ),
+                timeout_ms=_adaptive_allowance(None, _cap_ms, _remaining_ms),
                 qualname=qualname,
                 record_all_killers=full_matrix,
                 source_path=source_path,
@@ -3844,16 +6898,52 @@ def run_function_converged(
 
             # Integrated equivalence: check survivors immediately
             if not result.killed:
-                if check_equivalent(func_node, mutant):
+                # TCE first (#24): a pure function of two code objects — no execution, no test
+                # run — and SOUND, since identical bytecode cannot behave differently. It is
+                # both cheaper than the boundary probes and strictly stronger, so it decides
+                # before they run. A miss falls through and costs nothing; different bytecode
+                # is not evidence of inequivalence, so the probes still get their turn.
+                _warrant = (
+                    WARRANT_BYTECODE
+                    if nodes_equivalent(func_node, mutant.mutated_node)
+                    else ""
+                )
+                if _warrant or check_equivalent(func_node, mutant):
+                    # Carry the execution phases across (#18). Rebuilding the result from
+                    # scratch here silently restored the dataclass DEFAULTS — `constructed=True,
+                    # installed=True, entered=None` — so a mutant that was never built or never
+                    # entered came out of this branch looking like a normally-evaluated
+                    # equivalent, and its disposition was erased before the denominator ever
+                    # saw it. A partial reconstruction of a record is a data-loss bug wearing
+                    # the shape of a constructor call.
                     result = MutantResult(
                         mutant=mutant,
                         killed=False,
                         equivalent=True,
+                        equivalence_warrant=_warrant,
+                        constructed=result.constructed,
+                        installed=result.installed,
+                        entered=result.entered,
                         elapsed_ms=result.elapsed_ms,
                     )
 
             seen[mutant.mutant_id] = result
-            if mutant.dimension and not _is_dead(mutant.dimension):
+            # The SECOND denominator (#18). `dims_covered` is a different accounting axis from
+            # `CategoryResult.total` and lives in a different loop, so gating the aggregation
+            # left this one inflated: a dimension whose only mutant was never built or never
+            # entered was still counted as COVERED, which is the same claim-without-measurement
+            # in a quantity Detective reads directly.
+            _scored = (
+                mutant_disposition(
+                    result.constructed,
+                    result.installed,
+                    result.entered,
+                    True,
+                    result.killed,
+                )
+                in SCORED_DISPOSITIONS
+            )
+            if _scored and mutant.dimension and not _is_dead(mutant.dimension):
                 dim_key = f"{mutant.category.value}\x00{mutant.dimension}"
                 dims_covered.add(dim_key)
                 # A dimension counts as PINNED only when a test DISTINGUISHED the mutant's
@@ -3907,16 +6997,184 @@ def run_function_converged(
             elif result.equivalent:
                 record["equivalent"] = True
                 survivor_records.append(record)
+                # A seed-declared equivalent may be a FALSE equivalent (#Fix B): `check_equivalent`
+                # ran against a mutant with an EMPTY seed covering set, so its boundary inputs never
+                # exercised a branch an unknown test reaches. The widen re-evaluates it too — a
+                # TRULY equivalent mutant stays equivalent (no test kills it), which is why this is
+                # sound; a false one is killed, matching a full run that scoped it to that test and
+                # never reached the equivalence check.
+                _survivor_mutants[mutant.mutant_id] = mutant
             else:
                 survivor_records.append(record)
+                # A true survivor: the widen may kill it with an unknown test the seed never traced.
+                _survivor_mutants[mutant.mutant_id] = mutant
+
+            # #14 (reopened): an uncontained worker (abandon could not stop it) is STILL ALIVE —
+            # burning a core and able to perturb every later mutant's timing. Keep THIS mutant's
+            # result (partial evidence), but stop NOW rather than measure more against a compromised
+            # process — and, because this path loops over passes, halt the OUTER loop too. The
+            # exhaustive path already breaks here; converged must not keep spawning workers alongside
+            # a runaway. `all_contained` (below) already forces the run non-gateable / depth="cut".
+            if not result.contained:
+                uncontained_stop = True
+                break
+
+        if uncontained_stop:
+            break
+
+    # ── LAZY WIDENING (Fix B) ──────────────────────────────────────────────────────────────
+    # The loop above ran against the SEEDED baseline (candidate tests only, when the caller seeded
+    # the holder). A surviving mutant may be killed by an UNKNOWN test the seed never traced, so
+    # before conceding a survivor, widen the baseline with `widen_tests` and re-evaluate ONLY the
+    # true survivors against it. `seed(A) + expand(B)` is byte-identical to a full trace over
+    # `A∪B` (LazySessionBaseline.expand), so a survivor can only move survivor->killed here, never
+    # the reverse — the final verdict equals the full-suite verdict (the differential oracle pins
+    # this). `test_functions` already contains the unknowns, so they become runnable once their
+    # coverage enters `line_cov`; equivalents are excluded (no test kills them), and a killed mutant
+    # is already resolved. If `expand` degrades (a partial build failed) it invalidates the holder,
+    # so the re-derived scope below rebuilds the FULL baseline — still a complete basis, never a
+    # seed-only false survivor.
+    _widen_holder = _SESSION_BASELINE.get()
+    # ── ITEM-INCREMENTAL WIDEN (Fix B / #15 C) — see run_function_profiling for the full rationale.
+    # Converged's obligation is `_survivor_mutants`, which already carries the PROVISIONALLY-EQUIVALENT
+    # mutants re-added above: an empty/partial seed can misclassify a mutant equivalent, so the widen
+    # must re-observe them too — a truly-equivalent one keeps the obligation open (forcing the full
+    # traversal that CONFIRMS equivalence), a false one is killed and pruned early. Trace the unknowns
+    # one micro-batch at a time in stratum order, stopping the instant every obligation discharges. A
+    # containment loss or a budget cut mid-widen ends it as `unresolved` (loop control only —
+    # converged's own gateability path is unchanged), never a false gap; a true gap only once the
+    # unknowns are exhausted.
+    _remaining_widen = (
+        list(widen_tests)
+        if (
+            widen_tests
+            and not uncontained_stop
+            and _widen_holder is not None
+            and _elapsed(start) <= budget_ms
+        )
+        else []
+    )
+    _widen_cut = False
+    while (
+        next_routing_action(
+            has_open_obligations=bool(_survivor_mutants),
+            has_remaining_items=bool(_remaining_widen),
+            containment_lost=uncontained_stop or _widen_cut,
+        )
+        == "trace_next"
+    ):
+        if _elapsed(start) > budget_ms:
+            _widen_cut = True
+            break
+        _batch, _remaining_widen = _remaining_widen[:1], _remaining_widen[1:]
+        # `_remaining_widen` is non-empty only when the holder is non-None (set together above).
+        assert _widen_holder is not None
+        _widen_holder.expand(_batch)
+        _wt: set[str] = set()
+        _wu: set[str] = set()
+        _tests_for, line_cov, exec_lines, failing = _build_test_scope(
+            func_node,
+            test_functions,
+            original_func,
+            scope_tests,
+            None,
+            qualname,
+            trace_budget_s,
+            _wt,
+            trace_progress,
+            trace_session_budget_s,
+            _wu,
+        )
+        _trace_truncated |= _wt
+        _baseline_uncontained |= _wu
+        for _mid, _mutant in list(_survivor_mutants.items()):
+            if _elapsed(start) > budget_ms:
+                _widen_cut = True
+                break
+            _scoped = _tests_for(_mutant)
+            _cap_ms = (
+                max(per_mutant_timeout_ms, 50.0 * len(_scoped))
+                if full_matrix
+                else per_mutant_timeout_ms
+            )
+            _remaining_ms = budget_ms - _elapsed(start)
+            _res = evaluate_mutant(
+                _mutant,
+                _scoped,
+                original_func,  # type: ignore[arg-type]
+                timeout_ms=_adaptive_allowance(None, _cap_ms, _remaining_ms),
+                qualname=qualname,
+                record_all_killers=full_matrix,
+                source_path=source_path,
+            )
+            if not _res.killed:
+                continue  # still a survivor after widening — the honest gap
+            # Move survivor -> killed across EVERY view. `seen` drives the per-category
+            # re-derivation below, so updating it fixes the counts; the record/matrix/dims views
+            # are built inline in the main loop and must be updated to match it exactly.
+            seen[_mid] = _res
+            survivor_records[:] = [
+                r for r in survivor_records if r["mutant_id"] != _mid
+            ]
+            _record = {
+                "mutant_id": _mutant.mutant_id,
+                "mutant": _mutant.description,
+                "category": _mutant.category.value,
+                "mutated_line": _mutant.mutated_line,
+                "dimension": _mutant.dimension,
+                "change": _mutant_change(_mutant),
+                "diff_summary": _mutant_diff(_mutant),
+                "elapsed_ms": round(_res.elapsed_ms, 1),
+                "killed_by": _res.killed_by,
+                "test": _res.test_name,
+            }
+            killed_records.append(_record)
+            if full_matrix and _res.killed_by_tests:
+                kill_matrix.setdefault(_mutant.description, []).extend(
+                    _res.killed_by_tests
+                )
+            elif _res.test_name:
+                kill_matrix.setdefault(_mutant.description, []).append(_res.test_name)
+            if (
+                mutant_disposition(
+                    _res.constructed, _res.installed, _res.entered, True, _res.killed
+                )
+                in SCORED_DISPOSITIONS
+                and _mutant.dimension
+                and not _is_dead(_mutant.dimension)
+            ):
+                _dk = f"{_mutant.category.value}\x00{_mutant.dimension}"
+                dims_covered.add(_dk)
+                if _res.killed_by == "assertion":
+                    dims_pinned.add(_dk)
+            del _survivor_mutants[_mid]
 
     # Aggregate by category
     results_by_cat: dict[MutationCategory, CategoryResult] = {}
+    # #14: cleared if any timed-out worker could not be stopped. Seeded from the BASELINE
+    # phases, not just the mutation loop — this path read only its own `seen` records, so #19's
+    # baseline-containment fix existed on `run_function_profiling` and was absent here, on the
+    # path `ci.profile_function` -> `profile_file` -> `profile_codebase` -> the GitHub Action
+    # actually runs. A zero-mutant run (`seen` empty) therefore left this True and published a
+    # clean badge over a live runaway.
+    all_contained = not _baseline_uncontained
     for result in seen.values():
+        if not result.contained:
+            all_contained = False
         cat = result.mutant.category
         cr = results_by_cat.setdefault(cat, CategoryResult(category=cat))
-        cr.total += 1
-        if result.killed:
+        # Same denominator rule as `run_function_profiling` (#18) — the two loops report the
+        # same quantity to the same consumers, so a gate applied to one and not the other is
+        # a drift the shared `CategoryResult` cannot express. See that site for why
+        # containment is passed as True here rather than routed through the disposition.
+        disposition = mutant_disposition(
+            result.constructed, result.installed, result.entered, True, result.killed
+        )
+        if disposition not in SCORED_DISPOSITIONS:
+            cr.unscored += 1
+            cr.unscored_by[disposition] = cr.unscored_by.get(disposition, 0) + 1
+        elif result.killed:
+            cr.total += 1
             cr.killed += 1
             if result.killed_by == "assertion":
                 cr.killed_by_assertion += 1
@@ -3929,9 +7187,11 @@ def run_function_converged(
             elif result.killed_by == "timeout":
                 cr.timed_out += 1
         elif result.equivalent:
+            cr.total += 1
             cr.equivalent += 1
             cr.survived += 1
         else:
+            cr.total += 1
             cr.survived += 1
 
     per_cat = list(results_by_cat.values())
@@ -3942,12 +7202,33 @@ def run_function_converged(
     budget_exhausted = _elapsed(start) > budget_ms
 
     # Determine coverage depth
-    if total >= universe > 0:
+    if budget_exhausted or not all_contained:
+        # An INVALIDATED measurement — the budget overran or a worker could not be contained
+        # (#13/#14) — is CUT, not a legitimate sample: `is_gateable` is already False, and marking
+        # the depth "cut" (as the exhaustive path does) is what lets the codebase rollup and the CI
+        # gate DROP it rather than count it as a completeness measurement. A clean sample keeps its
+        # own depth below; only invalidation overrides to "cut".
+        depth = "cut"
+    elif total >= universe > 0:
         depth = "profiled"
     elif passes > 1:
         depth = "converged"
     else:
         depth = "sampled"
+
+    # Read ONCE per result, next to the gate that consumes it (#58): the live collection's
+    # own answer about module identity, not a reconstruction of it.
+    # Read the collection identity the SESSION BASELINE captured under scope (#58): a live read here
+    # would find `_LAST_MANIFEST` overwritten to scope 0 by the per-mutant discoveries and report
+    # `unobserved`. Fall back to a live read only when there is no session baseline (a standalone
+    # profile outside a live session), where the direct answer is the only one available.
+    # Read session identity from the session ContextVar (#5), never from the (mutable) baseline — a
+    # per-function fork or a widen splice would drop a baseline copy. Fall back to a direct live read
+    # ONLY for a standalone profile outside a live session (where no session identity was captured).
+    _ident = session_identity()
+    if _ident is None:
+        _ident = _live_collection_identity()
+    _identity_standing, _identity_conflicts, _identity_basis = _ident
 
     return ProfilingResult(
         function_key=func_key,
@@ -3962,7 +7243,14 @@ def run_function_converged(
         dof_covered=len(dims_covered),
         dof_pinned=len(dims_pinned),
         coverage_depth=depth,
-        is_gateable=depth == "profiled",
+        is_gateable=_measurement_gateable(
+            depth == "profiled",
+            all_contained,
+            not budget_exhausted,
+            _identity_standing != "ambiguous",
+        ),
+        collection_conflicts=_identity_conflicts,
+        proof_basis=_identity_basis,
         per_category=per_cat,
         kill_matrix=kill_matrix,
         survivor_records=survivor_records,

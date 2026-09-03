@@ -48,7 +48,10 @@ __all__ = ["session_callables", "run_in_session"]
 try:  # pytest is an OPTIONAL dependency — this module degrades to a no-op without it.
     import pytest as _pytest
 
-    _hookwrapper = _pytest.hookimpl(hookwrapper=True)
+    # The no-pytest fallback below is a `def`, so the checker reads THAT as the declaration
+    # and this real decorator as a conflicting reassignment. Both are "callable that returns
+    # its argument"; only the fallback's shape is expressible here.
+    _hookwrapper = _pytest.hookimpl(hookwrapper=True)  # type: ignore[assignment]
 except Exception:  # pragma: no cover — no pytest: run_in_session returns None anyway
 
     def _hookwrapper(fn):  # type: ignore[misc]
@@ -208,7 +211,9 @@ def _make_item_callable(item: Any, capture: _ExcCapture) -> Callable[[], None]:
         # FunctionType's argdefs carries __defaults__ only; keyword-only defaults live
         # in __kwdefaults__ and must be copied across or every binding above is lost.
         rebound.__kwdefaults__ = dict(run.__kwdefaults__ or {})
-        run = rebound
+        # A rebound wrapper replaces the declared closure; the two are structurally the same
+        # callable, which the declared signature cannot express.
+        run = rebound  # ty: ignore[invalid-assignment]
     run.__name__ = name
     run.__qualname__ = str(getattr(item, "nodeid", name))
     if mod is not None:
@@ -224,7 +229,30 @@ def _make_item_callable(item: Any, capture: _ExcCapture) -> Callable[[], None]:
         # so a constant source collapses the fingerprint: editing a test would no longer
         # invalidate its cache and stale verdicts would be served as fresh ones — the
         # false-survivor bug that cache exists to prevent.
-        run.__wrapped__ = fn
+        run.__wrapped__ = fn  # type: ignore[attr-defined]  # ty: ignore[unresolved-attribute] — functools.wraps sets it; not in the stub
+    origin = getattr(item, "path", None) or getattr(item, "fspath", None)
+    if origin is not None:
+        with contextlib.suppress(Exception):
+            # The origin tag makes `ci.callable_origin` total for this wrapper even
+            # when the item has no `function` (no __wrapped__ to follow).
+            run.__wesker_origin__ = str(origin)  # type: ignore[attr-defined]  # ty: ignore[unresolved-attribute]
+    # Fixture-closure origins (#15): the files where this item's fixtures are DEFINED. A test can
+    # reach the target ONLY through a fixture — autouse, a conftest fixture, a plugin — while its
+    # own body names nothing; a static name scan then drops it as irrelevant (reproduced: an
+    # autouse fixture calling the target, the test dropped, read as "no test reaches this target").
+    # Stamping the fixture-definition files lets routing keep it on a fixture edge. Best-effort:
+    # any failure leaves the tag absent, which routes to `unknown` (kept), never breaking collection.
+    with contextlib.suppress(Exception):
+        _info = getattr(item, "_fixtureinfo", None)
+        _name2defs = getattr(_info, "name2fixturedefs", None) or {}
+        _fx_origins: set[str] = set()
+        for _defs in _name2defs.values():
+            for _fd in _defs or ():
+                _code = getattr(getattr(_fd, "func", None), "__code__", None)
+                _f = getattr(_code, "co_filename", None)
+                if _f:
+                    _fx_origins.add(str(_f))
+        run.__wesker_fixture_origins__ = tuple(sorted(_fx_origins))  # type: ignore[attr-defined]  # ty: ignore[unresolved-attribute]
     return run
 
 
@@ -308,6 +336,17 @@ def run_in_session(
             diagnostic["reason"] = "pytest_missing"
         return None
 
+    # The live session captures its OWN manifest, stamped with this session's scope (#26). The
+    # collect-only discovery sets a process-global "last manifest"; consuming that on the live
+    # path let a prior project's collection authorize this measurement. `_LAST_MANIFEST` is
+    # token-set inside the collection hook and reset in `finally`, so it is bound only for the
+    # window `body` runs in and restores the enclosing value on the way out.
+    from Wesker.pytest_discovery import (
+        _LAST_MANIFEST,
+        _MEASUREMENT_SCOPE,
+        _SCOPE_COUNTER,
+    )
+
     box: dict[str, Any] = {}
     capture = _ExcCapture()
     collect_errors = _CollectionErrorCapture()
@@ -316,6 +355,34 @@ def run_in_session(
     real_stdout, real_stderr = sys.stdout, sys.stderr
 
     class _Driver:
+        def pytest_collection_modifyitems(self, session, config, items) -> None:  # type: ignore[no-untyped-def]
+            # Capture THIS live session's regime from the live Config/Session, stamped with the
+            # active scope (#26). Same hook the collect-only backend uses, but bound to the
+            # session that will actually measure, so `_live_collection_identity` reads the
+            # runner's own answer instead of whatever was collected last. Never allowed to fail
+            # the collection: the measurement is the product, its description is not.
+            try:
+                from Wesker.session_manifest import capture_manifest
+
+                box["manifest_token"] = _LAST_MANIFEST.set(
+                    capture_manifest(session, config, items)
+                )
+            except Exception:  # noqa: BLE001 — a manifest that raises breaks a working run
+                pass
+            # Surface the collection errors this live session captured (a test that failed to COLLECT
+            # is silently absent from the routed suite, so its target's COMPLETE claim is unsafe).
+            # `collect_errors` accumulated them via its own pytest_collectreport, which fired during
+            # THIS collection before modifyitems; set the shared ContextVar fresh (empty when clean) so
+            # `last_collection_errors()` names this session's collection, mirroring `_LAST_MANIFEST`.
+            try:
+                from Wesker.pytest_discovery import _LAST_COLLECTION_ERRORS
+
+                _LAST_COLLECTION_ERRORS.set(
+                    tuple(nid for nid, _ in collect_errors.errors)
+                )
+            except Exception:  # noqa: BLE001 — describing the run must not fail the run
+                pass
+
         def pytest_runtestloop(self, session):  # type: ignore[no-untyped-def]
             if (
                 session.testsfailed
@@ -384,26 +451,54 @@ def run_in_session(
         "--capture=sys",
         "--continue-on-collection-errors",
     ]
-    args += paths or ["."]
+    # When the caller SCOPES (`paths` given), collect exactly those — the #15 optimisation. When it
+    # does NOT, pass no explicit path so pytest resolves collection the way the SUITE does, honoring
+    # `testpaths`. `["."]` defeated that: an explicit path arg makes pytest IGNORE `testpaths`, so a
+    # suite pytest collects ONLY because testpaths names it — a bare `test.py` — came back EMPTY, and
+    # the caller's loud fallback (paths=None) passed `["."]` too and stayed empty. cwd is already
+    # `project_root`, so a no-path run collects from the right root. Found dogfooding python-slugify.
+    args += paths or []
     cwd = os.getcwd()
     prev_path = list(sys.path)
+    # Retain pytest's exit code and captured output (#66). A conftest / config that fails to LOAD —
+    # e.g. `import keras` in conftest.py with keras uninstalled — dies before the collection hook that
+    # populates `collect_errors` can fire, so `collect_errors.errors` is empty; but pytest exits with
+    # a collection/config code (2/3/4) and prints the ImportError to stderr. Discarding both left the
+    # run indistinguishable from a genuinely empty suite.
+    stdout_buf = io.StringIO()
+    stderr_buf = io.StringIO()
+    rc = 0
+    # Mint this session's scope BEFORE collection, so the manifest hook above stamps it and the
+    # consumer inside `body` admits only this session's manifest (#26). Reset in `finally` — with
+    # the manifest token — restores the enclosing scope even if collection or the body raises.
+    scope_token = _MEASUREMENT_SCOPE.set(next(_SCOPE_COUNTER))
     try:
         os.chdir(project_root)
         if project_root not in sys.path:
             sys.path.insert(0, project_root)
         if quiet:
             with (
-                contextlib.redirect_stdout(io.StringIO()),
-                contextlib.redirect_stderr(io.StringIO()),
+                contextlib.redirect_stdout(stdout_buf),
+                contextlib.redirect_stderr(stderr_buf),
             ):
-                pytest.main(args, plugins=[_Driver(), capture, collect_errors])
+                rc = int(
+                    pytest.main(args, plugins=[_Driver(), capture, collect_errors])
+                )
         else:
-            pytest.main(args, plugins=[_Driver(), capture, collect_errors])
+            rc = int(pytest.main(args, plugins=[_Driver(), capture, collect_errors]))
     except Exception:
         if diagnostic is not None:
             diagnostic["reason"] = "pytest_crashed"
         return None
     finally:
+        # Restore the live-manifest and scope this session bound, innermost first, so a nested
+        # or sequential session sees the enclosing context exactly as it was (#26).
+        manifest_token = box.get("manifest_token")
+        if manifest_token is not None:
+            with contextlib.suppress(Exception):
+                _LAST_MANIFEST.reset(manifest_token)
+        with contextlib.suppress(Exception):
+            _MEASUREMENT_SCOPE.reset(scope_token)
         sys.path[:] = prev_path
         with contextlib.suppress(Exception):
             os.chdir(cwd)
@@ -427,9 +522,29 @@ def run_in_session(
         diagnostic["errors"] = collect_errors.errors
     if not box.get("ran"):
         if diagnostic is not None:
-            diagnostic["reason"] = (
-                "collection_errors" if collect_errors.errors else "empty_collection"
-            )
+            if collect_errors.errors:
+                diagnostic["reason"] = "collection_errors"
+            elif rc in (2, 3, 4):
+                # No session, no per-test collection error recorded, yet pytest exited with a
+                # collection / internal / usage code (#66): the signature of a conftest or config
+                # that failed to LOAD before the collection hook fired. That is a collection ERROR,
+                # not an empty suite — classify it so, and carry the captured error so the caller
+                # names the real cause (the missing import) instead of "check your testpaths".
+                raw = (stderr_buf.getvalue() or stdout_buf.getvalue()).strip()
+                err_lines = [ln.strip() for ln in raw.splitlines() if "Error" in ln]
+                detail = (
+                    (err_lines[-1] + "\n" + raw)
+                    if err_lines
+                    else (
+                        raw
+                        or f"pytest exited {rc} before any test ran — a conftest or config failed to load"
+                    )
+                )
+                diagnostic["reason"] = "collection_errors"
+                if not diagnostic.get("errors"):
+                    diagnostic["errors"] = (("conftest/config load", detail),)
+            else:
+                diagnostic["reason"] = "empty_collection"
         return None
     return box.get("result")
 

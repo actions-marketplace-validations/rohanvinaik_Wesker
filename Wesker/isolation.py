@@ -1,0 +1,697 @@
+"""Isolated worker execution — the gateable execution mode (#19).
+
+In-process execution shares `sys.modules`, cwd, environment, patched attributes, plugin and
+fixture lifecycle, and any singleton a test touches. It is CONDITIONALLY gateable: a hermetic test
+measures honestly, but a test that leaves state behind, spawns a thread the interpreter cannot
+join, or blocks in a subprocess/socket/C-extension cannot be contained in-process — a Python
+thread cannot be killed, only asked to stop, and `interrupt.abandon` reports honestly when the ask
+fails.
+
+A separate PROCESS can be killed. This module runs the exact pytest node IDs in a child process
+placed in its own process GROUP (`start_new_session`), so a timeout terminates the whole group —
+the worker AND any child it spawned — with an uncatchable ``SIGKILL`` that a thread abandon
+structurally cannot reach. Containment is therefore a REAL guarantee here, not a best-effort ask:
+the group is reaped, or the run reports uncontained and the measurement is cut.
+
+This is the parent-side primitive: spawn, feed a budget, terminate the group, classify the exit.
+The mutant-installation and node-ID lifecycle that run INSIDE the worker build on it.
+"""
+
+from __future__ import annotations
+
+import ast
+import contextlib
+import inspect
+import json
+import os
+import select
+import signal
+import subprocess
+import sys
+from collections.abc import Sequence
+from dataclasses import dataclass
+from typing import Any
+
+# Names whose presence in a test's OWN source marks a shape the in_process fast mode cannot contain
+# (#19). Matched against AST Name/Attribute identifiers, never raw text — a string literal or comment
+# that merely mentions "subprocess" must not refuse a hermetic test. Deliberately broad within each
+# group: over-refusal routes a test to the always-sound isolated mode, the safe direction.
+_SUBPROCESS_NAMES = frozenset(
+    {
+        "subprocess",
+        "multiprocessing",
+        "Popen",
+        "fork",
+        "forkpty",
+        "posix_spawn",
+        "posix_spawnp",
+    }
+)
+_THREAD_NAMES = frozenset({"threading", "_thread", "Thread", "start_new_thread"})
+_SIGNAL_NAMES = frozenset({"signal", "setitimer", "sigwait", "pthread_kill"})
+
+
+def isolated_test_outcome(returncode: int, timed_out: bool) -> str:
+    """Map an isolated pytest run's exit to a typed outcome (#19, pure — pinned).
+
+    pytest's exit code is the authoritative classifier, never a substring of its output (the same
+    discipline `Detective.certify.pytest_status` keeps for the in-process verifier): parsing text
+    is how "collected and failed" came to read as "could not collect". A ``timed_out`` run has no
+    trustworthy code — the worker was killed mid-flight — so it is named ``timeout`` before the
+    code is even consulted.
+
+    pytest's codes: 0 all passed, 1 tests failed, 2 collection/usage error, 3 internal error, 4
+    usage error, 5 no tests collected. Anything not 0/1/5 is ``error`` — an unknown non-green exit
+    must never read as a pass, so the default is not-green.
+    """
+    if timed_out:
+        return "timeout"
+    if returncode == 0:
+        return "passed"
+    if returncode == 1:
+        return "failed"
+    if returncode == 5:
+        return "no_tests"
+    return "error"
+
+
+@dataclass(frozen=True)
+class IsolatedRun:
+    """The outcome of one isolated worker execution (#19)."""
+
+    returncode: int
+    timed_out: bool
+    #: True only when the worker (and its process group) is CONFIRMED gone. A timeout that could
+    #: not reap the group — a process wedged in an uninterruptible syscall — is ``False``, and a
+    #: consumer must treat the measurement as uncontained/cut, exactly as the in-process path does.
+    contained: bool
+    stdout: str
+    #: The kill vocabulary the worker classified for this mutant (assertion/exception/crash), or
+    #: None. Set only on the server path, where a mutant's failure reasons cross back as data; the
+    #: one-shot and timeout paths leave it None (a timeout's reason is named by `mutant_verdict`).
+    killed_by: str | None = None
+    #: False when the mutant would not compile — the worker installed nothing, so the outcome
+    #: measures the harness, not the suite (#18). The engine scores that `harness_error`, outside
+    #: the denominator, never a survivor; True (the default) preserves every existing construction.
+    constructed: bool = True
+    #: The first node that failed under the mutant, for the kill matrix; None when none did.
+    test_name: str | None = None
+    #: Installation-and-entry proof (#18), from the server path. `installed` is True once any node
+    #: rebound an owner to the mutant; `ran` counts nodes that reached the call phase (0 keeps entry
+    #: `unobserved`, never a false `not_entered`); `entered_probe` is True when the mutant was CALLED.
+    #: Defaults preserve every prior construction (installed True, ran 0, entered_probe False).
+    installed: bool = True
+    ran: int = 0
+    entered_probe: bool = False
+    #: W#21 — memory budget signals from the server path. `memory_cut` is True when this mutant hit
+    #: the worker's address-space cap (a budget CUT, not a kill → non-gateable). `mem_enforced` says
+    #: whether the OS actually accepted the cap, so the parent reports an honest enforced/telemetry
+    #: capability rather than claiming a guarantee the platform did not keep.
+    memory_cut: bool = False
+    mem_enforced: bool = False
+
+    @property
+    def outcome(self) -> str:
+        return isolated_test_outcome(self.returncode, self.timed_out)
+
+
+def _terminate_group(proc: subprocess.Popen[str]) -> bool:
+    """SIGKILL the worker's whole process GROUP and confirm it is reaped. Returns contained.
+
+    `os.killpg` on the group id reaches every process the worker started — the child a thread
+    abandon leaves running. SIGKILL is uncatchable, so the group dies unless a process is wedged in
+    an uninterruptible (D-state) syscall; the bounded `wait` distinguishes "reaped" (contained)
+    from "could not confirm dead" (uncontained), rather than assuming the kill landed.
+    """
+    try:
+        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+    except (ProcessLookupError, OSError):
+        pass  # already gone — the wait below confirms it
+    try:
+        proc.wait(timeout=5.0)
+        return True
+    except subprocess.TimeoutExpired:
+        return False  # not confirmed dead — the honest answer is uncontained
+
+
+def run_pytest_node_isolated(
+    project_root: str,
+    node_ids: Sequence[str],
+    timeout_s: float,
+    *,
+    addopts_neutral: bool = False,
+) -> IsolatedRun:
+    """Run exact pytest ``node_ids`` in a killable child process group (#19).
+
+    The child runs under the project's OWN pytest regime (its addopts), the same soundness the
+    in-process verifier keeps (Detective #58): the certificate claims the project's real
+    configuration, so verification must use it. ``addopts_neutral`` is an explicit opt-out for a
+    caller that has already isolated the regime and only needs the node to run.
+
+    On timeout the ENTIRE process group is terminated and reaped; ``contained`` says whether that
+    was confirmed. The worker owns descriptor 1 for its own output — captured here, never streamed
+    — so a caller speaking a protocol on stdout is untouched.
+    """
+    argv = [sys.executable, "-m", "pytest", *node_ids, "-p", "no:cacheprovider"]
+    if addopts_neutral:
+        argv += ["-o", "addopts="]
+    proc = subprocess.Popen(
+        argv,
+        cwd=project_root,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        start_new_session=True,  # new session -> new process group -> killpg reaches children
+    )
+    try:
+        out, _ = proc.communicate(timeout=timeout_s)
+        return IsolatedRun(proc.returncode, False, True, out or "")
+    except subprocess.TimeoutExpired:
+        contained = _terminate_group(proc)
+        # Drain whatever the worker emitted before the kill, without blocking on a group that may
+        # not be fully gone; the outcome is already `timeout`, this is only for diagnostics.
+        try:
+            out, _ = proc.communicate(timeout=1.0)
+        except (subprocess.TimeoutExpired, ValueError):
+            out = ""
+        return IsolatedRun(-9, True, contained, out or "")
+
+
+def mutant_verdict(outcome: str) -> str:
+    """Map an isolated worker's pytest OUTCOME to a mutant verdict (#19, pure — pinned).
+
+    The worker runs the covering node IDs against the mutant; pytest's exit is the verdict.
+
+    * ``failed`` — a node FAILED under the mutant: the suite detected the mutation → ``killed``.
+    * ``timeout`` — the mutant made a node hang past its budget: a run-only kill, detected by time
+      → ``killed`` (the worker was terminated; containment travels separately on the run).
+    * ``passed`` — every node passed under the mutant: nothing distinguished it → ``survived``.
+    * ``no_tests`` / ``error`` — no node ran, or the run could not collect: this measures the
+      HARNESS, not the suite, and belongs on NEITHER side of the denominator → ``harness``, the
+      same discipline ``engine.mutant_disposition`` keeps for the in-process path so a collection
+      failure never inflates a kill score.
+    """
+    if outcome in ("failed", "timeout"):
+        return "killed"
+    if outcome == "passed":
+        return "survived"
+    return "harness"
+
+
+def classify_kill_reason(is_assertion: bool, is_declared_failure: bool) -> str:
+    """Name WHY one isolated node failed, in the engine's kill vocabulary (#19, pure — pinned).
+
+    The isolated worker runs real pytest, so a failure arrives as a report's ``excinfo`` rather
+    than the caught exception ``engine._run_test_with_timeout`` sees in-process — but the RULE
+    must be identical, or the isolated path's ``value_killed`` split silently disagrees with the
+    in-process one. That ladder, from engine.py:
+
+    * ``AssertionError`` → ``assertion`` — the test's assert pinned the return VALUE.
+    * a pytest DECLARED failure (``pytest.raises`` violated / ``pytest.fail``; see
+      ``engine._is_declared_failure``) → ``exception`` — a stated contract the mutant broke,
+      the same strength as an assertion (both make ``value_killed`` count).
+    * anything else that raised → ``crash`` — the mutant merely RAN differently; the value is
+      not pinned, so it is a run-only kill (a value-survivor downstream).
+
+    Assertion outranks a declared failure when both describe the same node, matching the
+    in-process ``except AssertionError`` arm winning over the ``BaseException`` arm. The impure
+    boundary supplies the two booleans off ``excinfo`` and NEVER calls this for a pass or a skip.
+    """
+    if is_assertion:
+        return "assertion"
+    if is_declared_failure:
+        return "exception"
+    return "crash"
+
+
+def aggregate_kill_reason(reasons: list[str]) -> str:
+    """Combine per-node kill reasons into ONE verdict for the mutant (#19, pure — pinned).
+
+    The worker runs several nodes in one pytest invocation, so a mutant can be killed by more
+    than one — one by assertion, another by crash. This is the same precedence
+    ``evaluate_mutant``'s ``record_all_killers`` branch keeps (its inline twin, kept in step so a
+    future refactor can share this): a VALUE PIN outranks a run-only kill, and among value pins
+    ``assertion`` is named before ``exception``. Order-independent — a mutant ANY node kills by
+    assertion is value-killed regardless of which node ran first. ``""`` when nothing killed
+    (every node passed); the caller reads the kill itself from pytest's exit code, not from here.
+    """
+    if "assertion" in reasons:
+        return "assertion"
+    if "exception" in reasons:
+        return "exception"
+    if "crash" in reasons:
+        return "crash"
+    return ""
+
+
+def run_mutant_isolated(
+    project_root: str,
+    node_ids: Sequence[str],
+    target_file: str,
+    func_qualname: str,
+    mutant_source: str,
+    timeout_s: float,
+) -> IsolatedRun:
+    """Evaluate ONE mutant against exact node IDs in a killable worker process (#19).
+
+    The worker (`Wesker._isolated_worker`) installs the mutant through the REAL pytest lifecycle —
+    the same `_patch_mutant_into_test` / `_unpatch_mutant` the in-process evaluator uses, from a
+    plugin — and exits with pytest's code; `IsolatedRun.outcome` + :func:`mutant_verdict` name the
+    result. A mutant that hangs is terminated with its whole process group, and ``contained`` says
+    whether that was confirmed, so a runaway mutant cannot leave a live worker perturbing the next
+    measurement — the containment the in-process thread path cannot guarantee.
+    """
+    payload = json.dumps(
+        {
+            "project_root": project_root,
+            "node_ids": list(node_ids),
+            "target_file": target_file,
+            "func_qualname": func_qualname,
+            "mutant_source": mutant_source,
+        }
+    )
+    proc = subprocess.Popen(
+        [sys.executable, "-m", "Wesker._isolated_worker"],
+        cwd=project_root,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        start_new_session=True,
+    )
+    try:
+        out, _ = proc.communicate(payload, timeout=timeout_s)
+        return IsolatedRun(proc.returncode, False, True, out or "")
+    except subprocess.TimeoutExpired:
+        contained = _terminate_group(proc)
+        try:
+            out, _ = proc.communicate(timeout=1.0)
+        except (subprocess.TimeoutExpired, ValueError):
+            out = ""
+        return IsolatedRun(-9, True, contained, out or "")
+
+
+def run_baseline_traced_isolated(
+    project_root: str,
+    node_ids: Sequence[str],
+    target_file: str,
+    timeout_s: float,
+) -> tuple[list[int], str, bool]:
+    """Trace the UNMUTATED baseline once in a fresh killable worker (#19).
+
+    Returns ``(covered_target_lines, outcome, contained)``. Two calls from matched fresh state feed
+    :func:`baseline_determinism`: a differing line-set or outcome across the two means the baseline
+    is not repeatable, so no verdict measured against it may gate. A timeout yields no lines and a
+    ``timeout`` outcome — itself an untrustworthy baseline. The worker traces the target file's line
+    events around a real pytest run and emits one JSON line; pytest's own output is captured inside
+    the worker, so the LAST line of stdout is the protocol payload even if a stray byte precedes it.
+    """
+    payload = json.dumps(
+        {
+            "project_root": project_root,
+            "node_ids": list(node_ids),
+            "target_file": target_file,
+        }
+    )
+    proc = subprocess.Popen(
+        [sys.executable, "-m", "Wesker._isolated_worker", "--baseline"],
+        cwd=project_root,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        start_new_session=True,
+    )
+    try:
+        out, _ = proc.communicate(payload, timeout=timeout_s)
+    except subprocess.TimeoutExpired:
+        contained = _terminate_group(proc)
+        return [], "timeout", contained
+    lines = [ln for ln in (out or "").splitlines() if ln.strip()]
+    if not lines:
+        return [], "error", True
+    try:
+        data = json.loads(lines[-1])
+        return list(data.get("lines", [])), str(data.get("outcome", "error")), True
+    except (ValueError, TypeError):
+        return [], "error", True
+
+
+def should_recycle(evaluated: int, max_per_worker: int) -> bool:
+    """Whether a persistent isolated worker has done enough mutants to recycle (#19, pure — pinned).
+
+    A worker reused across mutants can accumulate application state a per-test lifecycle does not
+    reset — a singleton, a registry, a module-level cache. Recycling to a fresh process after a
+    bounded count discards that drift before it can perturb a verdict; ``max_per_worker <= 0`` means
+    never recycle on count (a caller relying on other drift detection). The count is inclusive: at
+    exactly the cap the worker is spent.
+    """
+    return max_per_worker > 0 and evaluated >= max_per_worker
+
+
+def execution_mode_standing(execution_mode: str, measurement_gateable: bool) -> str:
+    """The gateability TIER a profiling result earns from its execution mode (#19, pure — pinned).
+
+    `measurement_gateable` is the result's existing measurement-level validity (`is_gateable`:
+    contained, in-budget, unambiguous identity, exhaustive depth). The standing layers the mode on
+    top of it, and it is INFORMATIONAL — it does not change `is_gateable`, so no in-process
+    certificate is downgraded before the fast-mode shape check (increment 5) gives "conditional" its
+    teeth.
+
+    * ``cut`` — the measurement is not valid to gate on for ANY reason the existing conjunction
+      already names (an uncontained worker, a cut budget, an ambiguous module identity). The mode
+      cannot rescue an invalid measurement, so this is checked first.
+    * ``gateable`` — measured under ``isolated``, where containment is a real SIGKILL guarantee: the
+      counts may gate a downstream verdict outright.
+    * ``conditional`` — measured under ``in_process``, where a runaway can only be ASKED to stop.
+      The counts are valid, but the mode's containment is best-effort, so gating is conditional on
+      the hermetic-shape check that increment 5 will require. Until then this is a label, not a gate.
+    """
+    if not measurement_gateable:
+        return "cut"
+    if execution_mode == "isolated":
+        return "gateable"
+    return "conditional"
+
+
+def fast_mode_standing(
+    spawns_subprocess: bool,
+    starts_background_thread: bool,
+    custom_collector: bool,
+    signal_main_thread: bool,
+    stateful_fixture: bool,
+) -> str:
+    """Whether the in_process FAST mode may be trusted for a test's SHAPE (#19, pure — pinned).
+
+    in_process containment is a thread abandon — it ASKS a runaway to stop and cannot force it. So
+    the fast mode is sound only for HERMETIC shapes; a test that escapes the interpreter or the
+    per-test lifecycle must be REFUSED to the isolated mode rather than measured on a guarantee the
+    mode cannot keep. Issue #19: "explicit warning/refusal for subprocess, background-thread, custom
+    collector, signal/main-thread, or stateful fixture requirements ... never silently upgraded to
+    the isolated guarantee." Each hazard is NAMED (a consumer reports which one refused), in the
+    issue's own listing order; all-clear is ``hermetic``.
+
+    Over-refusal is the safe direction: a shape wrongly flagged hazardous is merely routed to the
+    always-sound isolated mode, while a hazard wrongly cleared would measure on a false containment —
+    the one error a proof-facing tool must not make.
+    """
+    if spawns_subprocess:
+        return "refuse_subprocess"
+    if starts_background_thread:
+        return "refuse_thread"
+    if custom_collector:
+        return "refuse_collector"
+    if signal_main_thread:
+        return "refuse_signal"
+    if stateful_fixture:
+        return "refuse_fixture"
+    return "hermetic"
+
+
+def baseline_determinism(
+    coverage_a: list[int],
+    outcome_a: str,
+    coverage_b: list[int],
+    outcome_b: str,
+) -> str:
+    """Whether two fresh-state baseline runs agree — the proof-facing nondeterminism check (#19,
+    pure — pinned).
+
+    A gateable measurement must be REPEATABLE: run the unmutated baseline twice from matched fresh
+    state, and if the pass/fail outcome or the covered lines differ, the function is nondeterministic
+    and no mutant verdict measured against it can be trusted. Issue #19: "execute baseline more than
+    once from matched fresh state; classify inconsistent outcomes/coverage as nondeterministic."
+
+    Outcome is checked before coverage because a flipped pass/fail is the louder signal, but either
+    disagreement is decisive. Coverage is compared as a SET — order and repeats from the tracer are
+    not signal, only WHICH lines ran.
+    """
+    if outcome_a != outcome_b:
+        return "nondeterministic"
+    if set(coverage_a) != set(coverage_b):
+        return "nondeterministic"
+    return "deterministic"
+
+
+def hazards_from_names(names: list[str], parseable: bool) -> list[str]:
+    """Which fast-mode SHAPE hazards a set of referenced names reveals (#19, pure — pinned).
+
+    The DECISION half of :func:`scan_source_hazards`, split out to be pinnable: the AST walk that
+    collects the names is plumbing over `ast` objects `--input` cannot express, but the name-set ->
+    hazard mapping is a total function over ``list[str]``/``bool``. Returns the sorted subset of
+    {spawns_subprocess, starts_background_thread, signal_main_thread} present. ``parseable`` False
+    means the source could not be read at all, so every source-detectable hazard is reported — a scan
+    that cannot read the test must not silently clear it (over-refusal is the safe direction: the
+    isolated mode measures it soundly regardless).
+    """
+    if not parseable:
+        return ["signal_main_thread", "spawns_subprocess", "starts_background_thread"]
+    nameset = set(names)
+    hazards: list[str] = []
+    if nameset & _SUBPROCESS_NAMES:
+        hazards.append("spawns_subprocess")
+    if nameset & _THREAD_NAMES:
+        hazards.append("starts_background_thread")
+    if nameset & _SIGNAL_NAMES:
+        hazards.append("signal_main_thread")
+    return sorted(hazards)
+
+
+def scan_source_hazards(source: str) -> list[str]:
+    """Names the fast-mode SHAPE hazards a test's own source reveals (#19; AST-walk plumbing).
+
+    An AST walk, NOT a text scan: a `subprocess` named only in a comment, docstring, or string
+    literal must not refuse a hermetic test — only a real `Name`/`Attribute` reference counts (the
+    same discipline the repo's grep ban encodes). The walk over `ast` objects is not input-synthesis
+    pinnable, so it is hand-tested; the pinned decision it feeds is :func:`hazards_from_names`.
+    `custom_collector` and `stateful_fixture` come from the pytest item, not the source, and are
+    decided at bind time.
+    """
+    try:
+        tree = ast.parse(source)
+    except (SyntaxError, ValueError):
+        return hazards_from_names([], parseable=False)
+    names: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Attribute):
+            names.add(node.attr)
+            if isinstance(node.value, ast.Name):
+                names.add(node.value.id)
+        elif isinstance(node, ast.Name):
+            names.add(node.id)
+    return hazards_from_names(sorted(names), parseable=True)
+
+
+#: The shape facts `fast_mode_standing` consumes, in its parameter order — the key set of the
+#: `__wesker_shape__` tag and the argument names, kept identical so `fast_mode_standing(**facts)` binds.
+_SHAPE_KEYS = (
+    "spawns_subprocess",
+    "starts_background_thread",
+    "custom_collector",
+    "signal_main_thread",
+    "stateful_fixture",
+)
+
+
+def callable_shape_hazards(call: Any) -> dict[str, bool]:
+    """The fast-mode shape facts stamped on a discovered test callable (#19).
+
+    Accessor of the ``__wesker_shape__`` tag ``pytest_discovery`` stamps at collection, where the
+    live pytest item is in scope. Absent — a callable from the live-session path, an inline synthesis
+    callable, or any non-discovery source — every hazard defaults False (hermetic): those paths carry
+    no shape signal and must not be refused on a missing tag. A declaration may have overwritten a
+    detected value; this reads whatever stands.
+    """
+    stamped = getattr(call, "__wesker_shape__", None)
+    if not isinstance(stamped, dict):
+        return dict.fromkeys(_SHAPE_KEYS, False)
+    return {k: bool(stamped.get(k, False)) for k in _SHAPE_KEYS}
+
+
+def callable_is_hermetic(call: Any) -> bool:
+    """Whether a test callable is in_process-safe (hermetic), RESILIENT to the live-session path.
+
+    :func:`callable_shape_hazards` reads the ``__wesker_shape__`` stamp ``pytest_discovery`` sets at
+    NON-live collection. A LIVE-session callable carries NO stamp, so a stamped read defaults it
+    hermetic and any shape-aware ordering/gating over live tests would be a silent no-op. So when the
+    stamp is absent, RE-DERIVE the source-detectable hazards (:func:`scan_source_hazards`) from the
+    callable's own source, which the live path exposes via ``__wrapped__``. Unreadable source →
+    hermetic (conservative: never deprioritise a test we cannot classify). ``custom_collector`` /
+    ``stateful_fixture`` are only caught via the stamp — an accepted live-path gap; subprocess /
+    thread / signal (the isolation-FORCING hazards, which are the SLOW ones) are recovered either way.
+    """
+    stamped = getattr(call, "__wesker_shape__", None)
+    if isinstance(stamped, dict):
+        return fast_mode_standing(**callable_shape_hazards(call)) == "hermetic"
+    real = getattr(call, "__wrapped__", call)
+    try:
+        src = inspect.getsource(real)
+    except (OSError, TypeError):
+        return True
+    return not scan_source_hazards(src)
+
+
+def scope_fast_mode_standing(standings: list[str]) -> str:
+    """The fast-mode standing of a WHOLE scoped test set (#19, pure — pinned).
+
+    in_process is gateable only if EVERY covering test is hermetic: one hazardous test can leave
+    state, a live thread, or an unreaped subprocess that perturbs the others' measurement in the
+    shared interpreter. So the scope is ``hermetic`` only when all are; otherwise it takes the FIRST
+    refusal, so the hazard is NAMED rather than merely counted. An empty scope is ``hermetic`` —
+    nothing runs that could escape containment.
+    """
+    for standing in standings:
+        if standing != "hermetic":
+            return standing
+    return "hermetic"
+
+
+def entry_disposition(ran: int, entered: bool) -> str:
+    """Whether the isolated worker OBSERVED the mutant being entered (#18, pure — pinned).
+
+    Installation and ENTRY are different events (see ``engine._entry_probe``): a decorator,
+    ``lru_cache``, a closure cell, a registry list, or an object field can hold the ORIGINAL while
+    the namespace holds the mutant, so an installed mutant that a test never actually CALLS is a
+    survivor about our harness, not the user's tests — the exact adequacy inflation #18 exists to
+    stop.
+
+    But "no node ran" must NOT read as "not entered". With an empty run the entry probe was never
+    called, and scoring that ``not_entered`` would empty the denominator and report a function whose
+    covering tests never executed as fully specified — the one false COMPLETE this engine must never
+    produce. So ``ran <= 0`` is ``unobserved`` (the pre-#18 scored default, `entered=None`); only a
+    node that RAN without entering the mutant is ``not_entered``.
+    """
+    if ran <= 0:
+        return "unobserved"
+    return "entered" if entered else "not_entered"
+
+
+class IsolatedMutantWorker:
+    """A PERSISTENT isolated worker evaluating many mutants in one interpreter (#19).
+
+    The one-shot `run_mutant_isolated` pays pytest startup per mutant; this reuses one worker so a
+    whole survivor set is measured for the cost of one import, and the caller recycles it (via
+    `should_recycle` / a hang) rather than spawn per mutant. Every mutant is still installed and
+    torn down per test, so the mutant itself never leaks between evaluations; recycling bounds the
+    application-state drift a reused process can accumulate.
+
+    A single mutant that hangs terminates the whole process GROUP — the worker AND any child — and
+    marks this worker dead, so the caller recycles a fresh one; the hung mutant's result is a
+    contained timeout kill.
+    """
+
+    def __init__(
+        self,
+        project_root: str,
+        node_ids: Sequence[str],
+        target_file: str,
+        func_qualname: str,
+        mem_limit_bytes: int | None = None,
+    ) -> None:
+        self._proc = subprocess.Popen(
+            [sys.executable, "-m", "Wesker._isolated_worker", "--serve"],
+            cwd=project_root,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            start_new_session=True,
+        )
+        self._alive = True
+        self._evaluated = 0
+        # `mem_limit_bytes` caps the worker's whole address space ONCE at session start (W#21), so a
+        # runaway mutant fails as a catchable MemoryError instead of taking the box down; None leaves
+        # the worker uncapped (telemetry only).
+        session = json.dumps(
+            {
+                "project_root": project_root,
+                "node_ids": list(node_ids),
+                "target_file": target_file,
+                "func_qualname": func_qualname,
+                "mem_limit_bytes": mem_limit_bytes,
+            }
+        )
+        try:
+            assert self._proc.stdin is not None
+            self._proc.stdin.write(session + "\n")
+            self._proc.stdin.flush()
+        except (BrokenPipeError, ValueError, AssertionError):
+            self._alive = False
+
+    @property
+    def evaluated(self) -> int:
+        return self._evaluated
+
+    @property
+    def alive(self) -> bool:
+        return self._alive and self._proc.poll() is None
+
+    def evaluate(
+        self,
+        mutant_source: str,
+        timeout_s: float,
+        node_ids: Sequence[str] | None = None,
+    ) -> IsolatedRun:
+        """Evaluate ONE mutant on the reused worker. A hang kills the group and retires the worker.
+
+        ``node_ids`` overrides the session's set for THIS mutant — per-mutant test scoping, so the
+        isolated verdict matches the in-process scoped one (only the tests reaching the mutated line
+        run); None uses the session default the worker was opened with.
+        """
+        if not self.alive:
+            return IsolatedRun(-9, True, self._reap(), "")
+        spec: dict[str, Any] = {"mutant_source": mutant_source}
+        if node_ids is not None:
+            spec["node_ids"] = list(node_ids)
+        try:
+            assert self._proc.stdin is not None and self._proc.stdout is not None
+            self._proc.stdin.write(json.dumps(spec) + "\n")
+            self._proc.stdin.flush()
+        except (BrokenPipeError, ValueError, AssertionError):
+            self._alive = False
+            return IsolatedRun(-9, True, self._reap(), "")
+        ready, _, _ = select.select([self._proc.stdout], [], [], timeout_s)
+        if not ready:
+            # The mutant hung the worker. Kill the whole group and retire it — a fresh worker takes
+            # the next mutant, and this one is a contained timeout kill.
+            contained = self._reap()
+            self._alive = False
+            return IsolatedRun(-9, True, contained, "")
+        line = self._proc.stdout.readline()
+        if not line:  # the worker died mid-evaluation
+            self._alive = False
+            return IsolatedRun(-9, True, self._reap(), "")
+        self._evaluated += 1
+        try:
+            data = json.loads(line)
+            rc = int(data.get("rc", 2))
+        except (ValueError, TypeError):
+            data, rc = (
+                {},
+                2,
+            )  # unreadable line -> a collection-class code, never a silent pass
+        return IsolatedRun(
+            rc,
+            False,
+            True,
+            "",
+            killed_by=data.get("killed_by"),
+            constructed=bool(data.get("constructed", True)),
+            test_name=data.get("test_name"),
+            installed=bool(data.get("installed", True)),
+            ran=int(data.get("ran", 0)),
+            entered_probe=bool(data.get("entered", False)),
+            memory_cut=bool(data.get("memory_cut", False)),
+            mem_enforced=bool(data.get("enforced", False)),
+        )
+
+    def _reap(self) -> bool:
+        return _terminate_group(self._proc)
+
+    def close(self) -> None:
+        with contextlib.suppress(Exception):
+            if self._proc.stdin is not None:
+                self._proc.stdin.close()
+        if self._proc.poll() is None:
+            self._reap()
+        self._alive = False

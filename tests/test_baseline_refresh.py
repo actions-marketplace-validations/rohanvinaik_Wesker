@@ -99,7 +99,7 @@ def test_refresh_does_not_force_a_build_that_never_happened():
 
 
 def test_refresh_splices_into_a_built_baseline():
-    def build(subset=None):
+    def build(subset=None, fresh=False):
         return (
             _bl({"test_b": {"f.py": {9}}}, n_tests=1)
             if subset
@@ -119,7 +119,7 @@ def test_refresh_degrades_to_invalidate_when_the_partial_build_raises():
     # re-trace, which is exactly what invalidation did unconditionally.
     state = {"full": 0}
 
-    def build(subset=None):
+    def build(subset=None, fresh=False):
         if subset is not None:
             raise RuntimeError("the consumer's test blew up mid-trace")
         state["full"] += 1
@@ -145,7 +145,7 @@ def test_refresh_equals_a_full_rebuild():
         "test_new": {"f.py": {3}},
     }
 
-    def build(subset=None):
+    def build(subset=None, fresh=False):
         names = subset if subset is not None else list(suite)
         return _bl({n: suite[n] for n in names if n in suite}, n_tests=len(names))
 
@@ -173,11 +173,17 @@ def _write(tmp_path, name, body):
 def test_refreshing_one_file_keeps_a_same_named_test_in_another_module(
     tmp_path, monkeypatch
 ):
-    """`traced` is keyed by __name__ and UNIONS duplicates across files.
+    """A same-named test in ANOTHER module must not lose its coverage when one file is written.
 
-    So a name the written file merely SHARES cannot be dropped on its own — the other
-    owner's coverage would vanish with it, and every mutant that test kills would then
-    read as a survivor. The splice must re-trace every CURRENT owner of an affected name.
+    That loss is what the `__name__` union existed to prevent: dropping a shared name took the
+    other owner's coverage with it, and every mutant that test killed then read as a survivor.
+    Since issue #16 `traced` is keyed per ITEM, so the two owners occupy different entries and
+    the written file's splice cannot reach the other one at all.
+
+    THE INVARIANT IS UNCHANGED and is still what this asserts. What changed is that it now holds
+    STRUCTURALLY rather than being bought by re-tracing every current owner of the name — so the
+    second assertion below is the inverse of the one it replaces: the other owner must NOT be
+    re-traced, because there is no longer anything to compensate for.
     """
     target = _write(tmp_path, "test_written.py", "def test_shared():\n    pass\n")
 
@@ -187,16 +193,17 @@ def test_refreshing_one_file_keeps_a_same_named_test_in_another_module(
 
     other = _write(tmp_path, "test_other.py", "def test_shared():\n    pass\n")
     test_shared.__wesker_origin__ = other
+    other_id = ci.callable_test_id(test_shared)
 
     traced_with: list[list[str]] = []
 
-    def build(subset=None):
-        names = [getattr(c, "__name__", "?") for c in (subset or [])]
-        traced_with.append(names)
-        return _bl({n: {"f.py": {1}} for n in names}, n_tests=len(names))
+    def build(subset=None, fresh=False):
+        ids = [ci.callable_test_id(c) for c in (subset or [])]
+        traced_with.append(ids)
+        return _bl({i: {"f.py": {1}} for i in ids}, n_tests=len(ids))
 
     holder = LazySessionBaseline(build)
-    holder._value = _bl({"test_shared": {"f.py": {1}}}, n_tests=2)
+    holder._value = _bl({other_id: {"f.py": {1}}}, n_tests=2)
     holder._built = True
 
     suite_token = ci._LIVE_SUITE.set([test_shared])
@@ -208,12 +215,13 @@ def test_refreshing_one_file_keeps_a_same_named_test_in_another_module(
         _SESSION_BASELINE.reset(base_token)
 
     assert traced_with, "the splice never ran"
-    # The other module's same-named test is re-traced ALONGSIDE the written file's, so the
-    # union under that key still accounts for it. Dropping the key and re-adding only the
-    # written file's test would silently delete it.
-    assert "test_shared" in holder.get().traced
-    assert sum(n == "test_shared" for n in traced_with[-1]) >= 2, (
-        f"both owners of the shared name must be re-traced, got {traced_with[-1]}"
+    # THE INVARIANT: the other module's entry survives the write untouched.
+    assert other_id in holder.get().traced
+    # AND it cost nothing to keep. Distinct ids mean `affected` never contained the other
+    # owner, so the splice could not reach it — where the union had to re-trace every current
+    # owner of the name to protect exactly this entry.
+    assert other_id not in traced_with[-1], (
+        f"the other owner must not need re-tracing, got {traced_with[-1]}"
     )
 
 
@@ -238,3 +246,131 @@ def test_refresh_live_suite_replaces_only_the_written_files_callables(tmp_path):
         ci._LIVE_SUITE.reset(suite_token)
 
     assert kept_test in live  # the other file's callable is untouched
+
+
+# ── LazySessionBaseline.seed / expand: target-first incremental baseline (Fix B) ──
+
+
+def _suite_build(suite):
+    """A build closure over a name->coverage dict, treating `subset` as a name list (mirrors the
+    real closure, which traces exactly the callables it is handed)."""
+
+    def build(subset=None, fresh=False):
+        names = list(suite) if subset is None else list(subset)
+        return _bl({n: suite[n] for n in names if n in suite}, n_tests=len(names))
+
+    return build
+
+
+def test_seed_measures_only_the_candidate_subset():
+    suite = {"test_a": {"f.py": {1}}, "test_b": {"f.py": {2}}, "test_c": {"f.py": {3}}}
+    seen: list[list[str]] = []
+
+    def build(subset=None, fresh=False):
+        names = list(suite) if subset is None else list(subset)
+        seen.append(names)
+        return _bl({n: suite[n] for n in names if n in suite}, n_tests=len(names))
+
+    holder = LazySessionBaseline(build)
+    holder.seed(["test_a"])
+    # Only the candidate was measured — never the whole suite.
+    assert seen == [["test_a"]]
+    assert set(holder.get().traced) == {"test_a"}
+
+
+def test_seed_is_a_noop_once_built():
+    suite = {"test_a": {"f.py": {1}}, "test_b": {"f.py": {2}}}
+    holder = LazySessionBaseline(_suite_build(suite))
+    holder.seed(["test_a"])
+    holder.seed(["test_b"])  # must not re-measure or widen — once-per-session
+    assert set(holder.get().traced) == {"test_a"}
+
+
+def test_expand_adds_the_widened_batch_without_dropping_the_seed():
+    suite = {"test_a": {"f.py": {1}}, "test_b": {"f.py": {2}}, "test_c": {"f.py": {3}}}
+    holder = LazySessionBaseline(_suite_build(suite))
+    holder.seed(["test_a"])
+    assert holder.expand(["test_b", "test_c"]) is True
+    got = holder.get().traced
+    assert set(got) == {"test_a", "test_b", "test_c"}
+    assert got["test_a"] == {"f.py": {1}}  # the seed survives the widening verbatim
+
+
+def test_seed_then_expand_equals_a_full_rebuild():
+    """THE soundness property: incrementally seeding candidates then widening to the rest yields
+    the byte-identical baseline a full trace would — so early-stop-with-widen can never diverge
+    from the full-suite verdict."""
+    suite = {
+        "test_a": {"f.py": {1}},
+        "test_b": {"f.py": {2, 3}},
+        "test_c": {"g.py": {9}},
+        "test_d": {"f.py": {1}},
+    }
+    incremental = LazySessionBaseline(_suite_build(suite))
+    incremental.seed(["test_a", "test_b"])
+    incremental.expand(["test_c", "test_d"])
+    spliced = incremental.get()
+
+    full = LazySessionBaseline(_suite_build(suite))
+    rebuilt = full.get()
+
+    assert spliced.traced == rebuilt.traced
+    assert spliced.n_tests == rebuilt.n_tests
+
+
+def test_expand_degrades_to_invalidate_when_the_partial_build_raises():
+    suite = {"test_a": {"f.py": {1}}, "test_b": {"f.py": {2}}}
+    state = {"full": 0}
+
+    def build(subset=None, fresh=False):
+        if subset is not None and "test_b" in subset:
+            raise RuntimeError("the consumer's test blew up mid-trace")
+        if subset is None:
+            state["full"] += 1
+        names = list(suite) if subset is None else list(subset)
+        return _bl({n: suite[n] for n in names if n in suite}, n_tests=len(names))
+
+    holder = LazySessionBaseline(build)
+    holder.seed(["test_a"])
+    assert holder.expand(["test_b"]) is False
+    assert holder.built is False  # value dropped, not left half-spliced
+    holder.get()
+    assert state["full"] == 1  # the next read re-traced in full — correct, just slower
+
+
+def test_expand_is_a_noop_on_an_unbuilt_or_empty_batch():
+    holder = LazySessionBaseline(_suite_build({"test_a": {"f.py": {1}}}))
+    assert holder.expand(["test_a"]) is False  # nothing seeded yet -> nothing to widen
+    holder.seed(["test_a"])
+    assert holder.expand([]) is False  # empty batch -> no-op
+
+
+def test_seed_and_expand_trace_every_proof_facing_test_fresh():
+    # #15/#20: a cache may route, never prove. A stale "covers no target line" in either the seed
+    # or widen would drop a real killer from `_tests_for`, so both subsets are observed this session.
+    suite = {"test_a": {"f.py": {1}}, "test_b": {"f.py": {2}}}
+    fresh_by_call: list[bool] = []
+
+    def build(subset=None, fresh=False):
+        fresh_by_call.append(fresh)
+        names = list(suite) if subset is None else list(subset)
+        return _bl({n: suite[n] for n in names if n in suite}, n_tests=len(names))
+
+    holder = LazySessionBaseline(build)
+    holder.seed(["test_a"])
+    holder.expand(["test_b"])
+    assert fresh_by_call == [True, True]
+
+
+def test_fork_is_an_independent_unbuilt_holder_no_sibling_corruption():
+    # Fix B #1: seeding one function's holder must not contaminate a sibling's. A fork is a fresh,
+    # unbuilt holder over the SAME build closure; seeding it leaves the original untouched — the
+    # reproduced `baseline seeded for alpha killed 0/3 of beta` failure, closed structurally.
+    suite = {"test_a": {"f.py": {1}}, "test_b": {"f.py": {2}}}
+    orig = LazySessionBaseline(_suite_build(suite))
+    orig.seed(["test_a"])  # `alpha` seeds its candidate
+    fork = orig.fork()
+    assert fork.built is False  # a fork is fresh, never carrying the original's seed
+    fork.seed(["test_b"])  # `beta` seeds its own candidate on its own holder
+    assert set(orig.get().traced) == {"test_a"}  # alpha's baseline is untouched
+    assert set(fork.get().traced) == {"test_b"}  # beta measured only its own

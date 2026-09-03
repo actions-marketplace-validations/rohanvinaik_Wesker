@@ -119,6 +119,11 @@ def test_scoped_and_unscoped_verdicts_agree():
 
     Profiles a real function against a suite that kills every mutant, both scoped
     and unscoped. Any divergence means scoping invented survivors.
+
+    DISPOSITION-EXACT (A0, #40): equal totals do not prove agreement — killing mutant
+    A instead of B leaves ``total_killed`` unchanged yet is a scoping soundness bug
+    (the kind ``c8ee1c0`` records as "caught by the oracle, not by inspection"). So this
+    also compares the per-mutant OUTCOME map, not just the counts.
     """
     from Wesker.engine import MutationCategory, run_function_profiling
 
@@ -176,3 +181,76 @@ def test_scoped_and_unscoped_verdicts_agree():
         f"scoping changed the verdict: {unscoped.total_killed} killed unscoped vs "
         f"{scoped.total_killed} scoped — scoping is not verdict-exact"
     )
+
+    # Disposition-exact: every mutant's IDENTITY must map to the same OUTCOME under both
+    # scopes. Keyed on mutant_id; the outcome is `killed_by` (assertion / exception / crash /
+    # timeout) for a kill, "survived" otherwise. WHICH tests killed a mutant (the kill_matrix
+    # values) legitimately shrinks under scoping and is NOT part of the disposition.
+    def _disposition(r) -> dict:
+        d = {rec["mutant_id"]: rec.get("killed_by") for rec in r.killed_records}
+        d.update({rec["mutant_id"]: "survived" for rec in r.survivor_records})
+        return d
+
+    assert _disposition(scoped) == _disposition(unscoped), (
+        "scoping changed WHICH mutants died, not just how many:\n"
+        f"  unscoped: {_disposition(unscoped)}\n"
+        f"  scoped:   {_disposition(scoped)}"
+    )
+
+
+BRANCHY_SRC = '''
+def g(x):
+    """doc"""
+    if x <= 2:
+        r = 1
+    elif x <= 10:
+        r = 2
+    else:
+        r = 3
+    return r
+'''
+
+
+def test_keyword_only_lines_excluded_from_denominator():
+    """A bare ``else:`` carries no bytecode, so no trace event can EVER mention it.
+
+    Regression cover for the inverse defect of the statement-start one above:
+    spanning full statement extents swept keyword-only lines (``else:``,
+    ``finally:``) into the denominator. ``_trace_one`` intersects traced hits
+    with the denominator, so such a line read as a permanent coverage gap no
+    test could ever close — and callers asked for input after input to reach a
+    line that is not code.
+    """
+    src = BRANCHY_SRC.strip()
+    node = _fn(src)
+    lines = executable_lines(node)
+    else_line = next(
+        i for i, text in enumerate(src.splitlines(), start=1) if text.strip() == "else:"
+    )
+    assert else_line not in lines, "keyword-only line inflates the denominator forever"
+    # The branch bodies on either side of the keyword ARE reachable behavior.
+    assert else_line - 1 in lines
+    assert else_line + 1 in lines
+
+
+def test_no_mutant_orphaned_by_traceability_filter():
+    """The co_lines intersection must not evict any mutant's fire-site line.
+
+    Same invariant as ``test_every_mutant_line_is_in_the_denominator``, asserted
+    against the branchy sample the filter actually prunes: soundness requires
+    pruning ONLY lines no mutant and no trace event can ever name.
+    """
+    from Wesker.engine import generate_mutants
+    from Wesker.filter import filter_categories
+
+    node = _fn(BRANCHY_SRC.strip())
+    cats = filter_categories(node)
+    lines = executable_lines(node)
+    mutants = generate_mutants(node, cats, max_per_category=0)
+    assert mutants, "expected mutants for this function"
+    orphans = [
+        (m.category.value, m.mutated_line)
+        for m in mutants
+        if m.mutated_line not in lines
+    ]
+    assert not orphans, f"mutants on lines outside the denominator: {orphans}"

@@ -30,9 +30,90 @@ import contextlib
 import importlib
 import inspect
 import io
+import itertools
 import os
 import sys
-from typing import Any, Callable
+from collections.abc import Iterator
+from contextvars import ContextVar
+from typing import TYPE_CHECKING, Any, Callable
+
+if TYPE_CHECKING:
+    from Wesker.session_manifest import PytestSessionManifest
+
+# The regime the most recent collection ran under (Detective #58). A ContextVar rather than a
+# return value because `collect_pytest_callables` has one caller contract — it returns
+# CALLABLES — and threading a second value through every path would change every signature to
+# carry something most callers do not read. Same session-state idiom as `ci._LIVE_SUITE`.
+_LAST_MANIFEST: ContextVar[PytestSessionManifest | None] = ContextVar(
+    "wesker_last_session_manifest", default=None
+)
+
+
+def last_session_manifest() -> PytestSessionManifest | None:
+    """The manifest of the most recent collection in this context, or None.
+
+    None is a REAL answer and callers must treat it as one: it means no collection has happened
+    here, or the capture itself failed. Falling back to a re-derived regime is the exact
+    substitution #58 exists to end — a consumer that cannot get the runner's own answer should
+    say so, not quietly compute a lookalike.
+    """
+    return _LAST_MANIFEST.get()
+
+
+# The node-ids that FAILED TO COLLECT in the most recent collection (an ImportError at collection —
+# a torch dep, a broken conftest). The manifest above is built from the SUCCESSFUL items only, so an
+# erroring file is invisible to it; without this, a test that failed to collect is silently absent
+# from the routed suite and a mutant only its tests would kill reads as candidate-equivalent. Same
+# session-state idiom and same "collect returns CALLABLES, not a second value" rationale as
+# `_LAST_MANIFEST`. Set per collection (fresh plugin instance), so it names the LAST collection only.
+_LAST_COLLECTION_ERRORS: ContextVar[tuple[str, ...]] = ContextVar(
+    "wesker_last_collection_errors", default=()
+)
+
+
+def last_collection_errors() -> tuple[str, ...]:
+    """Node-ids that failed to collect in the most recent collection in this context (empty if none).
+
+    Empty is a REAL answer: either the collection was complete, or no collection happened here. A
+    consumer stamps ``collection_incomplete`` on a non-empty tuple — the "degrade loudly" enforcement
+    for the test floor — rather than let the measurement rest on fewer tests than the layout implies.
+    """
+    return _LAST_COLLECTION_ERRORS.get()
+
+
+# The live measurement session currently in scope (#26). `_LAST_MANIFEST` alone is process-global
+# "the last manifest captured" — a collect-only run for project A leaks into a live run for
+# project B, and B's certificate gets authorized by A's collection (reproduced: A's rootpath,
+# standing `confirmed`, consumed inside B's session). A manifest is proof-facing only when it was
+# captured by the EXACT session now consuming it; a monotonic per-session id stamped at capture
+# and checked at consume is what makes "same session" decidable when paths, modules, and config
+# coincide. Ids start at 1 so 0 can mean "no scope / unstamped" without a second sentinel.
+_SCOPE_COUNTER = itertools.count(1)
+_MEASUREMENT_SCOPE: ContextVar[int | None] = ContextVar(
+    "wesker_measurement_scope", default=None
+)
+
+
+def current_measurement_scope() -> int | None:
+    """The id of the live measurement session in scope, or None outside one (#26)."""
+    return _MEASUREMENT_SCOPE.get()
+
+
+@contextlib.contextmanager
+def live_measurement_scope() -> Iterator[int]:
+    """Mint a fresh measurement-scope id for the duration of one live pytest session (#26).
+
+    A manifest captured inside this scope is stamped with the id; a consumer inside the same
+    scope admits only a manifest carrying it. Sequential and nested sessions get distinct ids
+    and cannot read each other's manifest even when their rootpath, module names, or config
+    shape are identical. Token-reset in ``finally`` restores the enclosing scope (None at the
+    top level), so an exception mid-session cannot leave a stale id bound.
+    """
+    token = _MEASUREMENT_SCOPE.set(next(_SCOPE_COUNTER))
+    try:
+        yield _MEASUREMENT_SCOPE.get() or 0
+    finally:
+        _MEASUREMENT_SCOPE.reset(token)
 
 
 def _build_callables(items: list[Any]) -> list[Callable[..., Any]]:
@@ -57,6 +138,51 @@ def _build_callables(items: list[Any]) -> list[Callable[..., Any]]:
         run.__name__ = f"{cls.__name__}.{method}"
         return run
 
+    def _tag_origin(runnable: Callable[..., Any], it: Any) -> Callable[..., Any]:
+        # Every callable this builder hands out is a closure whose code object
+        # lives in THIS module — the origin tag is the only way a consumer
+        # (ci.callable_origin) can recover which test FILE it stands for.
+        origin = getattr(it, "path", None) or getattr(it, "fspath", None)
+        if origin is not None:
+            with contextlib.suppress(Exception):
+                # Dynamic metadata on a function object: valid Python, absent from
+                # FunctionType's stub, so the checker needs telling.
+                runnable.__wesker_origin__ = str(origin)  # type: ignore[attr-defined]  # ty: ignore[unresolved-attribute]
+        return runnable
+
+    def _tag_shape(
+        runnable: Callable[..., Any], it: Any, source_obj: Any
+    ) -> Callable[..., Any]:
+        # Fast-mode shape facts (#19), stamped where the pytest item is live. Source hazards come
+        # from an AST scan of the test's OWN source — a helper it calls that spawns a subprocess is
+        # invisible here (documented; over-refusal on what IS visible stays sound). `stateful_fixture`
+        # is False by construction: `_bind_item` skips any test needing a runtime fixture, so bound
+        # callables are fixture-free (an autouse SESSION fixture is a known gap). Source that cannot
+        # be read is treated as unclearable — every source-detectable hazard is flagged.
+        from Wesker.isolation import _SHAPE_KEYS, scan_source_hazards
+
+        shape = dict.fromkeys(_SHAPE_KEYS, False)
+        real = getattr(source_obj, "__wrapped__", source_obj)
+        try:
+            src: str | None = inspect.getsource(real)
+        except (OSError, TypeError):
+            src = None
+        detected = (
+            scan_source_hazards(src)
+            if src is not None
+            else ["signal_main_thread", "spawns_subprocess", "starts_background_thread"]
+        )
+        for hazard in detected:
+            shape[hazard] = True
+        # A standard test item is `Function`; a unittest method `TestCaseFunction`. Anything else is
+        # a custom collector whose lifecycle the in_process fast mode cannot assume it understands.
+        if type(it).__name__ not in ("Function", "TestCaseFunction"):
+            shape["custom_collector"] = True
+        with contextlib.suppress(Exception):
+            # Dynamic tag: valid Python, absent from FunctionType's stub.
+            runnable.__wesker_shape__ = shape  # type: ignore[attr-defined]  # ty: ignore[unresolved-attribute]
+        return runnable
+
     callables: list[Callable[..., Any]] = []
     for it in items:
         cls = getattr(it, "cls", None)
@@ -66,7 +192,10 @@ def _build_callables(items: list[Any]) -> list[Callable[..., Any]]:
                 or str(getattr(it, "name", "")).split("[")[0]
             )
             if method:
-                callables.append(make_tc_runner(cls, method))
+                runner = _tag_shape(
+                    make_tc_runner(cls, method), it, getattr(cls, method, None)
+                )
+                callables.append(_tag_origin(runner, it))
             continue
         fn = getattr(it, "function", None)
         if not callable(fn):
@@ -74,7 +203,7 @@ def _build_callables(items: list[Any]) -> list[Callable[..., Any]]:
         runnable = _bind_item(it, fn)
         if runnable is None:
             continue  # requires real runtime fixtures we can't supply in-process (v1)
-        callables.append(runnable)
+        callables.append(_tag_origin(_tag_shape(runnable, it, fn), it))
     return callables
 
 
@@ -95,7 +224,9 @@ def _bind_item(item: Any, fn: Callable[..., Any]) -> Callable[..., Any] | None:
     if not sig_params:
         if not getattr(fn, "__name__", None):
             with contextlib.suppress(Exception):
-                fn.__name__ = str(getattr(item, "name", "test"))
+                # Rebinding __name__ on a live callable is how a parametrized case keeps its
+                # nodeid identity (#16); the stub types it read-only.
+                fn.__name__ = str(getattr(item, "name", "test"))  # ty: ignore[unresolved-attribute]
         return fn
 
     callspec = getattr(item, "callspec", None)
@@ -109,6 +240,15 @@ def _bind_item(item: Any, fn: Callable[..., Any]) -> Callable[..., Any] | None:
         fn(**bound)
 
     run.__name__ = f"{getattr(fn, '__name__', 'test')}[{getattr(callspec, 'id', '')}]"
+    # Honor the trace-cache identity contract `_make_item_callable` (the live-session path) already sets,
+    # or this discovery-backend closure is mis-keyed. `trace_cache.test_fingerprint` hashes
+    # `getsource(__wrapped__ or self) + __qualname__`; with BOTH unset here, every parametrized case in
+    # every project hashed to ONE constant (this two-line `run` body + `_bind_item.<locals>.run`), so the
+    # per-test trace cache served whichever case was traced first as the coverage for all of them. The
+    # nodeid discriminates the cases; `__wrapped__` makes getsource() read the USER's test, so a source
+    # edit still invalidates the entry (and distinct tests still differ).
+    run.__qualname__ = str(getattr(item, "nodeid", run.__name__))
+    run.__wrapped__ = fn  # type: ignore[attr-defined]  # ty: ignore[unresolved-attribute] — functools.wraps sets it; not in the stub
     return run
 
 
@@ -133,6 +273,24 @@ def collect_pytest_callables(
 
         def pytest_collection_modifyitems(self, session, config, items) -> None:
             self.items = list(items)
+            # Record the regime this collection RAN under, from the live Config/Session that
+            # ran it (Detective #58). The hook already received all three arguments and used
+            # one; the other two are the only authoritative description of the regime that
+            # exists, and every consumer was otherwise re-deriving it from files on disk.
+            # Never allowed to fail the collection: the measurement is the product, its
+            # description is not.
+            #
+            # Collection ERRORS are NOT captured on THIS (discovery) path: `collect_pytest_callables`
+            # is handed explicit files and seeds `sys.path` differently than the live measuring session
+            # (the #15/#58 import-identity issue), so its `from <target> import ...` failures are
+            # SPURIOUS — the live session collects the same files fine. `last_collection_errors()` is
+            # therefore fed only by the live session's own capture (`run_in_session`, the authority).
+            try:
+                from Wesker.session_manifest import capture_manifest
+
+                _LAST_MANIFEST.set(capture_manifest(session, config, items))
+            except Exception:  # noqa: BLE001 — a manifest that raises breaks a working run
+                pass
 
     # Evict already-imported test modules whose source lives under any collection
     # root so pytest re-imports the CURRENT on-disk file. Repeated in-process

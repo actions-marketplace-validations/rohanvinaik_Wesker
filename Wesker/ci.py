@@ -13,11 +13,14 @@ from __future__ import annotations
 
 import ast
 import contextlib
+import fnmatch
 import hashlib
 import importlib.util
+import inspect
 import json
 import os
 import sys
+import textwrap
 import time
 from contextvars import ContextVar
 import unittest
@@ -183,14 +186,64 @@ def _build_static_impact_map(test_files: list[str]) -> dict[str, list[str]]:
     return {k: sorted(v) for k, v in impact.items()}
 
 
+def _impact_lookup_keys(func_name: str) -> tuple[str, ...]:
+    """The identifier keys a test may reference ``func_name`` under, for the static impact map.
+
+    The map (:func:`_build_static_impact_map`) keys on BARE ast identifiers — a ``Name``
+    (``free_tier``, ``Basket``) or an ``Attribute`` (``.tier``). A METHOD target, however, arrives
+    here as a DOTTED qualname (``Basket.tier``), which no test ever spells as one token: the call
+    site is ``Basket().tier(...)`` — a ``Basket`` Name and a ``tier`` Attribute, never a
+    ``Basket.tier`` Name. So a bare ``impact.get("Basket.tier")`` always missed, the method's own
+    generated test was never associated, and its mutants were then measured against unrelated tests
+    and read a misleading ``0/N killed``. Expanding the dotted qualname to its trailing attribute
+    (the ``.method`` access every call site carries, regardless of how the receiver is built)
+    recovers that test. A plain function name is returned unchanged. Over-inclusion is safe here — an
+    extra test file that does not reach the target contributes no kills and none of its lines, so it
+    can never manufacture a false ``COMPLETE`` (the same one-directional safety the caller relies on);
+    the per-mutant line scoping narrows it back down."""
+    if "." not in func_name:
+        return (func_name,)
+    return (func_name, func_name.rsplit(".", 1)[1])
+
+
 # ── Layer 3: Full fallback ───────────────────────────────────────
 
 
-def _discover_all_test_files(project_root: str) -> list[str]:
-    """Find all ``test_*.py`` files ANYWHERE in the project — matching pytest's default
-    collection, not just ``tests/`` — so a fresh install without the pytest extra still
-    discovers root-level and package-level tests through the legacy loader (otherwise a
-    user whose tests live at the repo root gets a misleading 0% kill rate)."""
+# pytest's DEFAULT `python_files` is BOTH of these, not just `test_*.py`. Discovery matched only the
+# first, so a repo whose suite is `*_test.py` (a pytest default) — or a bare `test.py` named via
+# `testpaths` — was invisible, and every function in it read a misleading 0% kill rate. Found by
+# dogfooding python-slugify: pytest collected its 82-test `test.py`, Wesker's discovery saw zero.
+_DEFAULT_TEST_PATTERNS: tuple[str, ...] = ("test_*.py", "*_test.py")
+
+
+def _is_test_filename(basename: str, patterns: tuple[str, ...]) -> bool:
+    """Whether ``basename`` is a pytest test module under ``patterns`` (pure — pinned).
+
+    ``patterns`` are ``python_files`` globs — the repo's configured set, or
+    :data:`_DEFAULT_TEST_PATTERNS`. A file matching ANY is a test module, the same OR pytest
+    applies. Matches the BASENAME only: ``python_files`` is a filename glob, and matching a full
+    path would let a directory component satisfy ``test_*`` and pull non-test files into the suite.
+    """
+    return any(fnmatch.fnmatch(basename, pat) for pat in patterns)
+
+
+def _discover_all_test_files(
+    project_root: str,
+    patterns: tuple[str, ...] = _DEFAULT_TEST_PATTERNS,
+    testpaths: tuple[str, ...] = (),
+) -> list[str]:
+    """Every candidate test file pytest WOULD collect, and no others — the impact map narrows this
+    pool by reachability, so a file pytest never collects must not enter it (or one function's
+    profile scopes onto a "test" from `bench/` that needs its own deps and errors the collection).
+
+    Mirrors pytest's own rule: WITH ``testpaths``, collect only under those paths (a named file is
+    taken as-is — the bare-``test.py`` case a pattern would miss — a dir is pattern-scanned); WITHOUT
+    ``testpaths``, recurse the whole tree from the rootdir by ``python_files`` pattern (so a fresh
+    install whose tests live at the repo root is still found, not a misleading 0%). A bare
+    ``test.py`` matches NEITHER default pattern — pytest collects it only because ``testpaths`` names
+    it, and so does this. ``patterns`` / ``testpaths`` come from the caller's resolved regime; the
+    defaults keep standalone Wesker correct.
+    """
     skip = {
         ".git",
         ".venv",
@@ -208,52 +261,455 @@ def _discover_all_test_files(project_root: str) -> list[str]:
     }
     root = Path(project_root)
     found: list[str] = []
-    for py in sorted(root.rglob("test_*.py")):
-        rel = py.relative_to(root)
-        if any(part in skip or part.startswith(".") for part in rel.parts[:-1]):
-            continue
-        found.append(str(py))
-    return found
+    seen: set[str] = set()
+
+    def _add(py: Path) -> None:
+        key = str(py)
+        if key not in seen:
+            seen.add(key)
+            found.append(key)
+
+    def _outside_skip(rel: Path) -> bool:
+        return not any(part in skip or part.startswith(".") for part in rel.parts[:-1])
+
+    def _scan_dir(base: Path) -> None:
+        for py in base.rglob("*.py"):
+            try:
+                rel = py.resolve().relative_to(root.resolve())
+            except (ValueError, OSError):
+                continue
+            if _outside_skip(rel) and _is_test_filename(py.name, patterns):
+                _add(py)
+
+    if testpaths:
+        # pytest with `testpaths` collects ONLY under those paths — NOT the whole tree. A `test_*.py`
+        # in `bench/`, `examples/`, or `docs/` that pytest never collects must not enter the impact
+        # map either, or profiling one function scopes onto a "test" that needs its own deps and
+        # errors the collection. Found dogfooding structlog: `bench/test_benchmarks.py` (needs
+        # pytest-codspeed) was pulled in for a pure log-level function under `testpaths = "tests"`.
+        # Scan WITHIN each testpaths entry — a named FILE is taken as-is (the bare-`test.py` case a
+        # pattern would miss), a DIR is pattern-scanned. This is exactly what pytest would collect.
+        for tp in testpaths:
+            base = Path(tp) if os.path.isabs(tp) else root / tp
+            try:
+                base.resolve().relative_to(root.resolve())
+            except (ValueError, OSError):
+                continue
+            if base.is_file() and base.suffix == ".py":
+                _add(base)
+            elif base.is_dir():
+                _scan_dir(base)
+    else:
+        # No `testpaths`: pytest recurses from the rootdir, so scan the whole tree by pattern — the
+        # broad candidate pool the impact map then narrows by reachability.
+        _scan_dir(root)
+
+    return sorted(found)
 
 
-# ── 3-Layer discovery orchestrator ───────────────────────────────
-
-
-def discover_tests(
-    project_root: str, source_file: str, func_names: list[str]
+def relevant_test_files(
+    project_root: str,
+    source_file: str,
+    func_names: list[str],
+    testpaths: tuple[str, ...] = (),
 ) -> list[str]:
-    """3-layer test discovery: convention -> static impact -> full fallback.
+    """Layers 1+2 of :func:`discover_tests` — convention and static impact, WITHOUT the
+    full-tree fallback. The test files plausibly exercising ``source_file``, and no others.
 
-    Layer 1: Convention matching (fast, filename-based)
-    Layer 2: Static impact (AST scan for function name references)
-    Layer 3: Full fallback (all test files)
+    ``discover_tests`` returns every test file in the project: layer 3 appends the
+    remainder unconditionally, so its three layers RANK relevance, they do not select on
+    it. That is the right contract for a caller that wants the whole suite in a useful
+    order, and the wrong one for scoping a single function — profiling one function in this
+    repo was handed 49 of 49 test files (549 of 637 callables), and every per-mutant and
+    per-trace cost was multiplied by the ~12x of them that cannot reach the target.
 
-    Each layer adds files not already found by previous layers.
+    Narrowing can only ever LOSE a covering test — one reached indirectly, through a
+    fixture or a dynamic import that no static scan sees. That direction is safe here: a
+    missing test can only remove kills and remove covered lines, so the report says MORE
+    unpinned behaviour and MORE line gap than the truth. It cannot manufacture a false
+    ``COMPLETE``, which is the only error that would matter. The user is asked to pin one
+    extra mutant; they are never told a function is specified when it is not.
+
+    EMPTY IS A REAL ANSWER, not a reason to widen. When no test file names this target or
+    any function in its file, running the rest of the suite through a full mutant pass
+    measures a set that provably does not mention the code under test: every mutant
+    survives for the same uninformative reason, and any kill it did report would be
+    incidental. The caller's honest move is to synthesize — call sites are harvested from
+    the REPO, not from tests, so de-novo generation loses nothing here that the suite
+    would have supplied.
     """
-    # Layer 1: Convention
     found = _discover_by_convention(project_root, source_file)
-
-    # Layer 2: Static impact — find additional test files that reference
-    # any of the function names in this source file
-    all_test_files = _discover_all_test_files(project_root)
-    impact_map = _build_static_impact_map(all_test_files)
     found_set = set(found)
+    impact_map = _build_static_impact_map(
+        _discover_all_test_files(project_root, testpaths=testpaths)
+    )
     for func_name in func_names:
-        for tf in impact_map.get(func_name, []):
-            if tf not in found_set:
-                found.append(tf)
-                found_set.add(tf)
-
-    # Layer 3: Full fallback — add remaining test files
-    for tf in all_test_files:
-        if tf not in found_set:
-            found.append(tf)
-            found_set.add(tf)
-
+        # A dotted method qualname (`Basket.tier`) is looked up under its trailing attribute too,
+        # because the impact map keys on the bare `.tier` a test's call site carries, never the
+        # dotted name (issue #25 — methods otherwise associated with no test and read 0/N killed).
+        for key in _impact_lookup_keys(func_name):
+            for tf in impact_map.get(key, []):
+                if tf not in found_set:
+                    found.append(tf)
+                    found_set.add(tf)
     return found
+
+
+def route_test_item(
+    static_reach: str,
+    fixture_reaches: bool,
+    caller_reaches: bool,
+    observed_reach: str,
+    dynamic_uncertain: bool,
+) -> str:
+    """Route ONE collected item against a target — skip only the provably-impossible (#15, pure — pinned).
+
+    The selector is one-sided by design. Dropping a genuinely relevant test removes kills and
+    covered lines, so it OVERSTATES a specification gap; it can never manufacture a kill. So the
+    only item skipped is one with POSITIVE evidence it cannot reach the target; everything else
+    stays in the pool. The code names BOTH the verdict and its reason, because "ruled out",
+    "plausibly reaches", and "could not tell" are different facts a report must keep apart —
+    collapsing `unknown` into `impossible` is the exact false-negative this closes (a
+    fixture-reached test, dropped, read as `no test reaches this target` → needless synthesis).
+
+    `observed_reach` is the ONLY sound source of impossibility — a prior trace that ran this node
+    and recorded the lines it hit:
+      * ``reached``     — the node executed the target: candidate, on observation.
+      * ``not_reached`` — the node ran and did not touch the target: impossible, on observation.
+      * ``unseen``      — no trace has watched this node; a static miss cannot be promoted to
+                          impossibility, only widened to unknown.
+
+    `static_reach` is a per-TESTID lattice, NOT a file bit — a sibling test naming the target is no
+    evidence THIS item reaches it, so the granularity is the item's own body (#15, per-item — the
+    residual that dragged a file's every integration sibling into the eager seed):
+      * ``"item"`` — the item's OWN function body statically references the target: a ``candidate_static``
+                     seed (the direct-item stratum, the strongest static positive).
+      * ``"file"`` — only the item's FILE references the target, not the item itself: a ``file_peer`` —
+                     KEPT (widened, never dropped) but NOT a seed candidate. A weak routing reason, so
+                     one real test naming the target no longer promotes its file-siblings into the seed.
+      * ``"none"`` — the item's file does not reference the target at all.
+    ``fixture_reaches`` (a fixture in the item's closure defined in a file that names the target — the
+    autouse/conftest reach a body scan cannot see) outranks ``"file"`` but sits below an own-body name.
+
+    ``caller_reaches`` is a positive TRANSITIVE-caller signal (#15 B): the item's body names a
+    production function that itself reaches the target, so a test of a public API reaches a private
+    helper it never names (``test_resolve_roles`` → ``resolve_roles`` → ``_compute_sets``). It is a
+    widen stratum (``caller_reaches``), ranked below a fixture edge and above a ``file_peer`` — traced
+    FIRST among the unknowns (`_unknown_stratum_rank`), never eagerly seeded. Positive-only: it can
+    only promote an item toward the front of the widen, never rule one out.
+
+    ``dynamic_uncertain`` widens to unknown rather than excluding: plugins or dynamic imports mean
+    the static picture is incomplete, and incomplete is not proof of irrelevance.
+    """
+    if observed_reach == "reached":
+        return "candidate_observed"
+    if observed_reach == "not_reached":
+        return "impossible_observed"
+    if static_reach == "item":
+        return "candidate_static"
+    if fixture_reaches:
+        return "candidate_fixture"
+    if caller_reaches:
+        return "caller_reaches"
+    if static_reach == "file":
+        return "file_peer"
+    if dynamic_uncertain:
+        return "unknown_dynamic"
+    return "unknown_no_path"
+
+
+def route_admits(code: str, conservative: bool) -> bool:
+    """Whether a routed item stays in the candidate pool (#15, pure — pinned).
+
+    Default (sound, one-sided): everything but a provably-impossible item stays — `unknown` is
+    KEPT, because a static miss is not proof of irrelevance. `conservative` is the opt-in
+    fast/lossy mode: it narrows to CANDIDATES only, dropping `unknown`, trading the one-sided
+    guarantee for speed. A gap produced under `conservative` is a conservative shortlist result
+    and must be labelled so by the caller, never rendered as a proof of specification.
+    """
+    if code.startswith("impossible"):
+        return False
+    if conservative:
+        return code.startswith("candidate")
+    return True
+
+
+def callable_fixture_origins(call: Any) -> tuple[str, ...]:
+    """The files where a live item's fixtures are DEFINED, or () (#15).
+
+    Stamped at build time by ``pytest_runner._make_item_callable`` from the item's
+    ``_fixtureinfo``. Empty for the legacy/re-collected backends and for any item whose closure
+    could not be read — all of which route to ``unknown`` (kept), never to a false ``impossible``.
+    Read through this accessor, not a raw attribute, so a backend that carries the closure
+    differently has one seam to change."""
+    got = getattr(call, "__wesker_fixture_origins__", ())
+    return tuple(got) if got else ()
+
+
+def _fixture_files_reaching_target(live: list[Any], func_names: list[str]) -> set[str]:
+    """Fixture-definition files whose source statically references the target (#15, fixture edge).
+
+    A fixture file — a conftest, a plugin, the test module itself — that imports the target's
+    module or names a target function is a positive reach for every item whose closure includes it:
+    the autouse/conftest path a test-body name scan cannot see. Built from the union of
+    fixture-origin files across the live suite and scanned with the same static-impact map the
+    test-file selector uses, so a fixture that calls ``target(...)`` is caught by the same key."""
+    files = {os.path.realpath(f) for c in live for f in callable_fixture_origins(c)}
+    if not files:
+        return set()
+    impact = _build_static_impact_map(sorted(files))
+    reaching: set[str] = set()
+    for func_name in func_names:
+        for key in _impact_lookup_keys(func_name):
+            for tf in impact.get(key, []):
+                reaching.add(os.path.realpath(tf))
+    return reaching
+
+
+def _route_live_callables(
+    live: list[Any], scoped: list[str], func_names: list[str], conservative: bool
+) -> list[Any]:
+    """Filter the live suite by routing each item (#15) — keep all but the provably-impossible.
+
+    Without an observed trace nothing is impossible, so the DEFAULT keeps the whole live suite:
+    a static miss is not proof of irrelevance, and dropping a fixture-reached test was the exact
+    false gap this closes. The value the routing adds is that ``conservative`` can now narrow to
+    static/fixture candidates WITHOUT dropping a fixture-reached test, and every kept/dropped
+    decision carries a reason. Observed-trace impossibility (the sound narrowing that makes
+    successive passes cheap) is the follow-up owned with the trace evidence (#20/#17)."""
+    keep_files = {os.path.realpath(p) for p in scoped}
+    fixture_ref = _fixture_files_reaching_target(live, func_names)
+    kept: list[Any] = []
+    for c in live:
+        names_target = os.path.realpath(callable_origin(c) or "") in keep_files
+        fx = {os.path.realpath(f) for f in callable_fixture_origins(c)}
+        fixture_reaches = bool(fx & fixture_ref)
+        # The default keep-all router routes at FILE scope (`in keep_files`) and carries `func_names`
+        # — a whole module's targets, not one — so there is no single target to attribute a per-item
+        # body reference to, and its `unknown` is KEPT regardless. Preserve that exactly by mapping
+        # the in-scope bit onto the static lattice; the per-item precision (#15) belongs to the SEED
+        # router `partition_live_callables`, where a file-peer was wrongly entering the seed.
+        static_reach = "item" if names_target else "none"
+        # The default keep-all router has no single target for a per-item caller slice — pass False.
+        code = route_test_item(static_reach, fixture_reaches, False, "unseen", False)
+        if route_admits(code, conservative):
+            kept.append(c)
+    return kept
+
+
+def _files_referencing_target(files: list[str], target_name: str) -> set[str]:
+    """Realpaths of the ``files`` whose AST statically references ``target_name`` (the target's
+    simple name).
+
+    This is what makes a SEED a strict subset: ``_route_live_callables`` keeps every reachable-file
+    test as a candidate because it routes at FILE granularity, but a test whose file names the target
+    is far likelier to enter it than one that merely imports the module. An unparseable file is
+    treated as referencing (a candidate): we never rule a test OUT on a parse failure, matching the
+    one-sided soundness of ``route_test_item`` (only observed evidence proves impossibility)."""
+    out: set[str] = set()
+    for p in files:
+        try:
+            with open(p, encoding="utf-8") as fh:
+                tree = ast.parse(fh.read(), filename=p)
+        except (OSError, SyntaxError, ValueError):
+            out.add(os.path.realpath(p))
+            continue
+        for n in ast.walk(tree):
+            if (isinstance(n, ast.Name) and n.id == target_name) or (
+                isinstance(n, ast.Attribute) and n.attr == target_name
+            ):
+                out.add(os.path.realpath(p))
+                break
+    return out
+
+
+def _item_body_names(call: Any) -> frozenset[str]:
+    """The simple names the item's OWN function body statically references (#15, per-item).
+
+    Read through :func:`callable_source` — the contract accessor for the user's underlying test — so
+    live, recollected, and legacy backends resolve to the real test function, never Wesker's wrapper
+    body (identical for every item, which would make every test look like it names the target).
+    Collects bare-``Name`` ids AND ``Attribute`` attrs (so ``obj.target`` names ``target``), the same
+    two-form match ``_files_referencing_target`` uses. This is the per-TESTID signal a FILE scan
+    cannot give: a sibling test in the same file naming the target does not put that name in THIS
+    item's set (residual-1). One parse serves both axes — the static-reach axis (``target_name`` in
+    the set) and the transitive-caller axis (#15 B, a caller name in the set). One-sided and
+    best-effort: any failure to read or parse the source returns the EMPTY set, degrading the item to
+    a file/unknown stratum (kept, widened), never a false drop.
+    """
+    fn = callable_source(call)
+    try:
+        src = inspect.getsource(fn)
+    except (OSError, TypeError):
+        return frozenset()
+    try:
+        tree = ast.parse(textwrap.dedent(src))
+    except (SyntaxError, ValueError):
+        return frozenset()
+    names: set[str] = set()
+    for n in ast.walk(tree):
+        if isinstance(n, ast.Name):
+            names.add(n.id)
+        elif isinstance(n, ast.Attribute):
+            names.add(n.attr)
+    return frozenset(names)
+
+
+def _unknown_stratum_rank(code: str) -> int:
+    """Order the widen (unknown) stratum most-likely-reacher first (#15 C/B), so an item-incremental
+    widen discharges its obligations before paying for the weaker signals. ``caller_reaches`` (the
+    item names a production caller that reaches the target — #15 B) is the strongest widen signal,
+    then ``file_peer`` (its FILE names the target), then ``unknown_dynamic`` (a plugin / dynamic
+    import MIGHT reach it), then ``unknown_no_path`` (no static signal at all). An unrecognised code
+    sorts last."""
+    return {
+        "caller_reaches": 0,
+        "file_peer": 1,
+        "unknown_dynamic": 2,
+        "unknown_no_path": 3,
+    }.get(code, 4)
+
+
+def partition_live_callables(
+    live: list[Any],
+    scoped: list[str],
+    target_name: str,
+    func_names: list[str],
+    observed_reach: dict[str, str] | None = None,
+    caller_names: set[str] | None = None,
+) -> tuple[list[Any], list[tuple[Any, str]], list[Any]]:
+    """Partition into candidate / TAGGED-unknown / proof-grade impossible for ONE function (#15).
+
+    Each unknown is returned as ``(callable, route_code)`` (#D3, §8.3): the widen stratum's code —
+    ``caller_reaches`` / ``file_peer`` / ``unknown_dynamic`` / ``unknown_no_path`` — travels WITH its
+    item, so the driver reads a caller-reacher off the tag instead of RE-PARSING every unknown's body
+    (`_item_body_names`) a second time to recover a bit computed here and discarded. Candidates and
+    impossibles stay plain callable lists — the seed is traced whole and the impossibles are dropped,
+    so neither consumes a code.
+
+    Static and fixture evidence can only promote an unseen item to CANDIDATE. The third bucket is
+    populated solely from an exact per-TestId observation loaded under the same target content,
+    test/fixture context, and pytest regime. Missing evidence remains UNKNOWN. ``caller_names`` are
+    production functions that reach the target (#15 B, a one-hop backward slice): an item naming one
+    is a ``caller_reaches`` widen stratum — it reaches the target though it never names it. The legacy
+    :func:`split_live_callables` wrapper preserves its two-way API for callers without observations.
+    """
+    naming_files = _files_referencing_target(scoped, target_name)
+    fixture_ref = _fixture_files_reaching_target(live, func_names)
+    _caller_names = frozenset(caller_names or ())
+    candidates: list[Any] = []
+    _unknown_rows: list[tuple[str, Any]] = []
+    impossible: list[Any] = []
+    observed_reach = observed_reach or {}
+    for c in live:
+        origin = os.path.realpath(callable_origin(c) or "")
+        # Per-TESTID (#15): the item's OWN body naming the target is a `candidate_static` seed; only
+        # its FILE naming it (a sibling test does, not this item) is a `file_peer` — kept, widened,
+        # never seeded. `_caller_names` are production functions that reach the target (#15 B): an
+        # item naming one reaches the target though it never names it (a `caller_reaches` widen
+        # stratum). One body parse serves both axes; falls back to the file bit / no caller signal
+        # when the body cannot be read (one-sided, kept).
+        body_names = _item_body_names(c)
+        if target_name in body_names:
+            static_reach = "item"
+        elif origin in naming_files:
+            static_reach = "file"
+        else:
+            static_reach = "none"
+        caller_reaches = bool(_caller_names & body_names)
+        fx = {os.path.realpath(f) for f in callable_fixture_origins(c)}
+        fixture_reaches = bool(fx & fixture_ref)
+        code = route_test_item(
+            static_reach,
+            fixture_reaches,
+            caller_reaches,
+            observed_reach.get(callable_test_id(c), "unseen"),
+            False,
+        )
+        if code.startswith("candidate"):
+            candidates.append(c)
+        elif code.startswith("impossible"):
+            impossible.append(c)
+        else:
+            _unknown_rows.append((code, c))
+    # Order the widen (unknown) stratum most-likely-reacher first (#15 C), so the item-incremental
+    # widen discharges its obligations before tracing the weaker signals. Stable — discovery order is
+    # kept within a rank; `candidates`/`impossible` keep discovery order (the seed is traced whole).
+    unknowns = [
+        (c, code)
+        for code, c in sorted(_unknown_rows, key=lambda r: _unknown_stratum_rank(r[0]))
+    ]
+    return candidates, unknowns, impossible
 
 
 # ── Test callable loading ────────────────────────────────────────
+
+
+def _parametrize_cases(func: Any) -> "list[Any] | None":
+    """Expand a ``@pytest.mark.parametrize``-decorated test into one bound, runnable callable per
+    case — the legacy loader's parity with pytest for the parametrize forms it can resolve without a
+    live session.
+
+    The decorator only ATTACHES marks; it leaves the function's ORIGINAL signature intact, so appending
+    the bare object yields an uncallable ``test(args, expected)`` that raises ``TypeError`` the moment
+    the profiler calls it — and that raise reads as a crash, silently dropping the case's value-kills and
+    line coverage (a parametrized golden then profiles as one case, so a re-profile disagrees with the
+    live-pytest pass). Stacked marks take the cartesian product (pytest's own rule); ``pytest.param(...)``
+    values are unwrapped. Returns None when there is no parametrize mark, or when a form cannot be
+    resolved here (unrecognized shape, fixtures, indirect) — the caller then keeps its prior behavior for
+    that callable, so this only ever ADDS coverage, never removes a case that used to load.
+    """
+    marks = [
+        m
+        for m in getattr(func, "pytestmark", ())
+        if getattr(m, "name", "") == "parametrize"
+    ]
+    if not marks:
+        return None
+
+    def _is_paramset(v: Any) -> bool:
+        # A pytest.param(...) ParameterSet — namedtuple(values, marks, id). Checking all three fields
+        # (not just `.values`) avoids mis-reading a dict/namedtuple VALUE as a wrapper to unwrap.
+        return hasattr(v, "values") and hasattr(v, "marks") and hasattr(v, "id")
+
+    try:
+        combined: list[dict] = [{}]
+        for m in marks:
+            argnames, argvalues = m.args[0], m.args[1]
+            names = (
+                [s.strip() for s in argnames.split(",")]
+                if isinstance(argnames, str)
+                else list(argnames)
+            )
+            frags: list[dict] = []
+            for v in argvalues:
+                if _is_paramset(v):
+                    vals: tuple = tuple(v.values)
+                elif len(names) == 1:
+                    vals = (
+                        v,
+                    )  # a single argname takes each value whole (even a tuple is ONE value)
+                else:
+                    vals = tuple(v)
+                frags.append(dict(zip(names, vals)))
+            combined = [{**c, **f} for c in combined for f in frags]
+    except Exception:
+        return None
+
+    cases: list[Any] = []
+    for i, kwargs in enumerate(combined):
+
+        def _case(_kwargs=kwargs, _i=i):
+            return func(**_kwargs)
+
+        # Mirror the live-item convention: siblings SHARE __name__ (the union key in trace_suite) and
+        # differ on __qualname__ (the per-case discriminator test_fingerprint folds in), so the legacy
+        # and pytest paths attribute a parametrized case's coverage identically.
+        _case.__name__ = func.__name__
+        _case.__qualname__ = f"{getattr(func, '__qualname__', func.__name__)}[{i}]"
+        _case.__doc__ = func.__doc__
+        cases.append(_case)
+    return cases
 
 
 def load_test_callables(
@@ -306,7 +762,10 @@ def load_test_callables(
         for name in dir(mod):
             obj = getattr(mod, name)
             if name.startswith("test_") and callable(obj):
-                callables.append(obj)
+                # A @parametrize'd function is uncallable bare (its params are still required); expand
+                # it into one bound callable per case so the fallback matches the pytest backend.
+                cases = _parametrize_cases(obj)
+                callables.extend(cases if cases is not None else [obj])
             elif isinstance(obj, type) and (
                 (issubclass(obj, unittest.TestCase) and obj is not unittest.TestCase)
                 or name.startswith("Test")
@@ -344,6 +803,221 @@ _LIVE_SUITE: ContextVar[list[Any] | None] = ContextVar(
     "wesker_live_suite", default=None
 )
 
+# The root that `callable_test_id` relativizes a legacy origin against (issue #16).
+#
+# A ContextVar rather than a parameter because the SAME test must produce the SAME id at
+# every site or the suite-wide maps stop intersecting. Coverage is keyed in `trace_suite`,
+# which has a project root to hand; the kill vocabulary is keyed inside `evaluate_mutant`,
+# which is per-mutant, hot, and several frames from any caller that knows the root.
+# Threading a parameter down that path makes agreement a discipline every future call site
+# has to remember — and the failure is silent: relative-vs-absolute ids simply intersect to
+# nothing, reporting every mutant a covered test kills as an unpinned survivor. Read from
+# one place, the two vocabularies cannot disagree by construction. Same reason `_LIVE_SUITE`
+# and `_SESSION_BASELINE` are session state rather than arguments.
+_PROJECT_ROOT: ContextVar[str | None] = ContextVar("wesker_project_root", default=None)
+
+
+DISCOVERED_CALLABLE_CONTRACT = """What every discovered test callable guarantees — THE single reference (issue #6).
+
+Three backends hand out callables, in three shapes:
+
+* live pytest items — ``pytest_runner._make_item_callable`` wrappers,
+* re-collected pytest — ``pytest_discovery`` closures (parametrized bindings, TestCase runners),
+* the legacy loader — plain function objects.
+
+Which shape a consumer receives depends on in-process session state, so NO consumer may
+branch on the shape. The contract every shape satisfies:
+
+``__name__``
+    The test's display/matrix name. A bracketed suffix (``test_x[case0]``) is a
+    parametrized ROW of one live test, never a function of its own. NOT unique across
+    files — never an identity on its own.
+``__qualname__``
+    The pytest nodeid when one exists (path::name[case]), else the name. The most
+    discriminating identity string a callable carries.
+``__wesker_origin__`` (optional, stamped at build time)
+    Absolute path of the test FILE the callable stands for. The only truth for closures
+    whose code object lives in Wesker's own modules. Read it through
+    :func:`callable_origin`, never directly.
+``__wrapped__`` (optional)
+    The USER's underlying test function. ``inspect.getsource``/``unwrap`` follow it, and
+    content-hashing consumers (trace cache, Detective's verdict cache) depend on it. Read
+    it through :func:`callable_source`, never directly.
+Invocation
+    Zero-argument call, raising on test failure. Parametrized bindings are already bound.
+
+Consumers resolve identity ONLY through the accessors below — a raw ``__code__`` /
+``__wrapped__`` / ``__name__`` read is correct under one backend and silently wrong under
+another (Detective's ``_locate`` bug: right under the legacy loader, a no-op under the
+pytest backend, invisible to 312 green tests). Old call sites migrate as they are touched;
+new ones start here.
+"""
+
+
+def callable_origin(call: Any) -> str | None:
+    """Absolute path of the test FILE a discovered callable came from, or None.
+
+    Accessor of :data:`DISCOVERED_CALLABLE_CONTRACT` — the ORIGIN axis. A
+    ``__wesker_origin__`` tag outranks everything (stamped at build time, and
+    the only truth for closures whose code object lives in Wesker's own modules);
+    ``__wrapped__`` is the live-item wrapper's pointer to the real test function;
+    the raw ``__code__.co_filename`` is the plain-function fallback. Consumers
+    that need "which file defines this test" (Detective's ``suite_edit._locate``)
+    MUST resolve through this — reading ``__code__`` directly attributes every
+    wrapper to ``pytest_runner.py``/``pytest_discovery.py``.
+    """
+    tagged = getattr(call, "__wesker_origin__", None)
+    if tagged:
+        return str(tagged)
+    real = getattr(call, "__wrapped__", call)
+    code = getattr(real, "__code__", None)
+    f = getattr(code, "co_filename", None)
+    return os.path.abspath(f) if f else None
+
+
+def callable_source(call: Any) -> Any:
+    """The USER's underlying test function for a discovered callable — itself when it is
+    already the plain function.
+
+    Accessor of :data:`DISCOVERED_CALLABLE_CONTRACT` — the SOURCE axis. Wrapper shapes
+    carry the real test as ``__wrapped__`` so introspection (``inspect.getsource``,
+    content fingerprints) reads the user's code instead of Wesker's wrapper body, which is
+    identical for every test in the suite and collapses any source-keyed cache to one
+    entry. New consumers reach the source function through this, never through a raw
+    ``__wrapped__`` read.
+    """
+    return getattr(call, "__wrapped__", call)
+
+
+def callable_base_name(call: Any) -> str:
+    """The test's FUNCTION name with any parametrize row id stripped —
+    ``test_x[case0]`` → ``test_x``.
+
+    Accessor of :data:`DISCOVERED_CALLABLE_CONTRACT` — the NAME axis. A bracketed
+    ``__name__`` is a ROW of one live test, never a function of its own; consumers
+    grouping rows to their test (row pruning, ownership matching) resolve through
+    this instead of re-implementing the split.
+    """
+    name = str(getattr(call, "__name__", "") or "")
+    return name.split("[", 1)[0]
+
+
+def callable_case_id(call: Any) -> str:
+    """The parametrize row id, or ``""`` for a non-parametrized test —
+    ``test_x[case0]`` → ``case0``.
+
+    Accessor of :data:`DISCOVERED_CALLABLE_CONTRACT` — the CASE axis, the complement
+    of :func:`callable_base_name`. The principal backend shape puts the discriminator
+    in the NODEID, not the display name: live and legacy wrappers deliberately share a
+    base ``__name__`` and carry ``test_golden[args0]`` on ``__qualname__``. A
+    bracketed ``__name__`` wins when present (the recollected-closure shape); else the
+    nodeid's FINAL bracket suffix is the row id — final, because a nodeid can carry
+    brackets in its path components too.
+    """
+    name = str(getattr(call, "__name__", "") or "")
+    if "[" in name and name.endswith("]"):
+        return name.split("[", 1)[1][:-1]
+    node_id = callable_node_id(call)
+    if node_id.endswith("]") and "[" in node_id:
+        return node_id.rsplit("[", 1)[1][:-1]
+    return ""
+
+
+def callable_node_id(call: Any) -> str:
+    """The most discriminating identity string a discovered callable carries: the
+    pytest nodeid when one exists (stamped on ``__qualname__`` at build time), else
+    the display name.
+
+    Accessor of :data:`DISCOVERED_CALLABLE_CONTRACT` — the IDENTITY axis. This is
+    what per-case caches key on (``trace_cache.test_fingerprint``): sibling
+    parametrized cases share their function's SOURCE, and only the nodeid tells them
+    apart.
+    """
+    return str(getattr(call, "__qualname__", "") or getattr(call, "__name__", "") or "")
+
+
+def resolve_test_id(
+    node_id: str,
+    display_name: str,
+    origin: str,
+    project_root: str | None,
+    case: str,
+) -> str:
+    """The pure DECISION behind :func:`callable_test_id`: five observed facts about a
+    test in, one suite-wide identity string out.
+
+    Split from the accessor so the decision is PINNABLE. ``callable_test_id`` takes an
+    arbitrary object, and Detective's ``--input`` parses a literal allowlist on purpose
+    (no arbitrary code execution), so a callable argument cannot be expressed and three
+    branches here were unreachable by input synthesis. Taking only ``str``/``None`` moves
+    the whole contract inside the literal grammar; the accessor above keeps the object
+    handling and holds no decision of its own. Same split as the exit-contract extraction
+    in Detective #50 — the reason this repo can claim a mutation-complete pin at all.
+
+    ``::`` means the collection produced a real pytest nodeid, which is already unique and
+    root-relative, so it is returned untouched. Otherwise the id is synthesized and
+    namespaced ``legacy:`` so the two can never be confused for one another.
+
+    THE ``#`` SUFFIX IS A CORRECTNESS FLOOR, NOT DECORATION. The replacement id must never
+    merge two tests the old ``__name__`` key kept apart, or #16 regresses the very property
+    it exists to establish. ``__qualname__`` is normally the more discriminating of the two,
+    but not always: closures minted by a factory all share ``factory.<locals>.inner`` while
+    carrying distinct ``__name__``s. Caught by ``test_session_budget_names_the_tests_it_never_reached``,
+    where ``heavy_1`` and ``heavy_2`` collapsed onto one entry and a 2-test cut reported as 1.
+    So when ``display_name`` is not the final dotted segment of the qualname the two carry
+    INDEPENDENT information, and both are kept. For an ordinary function they agree and the
+    id stays clean.
+
+    ``origin`` is relativized only when a root is supplied; a ``ValueError`` (a Windows
+    cross-drive path) leaves the absolute origin standing rather than failing the run —
+    still unique, merely not portable, and visibly so in the returned string.
+    """
+    if "::" in node_id:
+        return node_id
+    if origin and project_root:
+        with contextlib.suppress(ValueError):
+            origin = os.path.relpath(origin, project_root)
+    base = node_id.split("[", 1)[0] or display_name or "unknown"
+    if display_name and display_name != base.rsplit(".", 1)[-1]:
+        base = f"{base}#{display_name}"
+    return f"legacy:{origin or '?'}::{base}{f'[{case}]' if case else ''}"
+
+
+def callable_test_id(call: Any, project_root: str | None = None) -> str:
+    """The SUITE-WIDE identity of a discovered test: its pytest nodeid when the
+    collection produced one, else an explicitly namespaced ``legacy:`` fallback that
+    can never be mistaken for a nodeid.
+
+    Accessor of :data:`DISCOVERED_CALLABLE_CONTRACT` — the axis every suite-wide map
+    keys on (issue #16). :func:`callable_node_id` is the RAW accessor and is not
+    sufficient as a key: it degrades silently to a display ``__name__``, so a legacy row
+    and a real nodeid become indistinguishable strings and two different tests can
+    collide on one entry. Maps keyed here can always name WHICH pytest item supplied an
+    observation, which is the whole content of #16; ``__name__`` keying could not, and
+    unioned the collision instead (see :meth:`SessionBaseline.replaced`).
+
+    NAMED ``callable_test_id``, not ``test_id``: pytest collects ``test_*`` from any module
+    it imports, so the shorter name would be collected as a test the moment a test module
+    imported it — erroring on unfillable ``call``/``project_root`` fixtures. It also joins the
+    accessor family (:func:`callable_node_id`, :func:`callable_origin`,
+    :func:`callable_base_name`, :func:`callable_case_id`) that this contract already uses.
+
+    This function READS; :func:`resolve_test_id` DECIDES. Every branch lives there so it can
+    be pinned against a literal grammar — see that docstring for why the split exists.
+
+    ``project_root`` defaults to :data:`_PROJECT_ROOT`, the session's root, so that a caller
+    deep in the mutant loop yields the same id as the baseline tracer without threading an
+    argument between them. Pass it explicitly only to compute an id OUTSIDE a session.
+    """
+    root = project_root if project_root is not None else _PROJECT_ROOT.get()
+    return resolve_test_id(
+        callable_node_id(call),
+        str(getattr(call, "__name__", "") or ""),
+        callable_origin(call) or "",
+        root,
+        callable_case_id(call),
+    )
+
 
 def discover_test_callables(
     project_root: str,
@@ -351,6 +1025,8 @@ def discover_test_callables(
     func_names: list[str],
     backend: str = "auto",
     extra_dirs: list[str] | None = None,
+    conservative: bool = False,
+    testpaths: tuple[str, ...] = (),
 ) -> list[Any]:
     """Discover runnable test callables — a dial over two backends.
 
@@ -381,20 +1057,73 @@ def discover_test_callables(
     # already collected the whole suite, so the same list serves every file — for as long
     # as the suite is what it was when the session opened. A consumer that WRITES tests
     # must say so via `refresh_live_suite`; see there for what went wrong when it could not.
+    full_path = (
+        os.path.join(project_root, source_file)
+        if not os.path.isabs(source_file)
+        else source_file
+    )
+    extra = [os.path.abspath(d) for d in (extra_dirs or []) if os.path.isdir(d)]
+
+    # A live session collected the whole suite once, WITH real fixtures/conftest/lifecycle —
+    # route over what it already holds. This runs BEFORE the empty-`scoped` early return below,
+    # and that ordering is the fix (#15): an empty static shortlist is NOT "no test reaches this
+    # target" when the live suite may reach it through a fixture edge the name scan cannot see.
+    # The default keeps every item that is not provably impossible (unknown stays in the pool), so
+    # a fixture-reached test is no longer dropped as a false gap; `conservative` narrows to
+    # static/fixture candidates. Origin/closure resolve through the contract accessors, and
+    # comparisons are `realpath` — a live origin is pytest-canonicalised while `scoped` carries the
+    # caller's spelling, so on any symlinked root the two must be normalised or the filter silently
+    # empties the suite.
     live = _LIVE_SUITE.get()
-    if live is not None:
+    # PROVEN-IDENTITY SHORT-CIRCUIT (exhaustive [R-exec] probe, #15 C2). At the default
+    # `conservative=False`, `_route_live_callables` admits EVERY per-item route it can produce —
+    # static_reach×fixture over {item,none}×{T,F}, with caller/observed/dynamic fixed as it passes
+    # them, yields only candidate_static / candidate_fixture / unknown_no_path, all kept — so its
+    # result is exactly `live`. Return it WITHOUT computing the impact map: `relevant_test_files`
+    # was built on every live profiling call and then discarded by that identity (the "computed
+    # every live call, discarded" waste, §4.5). The `conservative=True` narrowing (which DOES drop
+    # `unknown_no_path`) still runs the router below, where `scoped` is the file bound it needs.
+    if live is not None and not conservative:
         return live
 
-    extra = [os.path.abspath(d) for d in (extra_dirs or []) if os.path.isdir(d)]
+    # SCOPE FIRST for every path that actually consumes it — the non-live backends below and the
+    # conservative live router. Profiling ONE function was previously handed every test file, and
+    # each backend then paid for the ~12x that cannot reach the target: collection, baseline, and
+    # again per mutant.
+    scoped = relevant_test_files(
+        project_root, full_path, func_names, testpaths=testpaths
+    )
+    if live is not None:
+        return _route_live_callables(live, scoped, func_names, conservative)
+
+    # Non-live: no already-collected suite to keep, and nothing statically reaches the target with
+    # no out-of-tree root named — return empty rather than run every unrelated test through a full
+    # mutant pass to relearn what `scoped` already said. The caller reads [] as "synthesize".
+    if not scoped and not extra:
+        return []
+
     if backend in ("auto", "pytest"):
         try:
             from Wesker.pytest_discovery import collect_pytest_callables
 
-            # "." resolves to project_root inside the collector's chdir; the extra
-            # roots are absolute so they collect regardless of cwd. No overlap with
-            # "." when out-of-tree, so no double-collection.
+            # Hand pytest the scoped FILES, not the tree: it then collects only those,
+            # so the narrowing is paid back in collection time too, not just afterwards.
+            # The extra roots are absolute so they collect regardless of cwd, and never
+            # overlap the in-tree paths.
+            #
+            # #15 IS REAL AND IS NOT FIXED HERE. Explicit arguments are not the repo's ordinary
+            # invocation: they bypass the `testpaths`/recursion route and can load a different
+            # conftest/plugin surface. But the two routes were MEASURED against each other while
+            # attempting the swap, and they differ in IMPORT BEHAVIOUR, not merely in conftest
+            # surface — collecting from the root drops a test whose module-level
+            # `from <target> import ...` cannot resolve, because `sys.path` is seeded
+            # differently. Switching naively therefore LOSES exactly the tests that reach the
+            # target and reports "nothing reaches this" — the false-negative direction, which is
+            # worse than the defect. Doing this properly needs the runner-derived import
+            # identity and effective import mode that Detective #58 specifies; it is not a
+            # matter of which paths are passed.
             collected = collect_pytest_callables(
-                project_root, paths=["."] + extra if extra else None
+                project_root, paths=list(scoped) + extra
             )
         except Exception:
             collected = None
@@ -402,14 +1131,9 @@ def discover_test_callables(
             return collected
         if backend == "pytest":
             return []
-    # Legacy fallback: hand-rolled discovery + loader. Union the project-tree test
+    # Legacy fallback: hand-rolled discovery + loader. Union the scoped project-tree test
     # files with any found under the extra roots so out-of-tree tests still load.
-    full_path = (
-        os.path.join(project_root, source_file)
-        if not os.path.isabs(source_file)
-        else source_file
-    )
-    files = discover_tests(project_root, full_path, func_names)
+    files = list(scoped)
     seen = set(files)
     for d in extra:
         for tf in _discover_all_test_files(d):
@@ -676,23 +1400,6 @@ def profile_function(
 # ── Codebase profiling with formatted output ─────────────────────
 
 
-def live_suite_active() -> bool:
-    """True when a LIVE pytest session is currently supplying the test suite.
-
-    Consumers need this to decide whether work can leave the process. The live suite is
-    a set of closures over LIVE pytest items — bound to this interpreter's session, its
-    fixtures and its conftest — so it cannot cross a ``spawn`` boundary. A worker
-    started from inside a live session re-discovers with the collect-only backend, which
-    silently drops every fixture-taking test; the shard then reports those mutants as
-    survivors and the parent merges the lie into an otherwise-correct result.
-
-    ``Detective.engine.profile`` already refuses to fan out when the caller passed
-    explicit callables, for exactly this reason ("workers re-discover; callables can't
-    cross spawn"). This predicate extends that same rule to the live suite.
-    """
-    return _LIVE_SUITE.get() is not None
-
-
 def refresh_live_suite(project_root: str, path: str) -> int:
     """Re-collect ONE test file into the live suite after writing it. Returns its test count.
 
@@ -747,20 +1454,21 @@ def refresh_live_suite(project_root: str, path: str) -> int:
     target = os.path.abspath(path)
 
     def _name(c: Any) -> str:
-        # The key `SessionBaseline.traced` / `.failing` / `.truncated` use — `trace_suite` reads
-        # the same attribute with the same fallback, so a splice keyed here lines up with what
-        # the full build wrote. Not `_origin`: a parametrized case's code object names its
-        # DEFINING module, which is why the file cannot be recovered from the name.
-        return getattr(c, "__name__", "unknown")
+        # The key `SessionBaseline.traced` / `.failing` / `.truncated` use — `trace_suite`
+        # resolves identity through the SAME accessor, so a splice keyed here lines up with
+        # what the full build wrote. Not `_origin`: a parametrized case's code object names
+        # its DEFINING module, which is why the file cannot be recovered from the id.
+        #
+        # Since issue #16 this is a per-ITEM id, which shrinks the splice rather than widening
+        # it: the `affected` set below had to include every current owner of a shared NAME,
+        # because dropping one owner's entry took the other's coverage with it. Distinct ids
+        # mean a written file's tests can only collide with themselves.
+        return callable_test_id(c)
 
-    def _origin(c: Any) -> str | None:
-        tagged = getattr(c, "__wesker_origin__", None)
-        if tagged:
-            return str(tagged)
-        real = getattr(c, "__wrapped__", c)
-        code = getattr(real, "__code__", None)
-        f = getattr(code, "co_filename", None)
-        return os.path.abspath(f) if f else None
+    # Origin resolution is the module-level contract — one resolver for every
+    # consumer, so a callable shape added later cannot be recognised here and
+    # missed elsewhere (or vice versa).
+    _origin = callable_origin
 
     # `gone` is held, not just counted: it carries the ids `SessionBaseline.inert` is keyed by,
     # and holding the objects until the splice is done is what stops a freed id being reused by
@@ -854,9 +1562,11 @@ def run_with_live_suite(
     """
     from Wesker.engine import (
         _SESSION_BASELINE,
+        _SESSION_IDENTITY,
         DEFAULT_TRACE_BUDGET_S,
         DEFAULT_TRACE_SESSION_BUDGET_S,
         LazySessionBaseline,
+        _live_collection_identity,
         build_session_baseline,
     )
     from Wesker.pytest_runner import run_in_session
@@ -887,8 +1597,22 @@ def run_with_live_suite(
 
     def _body(callables: list[Any], _session: Any) -> Any:
         suite_token = _LIVE_SUITE.set(callables)
+        # Bind the project root to THIS session and token-reset it on exit (#26). `_PROJECT_ROOT`
+        # was set inside `build_session_baseline` but never reset at the end of the owning session,
+        # so a later run in the same process relativized legacy TestIds against a stale project.
+        # Bound here, at the session boundary, it is restored to the enclosing value in `finally`.
+        root_token = _PROJECT_ROOT.set(os.path.abspath(project_root))
 
-        def _build(subset: list[Any] | None = None) -> Any:
+        # WITHIN-SESSION trace memo (#seam-events perf): a converge run makes MANY seed/widen passes
+        # over ONE unchanging target, each `fresh=True` (bypassing the cross-run disk cache for
+        # admissibility). Without this, every pass re-traces the same slow covering tests — measured:
+        # seam_events re-traced its ~50s live-game tests 11× in one converge. This dict holds ONLY
+        # this session's completed traces, keyed by test fingerprint; a hit is admissible (measured
+        # this session, not replayed). Created HERE so it lives for the whole session and dies with
+        # it — never a module global, or it becomes the stale cross-run cache `fresh` refuses.
+        _within_run: dict = {}
+
+        def _build(subset: list[Any] | None = None, fresh: bool = False) -> Any:
             # The guard lives INSIDE the closure because the closure decides when it runs. The
             # baseline RUNS the consumer's whole suite — arbitrary third-party code — and any of
             # it can leave `sys.stdout` replaced: by assigning it, or by being cut mid-
@@ -917,18 +1641,43 @@ def run_with_live_suite(
                 return build_session_baseline(
                     subset if subset is not None else (_LIVE_SUITE.get() or callables),
                     resolved,
-                    trace_progress=trace_progress if subset is None else None,
+                    # Every routed phase reports itself. The callback resets after each completed
+                    # batch, so a seed and a later widen are two honest progress phases rather than
+                    # a fast mutant "done" line followed by minutes of silence (#15/Fix B).
+                    trace_progress=trace_progress,
                     # The persistent cache lives under the CONSUMER's `.wesker/`, so the root has
-                    # to reach it — this closure is the only place that has both.
+                    # to reach it — this closure is the only place that has both. `fresh` bypasses
+                    # it (`fresh=True`): a proof-facing re-observation is measured THIS session,
+                    # then persisted as ROUTING evidence for another function — never relabelled as
+                    # this run's admissible proof reach (#15/#20).
                     project_root=project_root,
+                    fresh=fresh,
+                    regime_digest=_regime,
+                    within_run=_within_run,
                     **budgets,
                 )
 
         # Stored, not built. Whether the suite is traced at all is now the consumer's demand:
         # a run whose own cache answers the question never triggers it, and a run that needs it
         # gets it once. See `LazySessionBaseline` for why that is where the cost belongs.
+        # The pytest regime this session collected under, captured fresh HERE (#63): run_in_session
+        # set the manifest during collection, BEFORE this body runs, and later per-mutant collect-only
+        # discoveries overwrite that ContextVar — so a verdict's regime must be read at this point and
+        # carried on the holder, not re-read at cache-key time. Scope-gated: only this live session's
+        # own manifest counts (a stale collect-only one is scope 0 and yields no regime).
+        from Wesker.pytest_discovery import last_session_manifest as _last_manifest
+
+        _m = _last_manifest()
+        _regime = _m.regime_digest if (_m is not None and _m.scope > 0) else ""
+        # Session module-identity captured HERE (#5), at the same admissible point as the regime: it
+        # is a SESSION fact (about the collection), so it is published on a session ContextVar where a
+        # per-function fork or a widen splice cannot drop it — never on a mutable per-function
+        # baseline. Reads the same manifest `_live_collection_identity` already keys on.
+        ident_token = _SESSION_IDENTITY.set(_live_collection_identity())
         base_token = (
-            _SESSION_BASELINE.set(LazySessionBaseline(_build, budgets=effective))
+            _SESSION_BASELINE.set(
+                LazySessionBaseline(_build, budgets=effective, regime_digest=_regime)
+            )
             if resolved
             else None
         )
@@ -937,27 +1686,30 @@ def run_with_live_suite(
         finally:
             if base_token is not None:
                 _SESSION_BASELINE.reset(base_token)
+            _SESSION_IDENTITY.reset(ident_token)
+            _PROJECT_ROOT.reset(root_token)
             _LIVE_SUITE.reset(suite_token)
 
-    result = run_in_session(project_root, _body, paths=paths, diagnostic=diagnostic)
-    if result is None and paths:
-        # The SCOPED collection bound nothing. That is a statement about the scope, not about
-        # the suite — and the expensive pass is right there. `paths` is an optimisation: it
-        # narrows collection to the files that could execute the target. When it narrows to a
-        # set that will not collect (one stale import among them is enough — pytest's collection
-        # is per-invocation, not per-file), the honest move is to pay for the whole suite rather
-        # than report a suite that does not exist. Measured on TailChasingFixer: the 6 scoped
-        # files could not collect, while the full 61 collect 815 tests.
-        #
-        # SAFE TO RETRY, and only because of the guard in `_Driver.pytest_runtestloop`: `body`
-        # is the consumer's whole program — it writes test files — so a retry that could
-        # double-run it would be far worse than a wrong number. `run_in_session` returns None
-        # ONLY when body never ran, so the first attempt has no side effects to repeat. Never
-        # retry on an exception: that means body DID run and raised.
-        #
-        # Coverage, not perfection: slow and correct beats fast and false. A user who wants the
-        # cheap answer already got it when the scope collected.
-        result = run_in_session(project_root, _body, paths=None, diagnostic=diagnostic)
+    # A local diagnostic so the widen decision below can read the REASON even when the caller passed
+    # none; when the caller did pass one it IS this dict, so nothing about their view changes.
+    _diag: dict[str, Any] = diagnostic if diagnostic is not None else {}
+    result = run_in_session(project_root, _body, paths=paths, diagnostic=_diag)
+    # Widen to the whole suite ONLY when the scope found NO test to collect (`empty_collection`) —
+    # the fixture-reached case where static scoping was too narrow, which is the reason this fallback
+    # exists. NEVER on `collection_errors`: the reachable tests EXIST and could not be collected — a
+    # broken import or missing dep in exactly the tests that pin THIS function. Widening then measures
+    # the target against IRRELEVANT tests it does not reach, drags in every OTHER module's import
+    # failure, and refuses against the whole GLOBAL regime — which is the per-function isolation this
+    # tool exists for, inverted. Report the reachable tests' own error instead (the caller refuses
+    # with it). Found dogfooding structlog: a pure log-level function refused because unrelated
+    # modules needed pytest-asyncio / renderer deps its own tests never touch.
+    #
+    # SAFE TO RETRY (the empty case) because of the guard in `_Driver.pytest_runtestloop`: `body` is
+    # the consumer's whole program — it writes test files — and `run_in_session` returns None ONLY
+    # when body never ran, so the first attempt has no side effects to repeat. Never on an exception
+    # (body DID run and raised).
+    if result is None and paths and _diag.get("reason") == "empty_collection":
+        result = run_in_session(project_root, _body, paths=None, diagnostic=_diag)
     return result
 
 
@@ -1047,6 +1799,20 @@ def suite_health() -> dict | None:
         # coverage is under-counted by construction.
         "trace_truncated": len(baseline.truncated),
     }
+
+
+def is_truncated_measurement(coverage_depth: str, budget_exhausted: bool) -> bool:
+    """Whether one function's profile is a TRUNCATED/INVALID measurement the completeness gate must
+    drop rather than count (Wesker #14, aggregation layer).
+
+    The rollup previously counted only ``budget_exhausted``, so a run the engine had already flagged
+    non-gateable for a CONTAINMENT reason — an uncontained worker, ``coverage_depth="cut"`` with
+    ``budget_exhausted=False`` — sailed through: ``total_truncated=0``, ``spec_pct=100``, gate None.
+    The containment signal was computed correctly and then dropped before the badge decision, the
+    exact measurement/decision gap. The gate now consumes the engine's own ``coverage_depth`` — "cut"
+    is the universal invalid marker (budget OR containment, both paths) — so no invalid measurement
+    reaches the badge as a completeness number. Pure — Detective-pinned."""
+    return coverage_depth == "cut" or budget_exhausted
 
 
 def profile_codebase(
@@ -1139,7 +1905,16 @@ def profile_codebase(
         # sample of the cheap-to-reach mutants, not a mutation score. Aggregated here
         # because the per-function flag never reached the report — a truncated run and a
         # complete one published byte-identical badges.
-        total_truncated += sum(1 for r in results if r.get("budget_exhausted"))
+        # #14 (aggregation): consume the engine's COMPUTED signal, not a budget-only proxy. A run cut
+        # for CONTAINMENT (an uncontained worker: coverage_depth="cut", budget_exhausted=False) is a
+        # truncated measurement too — counting only budget_exhausted dropped it before the gate.
+        total_truncated += sum(
+            1
+            for r in results
+            if is_truncated_measurement(
+                r.get("coverage_depth", ""), bool(r.get("budget_exhausted"))
+            )
+        )
 
         # Carry each survivor up with the function it came from. ``function_key`` is
         # "path::qualname", so the record is self-locating: file, line, and the dimension
