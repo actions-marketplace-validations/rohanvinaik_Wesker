@@ -31,7 +31,8 @@ Pins into Wesker still run through Detective's CLI, with both repos on the path:
 ```bash
 cd /Users/rohanvinaik/tools/Wesker
 PYTHONPATH=$PP detective converge 'Wesker/ci.py::is_truncated_measurement' \
-  --input "('cut', False)" --input "('profiled', True)" 2>&1 | tail -8
+  --input "('cut', False)" --input "('profiled', True)" > run.log 2>&1
+# then Read run.log IN FULL — never tail it
 ```
 
 ## The gate that matters here
@@ -40,16 +41,16 @@ Wesker's own suite is **not sufficient**. It has been fully green through a regr
 only the cross-repo run caught. After any Wesker change, run both:
 
 ```bash
-cd /Users/rohanvinaik/tools/Wesker && python3 -m pytest -q 2>&1 | tail -3
-PYTHONPATH=$PP python3 -m pytest 2>&1 | tail -3   # Detective's suite vs LOCAL Wesker
+cd /Users/rohanvinaik/tools/Wesker && python3 -m pytest -q; echo "WESKER=$?"
+cd /Users/rohanvinaik/tools/Detective && PYTHONPATH=$PP python3 -m pytest; echo "DETECTIVE=$?"   # Detective's suite vs LOCAL Wesker
 ```
 
 Plus pinned ruff, never bare:
 
 ```bash
-uvx ruff@0.16.7 format . 2>&1 | tail -1 \
-  && uvx ruff@0.16.7 check . 2>&1 | tail -2 \
-  && uvx ruff@0.16.7 format --check . 2>&1 | tail -1
+uvx ruff@0.16.7 format .
+uvx ruff@0.16.7 check .; echo "CHECK=$?"
+uvx ruff@0.16.7 format --check .; echo "FORMAT=$?"
 ```
 
 ## Wesker-specific hazards
