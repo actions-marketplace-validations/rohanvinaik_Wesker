@@ -1733,7 +1733,14 @@ def run_with_live_suite(
         ident_token = _SESSION_IDENTITY.set(_live_collection_identity())
         base_token = (
             _SESSION_BASELINE.set(
-                LazySessionBaseline(_build, budgets=effective, regime_digest=_regime)
+                LazySessionBaseline(
+                    _build,
+                    budgets=effective,
+                    regime_digest=_regime,
+                    # The files `_build` traces, so a consumer can tell when this baseline cannot
+                    # answer for a function (Detective #103): real paths, the form a frame reports.
+                    target_files=frozenset(os.path.realpath(p) for p in resolved),
+                )
             )
             if resolved
             else None

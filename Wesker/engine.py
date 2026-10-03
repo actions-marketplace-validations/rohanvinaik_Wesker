@@ -3536,6 +3536,7 @@ class LazySessionBaseline:
         "_built",
         "_pending",
         "_regime_digest",
+        "_target_files",
         "_value",
     )
 
@@ -3544,6 +3545,7 @@ class LazySessionBaseline:
         build: Callable[..., SessionBaseline],
         budgets: tuple[float | None, float | None] | None = None,
         regime_digest: str = "",
+        target_files: frozenset[str] = frozenset(),
     ) -> None:
         # Takes an optional subset of callables: the same closure builds the whole baseline
         # (subset=None) and the partial one `refresh` splices in, so both are measured under
@@ -3569,6 +3571,12 @@ class LazySessionBaseline:
         # closure is stored — like the budgets above, readable without forcing the trace, so a cache
         # key can bind the regime a verdict was measured under before deciding to measure at all.
         self._regime_digest = regime_digest
+        # The real paths of the files the build closure TRACES (Detective #103). The trace records only
+        # these files' lines, so this baseline answers for a function in one of them and for nothing
+        # else: read for a function in any other file it yields empty coverage, no test routes, and
+        # no mutant dies, which every consumer read as a VALID empty measurement. Empty means the
+        # constructor did not say (a test's bare closure), and a consumer must then not assume a set.
+        self._target_files = frozenset(target_files)
 
     def get(self) -> SessionBaseline:
         """The baseline, building it on first call. Memoised — the pass runs at most once.
@@ -3617,6 +3625,18 @@ class LazySessionBaseline:
         unchanged, never invent a regime.
         """
         return self._regime_digest
+
+    @property
+    def target_files(self) -> frozenset[str]:
+        """The real paths of the files this baseline's trace covers, or empty when not declared.
+
+        Readable WITHOUT forcing the build, like ``budgets``. It is the seam's own contract made
+        checkable: ``run_with_live_suite`` traces the session baseline "once for all of" its target
+        files, and for any other file "the per-function baseline stands". A consumer about to profile a
+        function in a file NOT listed here must measure it on that per-function baseline, because this
+        one holds no line of that file (Detective #103).
+        """
+        return self._target_files
 
     def invalidate(self) -> None:
         """Discard the built baseline so the next read rebuilds it from the CURRENT suite.
@@ -3819,7 +3839,10 @@ class LazySessionBaseline:
         carries no per-function identity to lose.
         """
         return LazySessionBaseline(
-            self._build, budgets=self._budgets, regime_digest=self._regime_digest
+            self._build,
+            budgets=self._budgets,
+            regime_digest=self._regime_digest,
+            target_files=self._target_files,
         )
 
 
