@@ -53,6 +53,7 @@ import inspect
 import json
 import os
 import tempfile
+import tokenize
 from collections.abc import Callable
 from typing import Any
 
@@ -119,10 +120,15 @@ def test_fingerprint(fn: Callable[..., Any]) -> str:
     disc = callable_node_id(fn)
     try:
         declared = inspect.getsource(real)
-    except (OSError, TypeError):
+    except (OSError, TypeError, SyntaxError, tokenize.TokenError):
         # No readable source (a C callable, a closure built at runtime). Its NAME is not content,
         # so this cannot detect an edit — but it is stable, and the alternative is refusing to
-        # cache the whole suite because one test is unreadable.
+        # cache the whole suite because one test is unreadable. A STALE code object lands here
+        # too: its file was edited after import, so `getsource` tokenizes from a line number that
+        # now falls inside another construct and raises SyntaxError or TokenError (measured:
+        # Detective's in-process re-audit after `audit --remove` deleted tests above it, Detective
+        # #104). The name is safe there as well, because the origin file's content digest below
+        # changes with the edit, so a stale entry is never warmed.
         declared = f"{getattr(real, '__module__', '?')}.{getattr(real, '__qualname__', repr(real))}"
 
     # The function body is not the whole call path. A module helper or autouse/conftest fixture can
