@@ -12,6 +12,7 @@ Verifies:
 
 from __future__ import annotations
 
+import runpy
 import subprocess
 import sys
 import threading
@@ -404,3 +405,43 @@ def test_instruction_subscription_disable_behavior_preserved() -> None:
         _target_fn(1, "x")
         # Subsequent runs at disabled locations skip callback
         assert len(calls) == first_call_len
+
+
+def test_cold_instruction_count_survives_a_foreign_start_disabler(tmp_path) -> None:
+    """W#32: selector discovery must not lose the first call beside coverage-style DISABLE.
+
+    Use a fresh code object and a fresh foreign tool: earlier execution must not warm
+    either instrument's locations and hide the registration-order defect.
+    """
+    mon = sys.monitoring
+    tool_id()
+    slot = next((i for i in range(6) if mon.get_tool(i) is None), None)
+    if slot is None:
+        pytest.skip("no monitoring slot available for the foreign tool")
+    path = tmp_path / "cold.py"
+    source = "def target(n):\n    total = 0\n    for i in range(n):\n        total += i\n    return total\n"
+    path.write_text(source)
+    target = runpy.run_path(str(path))["target"]
+    offsets: list[int] = []
+    mon.use_tool_id(slot, "cold-start-disabler")
+    mon.register_callback(slot, mon.events.PY_START, lambda *args: mon.DISABLE)
+    mon.set_events(slot, mon.events.PY_START)
+    try:
+        with subscribe(
+            [target.__code__],
+            mon.events.INSTRUCTION,
+            lambda code, offset: offsets.append(offset),
+            selectors=[str(path)],
+            thread_id=threading.get_ident(),
+        ):
+            assert target(10) == 45
+            first = tuple(offsets)
+            offsets.clear()
+            assert target(10) == 45
+            assert first
+            assert tuple(offsets) == first
+    finally:
+        mon.set_events(slot, 0)
+        mon.register_callback(slot, mon.events.PY_START, None)
+        mon.free_tool_id(slot)
+    assert mon.get_local_events(tool_id(), target.__code__) == 0

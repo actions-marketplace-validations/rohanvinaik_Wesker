@@ -634,15 +634,19 @@ def subscribe(
         # Apply masks with transactional rollback on failure
         applied: list[CodeType] = []
         try:
+            _active_subscriptions[sub_id] = sub
+            if descriptors:
+                _subscriptions_with_selectors[sub_id] = sub
+            # Install discovery before local instrumentation. With a foreign
+            # PY_START callback returning DISABLE, reversing this order loses
+            # INSTRUCTION events on the code's first invocation (3.12–3.14).
+            # Reapplying an unchanged local mask does not repair that cold call.
+            _recompute_global_events(tool)
             for c in expanded_tuple:
                 _subscriptions_by_code.setdefault(c, []).append(sub)
                 _discovered_for_code.setdefault(c, set()).add(sub_id)
                 applied.append(c)
                 _recompute_mask(tool, c)
-            _active_subscriptions[sub_id] = sub
-            if descriptors:
-                _subscriptions_with_selectors[sub_id] = sub
-            _recompute_global_events(tool)
         except BaseException:
             for c in applied:
                 subs = _subscriptions_by_code.get(c, [])

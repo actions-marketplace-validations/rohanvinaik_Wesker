@@ -6,8 +6,9 @@ functions still carried their old line numbers, so `inspect.getsource` read the 
 line inside a docstring and raised `tokenize.TokenError` ("unterminated string literal"). `test_fingerprint`
 caught only OSError/TypeError, so the whole CLI died with a traceback after a removal it had already made.
 
-A stale code object's source cannot be read, exactly like a C callable's, and the same name fallback is safe:
-the origin file's content digest is also part of the fingerprint, so an edited file never warms a stale entry.
+A stale code object's source may be unreadable, depending on the interpreter's tokenizer. The same name
+fallback is safe: the origin file's content digest is also part of the fingerprint, so an edited file never
+warms a stale entry. Force tokenizer failures separately from the real edited-file scenario.
 """
 
 from __future__ import annotations
@@ -53,10 +54,21 @@ def _stale_function(tmp_path):
 
 def test_a_test_edited_under_its_code_object_fingerprints_instead_of_crashing(tmp_path):
     fn, _ = _stale_function(tmp_path)
-    # The precondition: this is the shape that crashed the CLI.
-    with pytest.raises((SyntaxError, tokenize.TokenError)):
-        inspect.getsource(fn)
     assert isinstance(fingerprint_of(fn), str)
+
+
+@pytest.mark.parametrize("error_type", (SyntaxError, tokenize.TokenError))
+def test_unreadable_stale_source_uses_a_content_sensitive_fallback(
+    tmp_path, monkeypatch, error_type
+):
+    fn, before = _stale_function(tmp_path)
+
+    def unreadable_source(_fn):
+        raise error_type("stale source")
+
+    monkeypatch.setattr(inspect, "getsource", unreadable_source)
+    assert isinstance(fingerprint_of(fn), str)
+    assert fingerprint_of(fn) != before
 
 
 def test_the_edit_still_voids_the_fingerprint(tmp_path):
@@ -65,14 +77,16 @@ def test_the_edit_still_voids_the_fingerprint(tmp_path):
     assert fingerprint_of(fn) != before
 
 
-def test_two_stale_edits_never_share_a_fingerprint(tmp_path):
+def test_two_stale_edits_never_share_a_fingerprint(tmp_path, monkeypatch):
     """The fallback key is only a NAME, so on its own two different edits would collide and the
     first edit's entry would be served for the second. The origin file's content digest is what
     keeps them apart; this pins that, since both edits take the fallback."""
     fn, _ = _stale_function(tmp_path)
+
+    def unreadable_source(_fn):
+        raise tokenize.TokenError("stale source")
+
+    monkeypatch.setattr(inspect, "getsource", unreadable_source)
     first = fingerprint_of(fn)
     (tmp_path / "test_stale_mod.py").write_text(_AFTER + "# a later edit\n")
-    # Still stale: line 5 still opens the docstring's closing quotes.
-    with pytest.raises((SyntaxError, tokenize.TokenError)):
-        inspect.getsource(fn)
     assert fingerprint_of(fn) != first
