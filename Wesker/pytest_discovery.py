@@ -163,6 +163,9 @@ def _build_callables(items: list[Any]) -> list[Callable[..., Any]]:
 
         shape = dict.fromkeys(_SHAPE_KEYS, False)
         provenance: dict[str, str] = {}
+        detected_hazards: dict[str, bool] = dict.fromkeys(_SHAPE_KEYS, False)
+        declared_hazards: dict[str, bool] = {}
+
         real = getattr(source_obj, "__wrapped__", source_obj)
         try:
             src: str | None = inspect.getsource(real)
@@ -180,7 +183,15 @@ def _build_callables(items: list[Any]) -> list[Callable[..., Any]]:
             detected_p = "source_unavailable"
         for hazard in detected:
             shape[hazard] = True
+            detected_hazards[hazard] = True
             provenance[hazard] = detected_p
+
+        # A standard test item is `Function`; a unittest method `TestCaseFunction`. Anything else is
+        # a custom collector whose lifecycle the in_process fast mode cannot assume it understands.
+        if type(it).__name__ not in ("Function", "TestCaseFunction"):
+            shape["custom_collector"] = True
+            detected_hazards["custom_collector"] = True
+            provenance["custom_collector"] = "detected"
 
         # Check for explicit declared shape on source_obj or pytest item
         decl = getattr(source_obj, "__wesker_declared_shape__", None) or getattr(
@@ -189,18 +200,21 @@ def _build_callables(items: list[Any]) -> list[Callable[..., Any]]:
         if isinstance(decl, dict):
             for k, v in decl.items():
                 if k in _SHAPE_KEYS:
-                    shape[k] = bool(v)
-                    provenance[k] = "declared"
+                    declared_val = bool(v)
+                    declared_hazards[k] = declared_val
+                    was_detected = detected_hazards.get(k, False)
+                    if was_detected != declared_val:
+                        provenance[k] = "declared_override"
+                    else:
+                        provenance[k] = "declared"
+                    shape[k] = declared_val
 
-        # A standard test item is `Function`; a unittest method `TestCaseFunction`. Anything else is
-        # a custom collector whose lifecycle the in_process fast mode cannot assume it understands.
-        if type(it).__name__ not in ("Function", "TestCaseFunction"):
-            shape["custom_collector"] = True
-            provenance["custom_collector"] = "detected"
         with contextlib.suppress(Exception):
-            # Dynamic tag: valid Python, absent from FunctionType's stub.
+            # Dynamic tags: valid Python, absent from FunctionType's stub.
             runnable.__wesker_shape__ = shape  # type: ignore[attr-defined]  # ty: ignore[unresolved-attribute]
             runnable.__wesker_shape_provenance__ = provenance  # type: ignore[attr-defined]  # ty: ignore[unresolved-attribute]
+            runnable.__wesker_detected_hazards__ = detected_hazards  # type: ignore[attr-defined]  # ty: ignore[unresolved-attribute]
+            runnable.__wesker_declared_hazards__ = declared_hazards  # type: ignore[attr-defined]  # ty: ignore[unresolved-attribute]
         return runnable
 
     callables: list[Callable[..., Any]] = []

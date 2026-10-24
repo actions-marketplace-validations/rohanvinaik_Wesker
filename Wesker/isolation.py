@@ -549,18 +549,27 @@ def callable_shape_records(call: Any, test_id: str = "") -> list[dict[str, Any]]
     prov_map = getattr(call, "__wesker_shape_provenance__", {})
     if not isinstance(prov_map, dict):
         prov_map = {}
+    detected_map = getattr(call, "__wesker_detected_hazards__", {})
+    if not isinstance(detected_map, dict):
+        detected_map = {}
+    declared_map = getattr(call, "__wesker_declared_hazards__", {})
+    if not isinstance(declared_map, dict):
+        declared_map = {}
     records: list[dict[str, Any]] = []
     for hazard, active in hazards.items():
         if active:
-            p = prov_map.get(hazard, "detected")
-            records.append(
-                {
-                    "hazard": hazard,
-                    "test_id": test_id,
-                    "execution_mode": "in_process",
-                    "provenance": p,
-                }
-            )
+            p = prov_map.get(hazard, "unknown")
+            rec: dict[str, Any] = {
+                "hazard": hazard,
+                "test_id": test_id,
+                "execution_mode": "in_process",
+                "provenance": p,
+            }
+            if hazard in detected_map:
+                rec["detected"] = bool(detected_map[hazard])
+            if hazard in declared_map:
+                rec["declared"] = bool(declared_map[hazard])
+            records.append(rec)
     return records
 
 

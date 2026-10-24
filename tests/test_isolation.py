@@ -788,6 +788,34 @@ def test_collection_stamps_the_shape_a_test_reveals(tmp_path):
     assert clean["spawns_subprocess"] is False
 
 
+def test_callable_shape_records_provenance_and_override():
+    """W#19/B01: callable_shape_records preserves detection, declaration, override, and unknown."""
+    from Wesker.isolation import callable_shape_records
+
+    def dummy():
+        pass
+
+    # 1. Unstamped or missing provenance defaults to 'unknown' rather than guessing 'detected'
+    dummy.__wesker_shape__ = {"starts_background_thread": True}
+    records = callable_shape_records(dummy, test_id="test_mod.py::test_dummy")
+    assert len(records) == 1
+    assert records[0]["hazard"] == "starts_background_thread"
+    assert records[0]["provenance"] == "unknown"
+    assert records[0]["test_id"] == "test_mod.py::test_dummy"
+
+    # 2. Detected and declared override
+    dummy.__wesker_shape__ = {"signal_main_thread": True}
+    dummy.__wesker_shape_provenance__ = {"signal_main_thread": "declared_override"}
+    dummy.__wesker_detected_hazards__ = {"signal_main_thread": False}
+    dummy.__wesker_declared_hazards__ = {"signal_main_thread": True}
+    records = callable_shape_records(dummy, test_id="test_mod.py::test_override")
+    assert len(records) == 1
+    assert records[0]["hazard"] == "signal_main_thread"
+    assert records[0]["provenance"] == "declared_override"
+    assert records[0]["detected"] is False
+    assert records[0]["declared"] is True
+
+
 def test_in_process_gateability_now_requires_hermetic_shapes(tmp_path):
     """THE increment-5 payoff: a non-hermetic in_process result is no longer gateable, and NAMES the
     hazard; a hermetic one still gates conditionally; the isolated mode contains any shape, so its
