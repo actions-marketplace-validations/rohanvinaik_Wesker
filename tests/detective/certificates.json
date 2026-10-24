@@ -59,9 +59,15 @@
     "refusal": "",
     "standing": "complete"
   },
+  "Wesker/engine.py::measurement_entry_disposition": {
+    "cut_reasons": [],
+    "function_digest": "2d1810f67a67b460",
+    "refusal": "",
+    "standing": "complete"
+  },
   "Wesker/engine.py::mutant_disposition": {
     "cut_reasons": [],
-    "function_digest": "81dc3f2be6a60ede",
+    "function_digest": "169f14b1e343e256",
     "refusal": "",
     "standing": "complete"
   },
