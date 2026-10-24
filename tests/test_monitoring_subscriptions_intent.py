@@ -320,6 +320,11 @@ def test_cancellation_during_delivery_admission_cleans_its_reservation() -> None
             monitoring._dispatch_py_unwind,
             (0, ValueError()),
         ),
+        (
+            sys.monitoring.events.INSTRUCTION,
+            monitoring._dispatch_instruction,
+            (0,),
+        ),
     ],
 )
 def test_rejected_threads_do_not_materialize_target_frames(
@@ -342,3 +347,60 @@ def test_rejected_threads_do_not_materialize_target_frames(
         thread_filter=lambda tid: False,
     ):
         dispatch(_target_fn.__code__, *args)
+
+
+def test_instruction_subscription_thread_attribution_and_token_retirement() -> None:
+    """W#32/B01: instruction events are attributed strictly to owning thread and token."""
+    code = _target_fn.__code__
+    counts: list[int] = []
+    token = allocate_run_token()
+    my_tid = threading.get_ident()
+
+    def on_instr(c: CodeType, offset: int) -> None:
+        counts.append(offset)
+
+    # 1. Monitored on current thread
+    with subscribe(
+        [code],
+        sys.monitoring.events.INSTRUCTION,
+        on_instr,
+        thread_id=my_tid,
+        run_token=token,
+    ):
+        res = _target_fn(2, "a")
+        assert res == "a:4"
+        assert len(counts) > 0
+        captured_len = len(counts)
+
+        # 2. Foreign thread executing code is rejected
+        def foreign_worker():
+            _target_fn(3, "b")
+
+        t = threading.Thread(target=foreign_worker)
+        t.start()
+        t.join()
+        assert len(counts) == captured_len
+
+        # 3. Retired run-token immediately stops delivery
+        retire_run_token(token)
+        _target_fn(4, "c")
+        assert len(counts) == captured_len
+
+
+def test_instruction_subscription_disable_behavior_preserved() -> None:
+    """W#32/B01: returning sys.monitoring.DISABLE from instruction callback is preserved."""
+    code = _target_fn.__code__
+    calls = []
+
+    def disabler(c: CodeType, offset: int):
+        calls.append(offset)
+        return sys.monitoring.DISABLE
+
+    with subscribe([code], sys.monitoring.events.INSTRUCTION, disabler):
+        assert _target_fn(1, "x") == "x:2"
+        # Only the first instruction callback runs before being disabled at that location
+        first_call_len = len(calls)
+        assert first_call_len >= 1
+        _target_fn(1, "x")
+        # Subsequent runs at disabled locations skip callback
+        assert len(calls) == first_call_len

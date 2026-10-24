@@ -274,6 +274,9 @@ def tool_id() -> int:
             mon.register_callback(candidate, mon.events.PY_RETURN, _dispatch_py_return)
             mon.register_callback(candidate, mon.events.LINE, _dispatch_line)
             mon.register_callback(candidate, mon.events.PY_UNWIND, _dispatch_py_unwind)
+            mon.register_callback(
+                candidate, mon.events.INSTRUCTION, _dispatch_instruction
+            )
             _tool = candidate
             return candidate
     raise MonitoringUnavailable(
@@ -492,6 +495,29 @@ def _dispatch_py_unwind(code: CodeType, offset: int, exc: BaseException) -> None
         _notify(sub, code, offset, exc, frame=target_frame)
 
 
+def _dispatch_instruction(code: CodeType, offset: int) -> object:
+    subs = _subscriptions_by_code.get(code)
+    if not subs:
+        return None
+    cur_thread = threading.get_ident()
+    for sub in subs:
+        if sub.event != sys.monitoring.events.INSTRUCTION or sub.observation.failure:
+            continue
+        if not _thread_matches(sub, cur_thread):
+            continue
+        if sub.run_token is not None and not is_run_token_active(sub.run_token):
+            continue
+        try:
+            res = sub.callback(code, offset)
+            if res is sys.monitoring.DISABLE:
+                return sys.monitoring.DISABLE
+        except Exception as exc:  # noqa: BLE001
+            sub.observation.failure = (
+                sub.observation.failure or f"observer_failed:{type(exc).__name__}"
+            )
+    return None
+
+
 # ── Subscription API ──────────────────────────────────────────────────────────
 
 
@@ -685,6 +711,7 @@ def release_monitoring_tool() -> None:
                 mon.events.PY_RETURN,
                 mon.events.LINE,
                 mon.events.PY_UNWIND,
+                mon.events.INSTRUCTION,
             ):
                 with contextlib.suppress(ValueError):
                     mon.register_callback(tid, ev, None)
