@@ -3,10 +3,15 @@
 **Mutation testing that counts the behavioral questions your tests leave open — one mutant per question, not the forty ways to ask it.**
 
 <p align="center">
-  <a href="https://github.com/rohanvinaik/Wesker/actions/workflows/ci.yml"><img src="https://github.com/rohanvinaik/Wesker/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
-  <a href="https://sonarcloud.io/summary/new_code?id=rohanvinaik_Wesker"><img src="https://sonarcloud.io/api/project_badges/measure?project=rohanvinaik_Wesker&amp;metric=alert_status" alt="Quality Gate"></a>
-  <a href="https://opensource.org/licenses/MIT"><img src="https://img.shields.io/badge/License-MIT-3367d6.svg" alt="License: MIT"></a>
-  <a href="https://www.python.org/downloads/"><img src="https://img.shields.io/badge/python-3.12+-3367d6.svg" alt="Python 3.12+"></a>
+  <a href="https://pypi.org/project/Wesker/"><img src="https://img.shields.io/pypi/v/Wesker?style=flat-square&amp;logo=pypi&amp;logoColor=white&amp;color=3776ab" alt="PyPI version"></a>
+  <a href="https://github.com/rohanvinaik/Wesker/releases/latest"><img src="https://img.shields.io/github/v/release/rohanvinaik/Wesker?style=flat-square&amp;logo=github&amp;label=release" alt="Latest GitHub release"></a>
+  <a href="https://www.python.org/downloads/"><img src="https://img.shields.io/badge/Python-3.12%2B-3776ab?style=flat-square&amp;logo=python&amp;logoColor=white" alt="Python 3.12+"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/github/license/rohanvinaik/Wesker?style=flat-square&amp;color=5b6abf" alt="License: MIT"></a>
+  <br>
+  <a href="https://github.com/rohanvinaik/Wesker/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/rohanvinaik/Wesker/ci.yml?branch=main&amp;style=flat-square&amp;logo=githubactions&amp;logoColor=white&amp;label=CI" alt="CI status"></a>
+  <a href="https://github.com/rohanvinaik/Wesker/actions/workflows/codeql.yml"><img src="https://img.shields.io/github/actions/workflow/status/rohanvinaik/Wesker/codeql.yml?branch=main&amp;style=flat-square&amp;logo=github&amp;label=CodeQL" alt="CodeQL status"></a>
+  <a href="https://sonarcloud.io/summary/new_code?id=rohanvinaik_Wesker"><img src="https://sonarcloud.io/api/project_badges/measure?project=rohanvinaik_Wesker&amp;metric=alert_status" alt="Sonar quality gate"></a>
+  <a href="https://docs.astral.sh/ruff/"><img src="https://img.shields.io/badge/code%20style-Ruff-d7ff64?style=flat-square&amp;logo=ruff&amp;logoColor=d7ff64&amp;labelColor=261230" alt="Code style: Ruff"></a>
 </p>
 
 `10 semantic categories · 1.00 mutants per behavioral dimension · Zero dependencies · Fully deterministic`
@@ -136,7 +141,7 @@ Zero dependencies beyond the standard library and your test framework. Python 3.
 ```yaml
 - uses: actions/checkout@v4
   with: {fetch-depth: 0}
-- uses: rohanvinaik/Wesker@v1.1.1
+- uses: rohanvinaik/Wesker@v1.2.1
   with:
     base-ref: ${{ github.event.pull_request.base.sha }}
     sarif: .wesker/wesker.sarif
