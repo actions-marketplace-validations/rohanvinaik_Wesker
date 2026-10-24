@@ -400,6 +400,11 @@ def mutation_policy(two_sign: bool = False) -> MutationPolicy:
         "observation": [
             "a mutant is killed when a covering test fails under it",
             (
+                "each test observation invokes the test at most once; a no-argument "
+                "unpatched fallback requires pre-execution signature binding; "
+                "a TypeError during execution never triggers a retry"
+            ),
+            (
                 "assertion kills (value-specified) are distinguished from "
                 "crash kills (run-only), and an assertion kill takes "
                 "precedence over a crash kill for the same mutant"

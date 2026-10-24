@@ -1,7 +1,7 @@
 """The versioned mutation policy (issue #8): identity, derivation, enforcement.
 
-Two goldens carry the enforcement story. The policy-id golden makes "a policy
-change without a version bump" a test failure instead of a silent drift; the
+Two goldens carry the enforcement story. The policy-id golden makes an unreviewed
+policy change a test failure instead of a silent drift; the
 fingerprint-counts golden is the same fact in a readable shape, so the failure
 names the category that moved instead of handing you a hash. Everything else
 pins that the manifest is DERIVED from the engine's own tables — the manifest
@@ -37,12 +37,14 @@ from Wesker.policy import (
 #     Wesker/policy.py, re-run `python -c "from Wesker import mutation_policy;
 #     print(mutation_policy().policy_id)"`, and update this golden (and the
 #     counts below, which will name what moved); or
+#   * you repaired observation semantics without changing the universe — retain
+#     POLICY_VERSION, verify categories/counts unchanged, and update the id with
+#     the repair receipt so older observation results cannot share its basis; or
 #   * you changed eligibility semantics BY ACCIDENT — a mutator, a counter, a
 #     skip rule — and this failure is the entire point: find the drift before
 #     touching the golden.
-GOLDEN_POLICY_ID = (
-    "8.dcc355186875"  # 8: annotation exclusion and unresolved execution bounds
-)
+# W#47: the same policy-8 universe, with single-invocation observation semantics.
+GOLDEN_POLICY_ID = "8.68a525594c46"
 
 # The same fact, readable: the engine's target counts over the fingerprint
 # corpus. A failure here names the category and function that moved.
@@ -87,7 +89,9 @@ def test_policy_id_is_the_golden():
     assert mutation_policy().policy_id == GOLDEN_POLICY_ID, (
         "The mutation-policy fingerprint moved. Intentional universe change → "
         "bump POLICY_VERSION and update GOLDEN_POLICY_ID (+ GOLDEN_FINGERPRINT, "
-        "which names what moved). Unintentional → you changed eligibility "
+        "which names what moved). Observation-only repair → verify unchanged "
+        "categories/counts and record the new observation id. Unintentional → "
+        "you changed eligibility "
         "semantics by accident; find the drift before touching the golden."
     )
 

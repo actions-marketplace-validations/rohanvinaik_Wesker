@@ -7046,6 +7046,9 @@ def _run_test_with_timeout(
     Returns a kill reason ("assertion", "exception", "crash"), an unresolved
     execution code ("undetermined", "diverged"), or None if the test passed.
 
+    Select arguments before invoking the test (#47). A TypeError raised after
+    entry is an execution outcome, never permission to retry without the mutant.
+
     AND ONE VALUE THAT IS NOT A KILL REASON: "uncontained" (#14). It means the timed-out
     worker outlived `abandon` and may still be running, so nothing measured after it is
     trustworthy. This list omitted it for a release, and three baseline callers written
@@ -7076,13 +7079,26 @@ def _run_test_with_timeout(
 
     def _target() -> None:
         try:
-            if patched:
-                test_fn()
-            else:
+            call_args: tuple[Any, ...] = ()
+            if not patched:
+                import inspect
+
+                call_args = (mutated_func,)
                 try:
-                    test_fn(mutated_func)
-                except TypeError:
-                    test_fn()
+                    call_signature = inspect.signature(test_fn, follow_wrapped=False)
+                except (TypeError, ValueError):
+                    # An unavailable signature supplies no evidence for a different
+                    # convention. Keep one injected attempt, without an execution retry.
+                    pass
+                else:
+                    try:
+                        call_signature.bind(*call_args)
+                    except TypeError:
+                        # Only binding, never execution, selects the zero-argument form.
+                        # A fixture wrapper's own signature matters, not its __wrapped__.
+                        call_signature.bind()
+                        call_args = ()
+            test_fn(*call_args)
         except StepBudgetExceeded:
             result_box[0] = "diverged"
         except AssertionError:
