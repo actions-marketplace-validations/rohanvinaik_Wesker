@@ -560,6 +560,8 @@ class ProfilingResult:
     #: "refuse_*" here is why an in_process result is not gateable — the NAMED refusal the issue asks
     #: for. Default "n/a" leaves every existing construction (and the isolated path) unaffected.
     fast_mode: str = "n/a"
+    #: Preserved shape hazard records when fast_mode refuses (hazard, test_id, mode, provenance) (W#19).
+    shape_hazards: tuple[dict[str, Any], ...] = ()
     #: The memory-budget standing over the isolated workers (W#21): "cut" when a mutant hit the
     #: worker's address-space cap (that mutant is non-gateable), else "enforced" / "telemetry_only"
     #: — the HONEST capability, never claiming a guarantee an unaccepting platform did not keep — or
@@ -851,6 +853,7 @@ class ProfilingResult:
             "coverage_depth": self.coverage_depth,
             "execution_mode": self.execution_mode,
             "fast_mode": self.fast_mode,
+            "shape_hazards": list(self.shape_hazards),
             "memory_standing": self.memory_standing,
             "determinism": self.determinism,
             "execution_standing": self.execution_standing,
@@ -8329,6 +8332,7 @@ def run_function_profiling(
     # whole process, so shape is irrelevant there — it is "n/a" and always passes the gate. Computed
     # once over the discovered tests from the shape stamped at collection (an inline/legacy callable
     # carries no stamp and reads hermetic — those paths have no shape signal to refuse on).
+    _shape_hazards: list[dict[str, Any]] = []
     if isolated:
         _fast_mode = "n/a"
         _fast_shape_ok = True
@@ -8337,6 +8341,13 @@ def run_function_profiling(
             [fast_mode_standing(**callable_shape_hazards(t)) for t in test_functions]
         )
         _fast_shape_ok = _fast_mode == "hermetic"
+        if not _fast_shape_ok:
+            from Wesker.ci import callable_test_id
+            from Wesker.isolation import callable_shape_records
+
+            for t in test_functions:
+                tid = callable_test_id(t)
+                _shape_hazards.extend(callable_shape_records(t, test_id=tid))
 
     # Repeated-fresh-baseline nondeterminism check (#19), OPT-IN. Two baselines from matched fresh
     # ISOLATED state, compared on outcome AND covered lines: an unrepeatable baseline cannot ground a
@@ -8454,6 +8465,7 @@ def run_function_profiling(
         # The NAMED fast-mode shape standing (#19): why an in_process result is (not) gateable — a
         # "refuse_<hazard>" is the explicit refusal the issue asks for, "n/a" under isolated.
         fast_mode=_fast_mode,
+        shape_hazards=tuple(_shape_hazards),
         # W#21: "cut" when a mutant hit the worker's memory cap (non-gateable), else the honest
         # enforced/telemetry capability, "n/a" in-process.
         memory_standing=_memory_standing,

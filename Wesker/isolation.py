@@ -539,6 +539,31 @@ def callable_shape_hazards(call: Any) -> dict[str, bool]:
     return {k: bool(stamped.get(k, False)) for k in _SHAPE_KEYS}
 
 
+def callable_shape_records(call: Any, test_id: str = "") -> list[dict[str, Any]]:
+    """Preserve shape hazards, affected test ID, execution mode, and provenance (W#19/B01).
+
+    Distinguishes detected AST analysis, declared test markers/attributes, source unavailable,
+    or overrides, so downstream evidence preserves provenance rather than reconstructing it
+    from tag presence alone."""
+    hazards = callable_shape_hazards(call)
+    prov_map = getattr(call, "__wesker_shape_provenance__", {})
+    if not isinstance(prov_map, dict):
+        prov_map = {}
+    records: list[dict[str, Any]] = []
+    for hazard, active in hazards.items():
+        if active:
+            p = prov_map.get(hazard, "detected")
+            records.append(
+                {
+                    "hazard": hazard,
+                    "test_id": test_id,
+                    "execution_mode": "in_process",
+                    "provenance": p,
+                }
+            )
+    return records
+
+
 def callable_is_hermetic(call: Any) -> bool:
     """Whether a test callable is in_process-safe (hermetic), RESILIENT to the live-session path.
 

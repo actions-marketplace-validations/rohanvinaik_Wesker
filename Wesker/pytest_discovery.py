@@ -162,25 +162,45 @@ def _build_callables(items: list[Any]) -> list[Callable[..., Any]]:
         from Wesker.isolation import _SHAPE_KEYS, scan_source_hazards
 
         shape = dict.fromkeys(_SHAPE_KEYS, False)
+        provenance: dict[str, str] = {}
         real = getattr(source_obj, "__wrapped__", source_obj)
         try:
             src: str | None = inspect.getsource(real)
         except (OSError, TypeError):
             src = None
-        detected = (
-            scan_source_hazards(src)
-            if src is not None
-            else ["signal_main_thread", "spawns_subprocess", "starts_background_thread"]
-        )
+        if src is not None:
+            detected = scan_source_hazards(src)
+            detected_p = "detected"
+        else:
+            detected = [
+                "signal_main_thread",
+                "spawns_subprocess",
+                "starts_background_thread",
+            ]
+            detected_p = "source_unavailable"
         for hazard in detected:
             shape[hazard] = True
+            provenance[hazard] = detected_p
+
+        # Check for explicit declared shape on source_obj or pytest item
+        decl = getattr(source_obj, "__wesker_declared_shape__", None) or getattr(
+            it, "__wesker_declared_shape__", None
+        )
+        if isinstance(decl, dict):
+            for k, v in decl.items():
+                if k in _SHAPE_KEYS:
+                    shape[k] = bool(v)
+                    provenance[k] = "declared"
+
         # A standard test item is `Function`; a unittest method `TestCaseFunction`. Anything else is
         # a custom collector whose lifecycle the in_process fast mode cannot assume it understands.
         if type(it).__name__ not in ("Function", "TestCaseFunction"):
             shape["custom_collector"] = True
+            provenance["custom_collector"] = "detected"
         with contextlib.suppress(Exception):
             # Dynamic tag: valid Python, absent from FunctionType's stub.
             runnable.__wesker_shape__ = shape  # type: ignore[attr-defined]  # ty: ignore[unresolved-attribute]
+            runnable.__wesker_shape_provenance__ = provenance  # type: ignore[attr-defined]  # ty: ignore[unresolved-attribute]
         return runnable
 
     callables: list[Callable[..., Any]] = []
