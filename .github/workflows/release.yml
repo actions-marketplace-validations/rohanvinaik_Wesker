@@ -23,12 +23,37 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
+      actions: read # inspect CI for the exact tagged commit before building/signing
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           # A release event checks out the tagged commit. check_sdist.py asks git what it tracks,
           # which needs no credentials.
           persist-credentials: false
+
+      - name: Require successful CI for the release commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python3 - <<'PY'
+          import json, os, subprocess, sys, urllib.request
+          sha = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
+          repo = os.environ["GITHUB_REPOSITORY"]
+          url = f"https://api.github.com/repos/{repo}/actions/workflows/ci.yml/runs?head_sha={sha}&event=push&per_page=100"
+          request = urllib.request.Request(url, headers={
+              "Authorization": f"Bearer {os.environ['GH_TOKEN']}",
+              "Accept": "application/vnd.github+json",
+          })
+          with urllib.request.urlopen(request, timeout=30) as response:
+              data = json.load(response)
+          runs = [r for r in data["workflow_runs"] if r["head_sha"] == sha and r["event"] == "push"]
+          if not runs:
+              sys.exit(f"No push CI run exists for release commit {sha}; artifacts withheld")
+          run = max(runs, key=lambda r: r["id"])
+          if (run["status"], run["conclusion"]) != ("completed", "success"):
+              sys.exit(f"Release commit {sha} CI is {run['status']}/{run['conclusion']}; artifacts withheld: {run['html_url']}")
+          print(f"Release commit {sha} passed CI: {run['html_url']}")
+          PY
 
       - uses: astral-sh/setup-uv@38f3f104447c67c051c4a08e39b64a148898af3a # v4.2.0
         with:
