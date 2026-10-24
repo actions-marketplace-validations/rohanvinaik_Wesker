@@ -327,7 +327,7 @@ def test_the_cause_is_about_the_tests_that_ran_not_the_whole_scope(project):
         )
     finally:
         stop.set()
-    assert res.entered is False and res.killed_by == "timeout"
+    assert res.entered is False and res.killed_by in ("timeout", "undetermined")
     assert res.tests_run == 1, "only the spinning test started"
     coverage = {
         callable_test_id(test_spins_elsewhere): [],
@@ -336,7 +336,7 @@ def test_the_cause_is_about_the_tests_that_ran_not_the_whole_scope(project):
     detail = _not_entered_detail(res, scoped, coverage, set(), [], "complete")
     assert detail["cause"] == "not_reached"
     assert detail["reach"] == "unreached"
-    assert detail["ended_by"] == "timeout"
+    assert detail["ended_by"] in ("timeout", "undetermined")
 
 
 # ── the holder scan: what the install DOES rebind is never a holder ──────────────────────────

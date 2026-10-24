@@ -287,13 +287,10 @@ def _trace_baseline_run(target_abspath: str, node_ids: list[str]) -> dict[str, A
 
     The determinism check runs this twice in two fresh workers and compares. Here, from one fresh
     process, it captures the set of TARGET lines the covering tests execute and the run's outcome.
-    The tracer mirrors ``line_coverage._trace_one_multi``'s dispatch: a global ``settrace`` whose
-    dispatch installs the per-line recorder only on frames whose code lives in the target file —
-    ``settrace``'s global hook still fires for every nested frame, so a test in another file that
-    CALLS the target is recorded too. ``settrace`` binds the calling (main) thread, which is where
-    pytest runs the node bodies.
+    Coordinated via sys.monitoring (W#32).
     """
     from Wesker.isolation import isolated_test_outcome
+    from Wesker.monitoring import allocate_run_token, retire_run_token, subscribe
 
     # `realpath`, not `abspath`: `python -m` prepends "" (cwd) to sys.path so an import can resolve to
     # a RELATIVE co_filename, AND on macOS the target dir is reached through the /var -> /private/var
@@ -311,21 +308,29 @@ def _trace_baseline_run(target_abspath: str, node_ids: list[str]) -> dict[str, A
             _norm[fn] = hit
         return hit
 
-    def _local(frame: Any, event: str, _arg: Any) -> Any:
-        if event == "line" and _is_target(frame.f_code.co_filename):
-            covered.add(frame.f_lineno)
-        return _local
+    token = allocate_run_token()
 
-    def _dispatch(frame: Any, event: str, _arg: Any) -> Any:
-        if event == "call" and _is_target(frame.f_code.co_filename):
-            return _local
-        return None
+    def _on_line(
+        code: Any,
+        lineno: int,
+        frame: Any = None,
+        run_token: int | None = None,
+    ) -> None:
+        if _is_target(code.co_filename):
+            covered.add(lineno)
+
+    handle = subscribe(
+        [],
+        sys.monitoring.events.LINE,
+        _on_line,
+        run_token=token,
+        selectors=[target_abspath],
+    )
 
     with (
         contextlib.redirect_stdout(io.StringIO()),
         contextlib.redirect_stderr(io.StringIO()),
     ):
-        sys.settrace(_dispatch)
         try:
             rc = pytest.main(
                 [
@@ -340,7 +345,9 @@ def _trace_baseline_run(target_abspath: str, node_ids: list[str]) -> dict[str, A
                 plugins=[_CheapFailureRepr()],
             )
         finally:
-            sys.settrace(None)
+            retire_run_token(token)
+            handle.close()
+    handle.check()
     return {"lines": sorted(covered), "outcome": isolated_test_outcome(int(rc), False)}
 
 

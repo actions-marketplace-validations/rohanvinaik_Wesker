@@ -41,12 +41,13 @@ from Wesker.policy import (
 #     skip rule — and this failure is the entire point: find the drift before
 #     touching the golden.
 GOLDEN_POLICY_ID = (
-    "7.a73c76cd1d65"  # 7: SWAP asks every positional pair, under a budget
+    "8.dcc355186875"  # 8: annotation exclusion and unresolved execution bounds
 )
 
 # The same fact, readable: the engine's target counts over the fingerprint
 # corpus. A failure here names the category and function that moved.
 GOLDEN_FINGERPRINT = {
+    "fp_annotations": {"ARITHMETIC": 1, "DATAFLOW": 1, "STATE": 1, "VALUE": 4},
     "fp_value": {"STATE": 1, "STMT": 1, "VALUE": 9},
     "fp_boundary": {"BOUNDARY": 17, "STATE": 1},
     "fp_arith_logic": {

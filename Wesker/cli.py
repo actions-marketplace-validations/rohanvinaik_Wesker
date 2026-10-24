@@ -85,6 +85,17 @@ def main(argv: list[str] | None = None) -> int:
         default=1,
         help="Convergence passes (extra passes deepen within covered dimensions)",
     )
+    parser.add_argument(
+        "--isolated",
+        action="store_true",
+        help="Run mutant evaluation in isolated worker subprocesses with memory boundaries (#45)",
+    )
+    parser.add_argument(
+        "--mem-limit-mb",
+        type=int,
+        default=512,
+        help="Memory limit in MB for isolated workers (default: 512)",
+    )
     parser.add_argument("--exclude", nargs="*", default=[], help="Files to exclude")
     parser.add_argument("--quiet", action="store_true", help="Minimal output")
     parser.add_argument(
@@ -93,6 +104,8 @@ def main(argv: list[str] | None = None) -> int:
         help="delete regeneratable .wesker/ cruft from old runs and exit",
     )
     args = parser.parse_args(argv)
+    if args.mem_limit_mb <= 0:
+        parser.error("--mem-limit-mb must be a positive integer")
 
     if args.purge:
         from Wesker.memory_guard import purge_caches
@@ -129,6 +142,8 @@ def main(argv: list[str] | None = None) -> int:
         max_per_category=args.max_per_category,
         passes=args.passes,
         verbose=not args.quiet and not args.json_output,
+        isolated=args.isolated,
+        worker_mem_limit_mb=args.mem_limit_mb,
     )
     execution_mode = "pytest-live"
     if result is None:
@@ -149,6 +164,8 @@ def main(argv: list[str] | None = None) -> int:
             max_per_category=args.max_per_category,
             passes=args.passes,
             verbose=not args.quiet and not args.json_output,
+            isolated=args.isolated,
+            worker_mem_limit_mb=args.mem_limit_mb,
         )
     result["execution_mode"] = execution_mode
 

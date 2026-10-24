@@ -23,8 +23,9 @@ import math
 import threading
 import time
 import types
+from collections.abc import Iterator
 from contextvars import ContextVar
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import Enum
 from typing import TYPE_CHECKING, Any, ClassVar, TypeGuard
 
@@ -52,7 +53,6 @@ from .line_coverage import admissible_coverage as _admissible_coverage
 from .line_coverage import arcs_from_trace as _arcs_from_trace
 from .line_coverage import coverage_from_trace as _coverage_from_trace
 from .line_coverage import executable_lines as _executable_lines
-from .line_coverage import failing_on_baseline as _failing_on_baseline
 from .line_coverage import trace_line_coverage as _trace_line_coverage
 from .line_coverage import trace_suite as _trace_suite
 from .memory_guard import memory_enforcement_standing
@@ -276,6 +276,7 @@ def mutant_disposition(
     contained: bool,
     killed: bool,
     refusal: str = "",
+    killed_by: str | None = None,
 ) -> str:
     """What a mutant's outcome is EVIDENCE OF (issue #18).
 
@@ -298,6 +299,10 @@ def mutant_disposition(
       held evaluation its nested measurement was refused rather than left to wait for itself. The
       test was never observed to pass or fail, so the mutant is neither killed nor survived.
       Ahead of ``not_entered`` because the refused test may have been the one to enter it.
+    * ``diverged``       — an explicit deterministic step budget was exceeded (issue #27).
+      Reported as its own named outcome, never a value kill.
+    * ``undetermined``   — a wall clock bound fired before any kill was established (issue #27).
+      Liveness boundary only, never a kill.
     * ``not_entered``    — installed, but the test never called it. The classic decorator and
       registry capture: the namespace holds the mutant while the caller holds the original.
     * ``cut``            — ran, but the measurement is truncated or uncontained, so its outcome
@@ -315,6 +320,10 @@ def mutant_disposition(
         return "not_installed"
     if refusal and not killed:
         return refusal
+    if killed_by == "diverged":
+        return "diverged"
+    if killed_by in ("undetermined", "timeout"):
+        return "undetermined"
     if entered is False:
         return "not_entered"
     if not contained:
@@ -981,7 +990,14 @@ def _unscored_record(result: MutantResult, disposition: str) -> dict:
         "dimension": mutant.dimension,
         "change": _mutant_change(mutant),
         "disposition": disposition,
+        "killed_by": result.killed_by,
+        "contained": result.contained,
+        "diff_summary": _mutant_diff(mutant),
     }
+    if result.test_name:
+        record["test"] = result.test_name
+    if result.uncontained_test:
+        record["uncontained_test"] = result.uncontained_test
     if result.refused_test:
         record["test"] = result.refused_test
     return record
@@ -1020,7 +1036,7 @@ def _not_entered_detail(
         "holders": [dict(h) for h in holders],
         "holder_scan": holder_scan,
     }
-    if result.killed and result.killed_by:
+    if result.killed_by:
         detail["ended_by"] = result.killed_by
     return detail
 
@@ -1062,6 +1078,62 @@ class _BaseMutator(ast.NodeTransformer):
         """Record the behavioral dimension of the current candidate site."""
         if self.keys is not None:
             self.keys.append(dim_key)
+
+    # ── Option A (Wesker#30): Exclude annotation subtrees ─────────────
+    # Annotations are inert under PEP 563 / PEP 649 absent explicit
+    # introspection. To keep the operator universe sound and aligned across
+    # counting, recording, and transformation, mutators skip annotation subtrees
+    # while preserving behavioral elements (default expressions, decorators, body).
+
+    def visit_arg(self, node: ast.arg) -> ast.arg:
+        # Parameter annotations are skipped; defaults live on ast.arguments.
+        return node
+
+    def _visit_node_list(self, nodes: list[Any]) -> list[Any]:
+        new_nodes: list[Any] = []
+        for item in nodes:
+            if isinstance(item, ast.AST):
+                res = self.visit(item)
+                if res is None:
+                    continue
+                if isinstance(res, list):
+                    new_nodes.extend(res)
+                else:
+                    new_nodes.append(res)
+            else:
+                new_nodes.append(item)
+        return new_nodes
+
+    def _visit_func_def(self, node: ast.FunctionDef | ast.AsyncFunctionDef) -> ast.AST:
+        # Decorators, parameter defaults, and body are behavioral;
+        # return annotations and type_params are inert.
+        node.decorator_list = self._visit_node_list(node.decorator_list)
+        node.args = self.visit(node.args)
+        node.body = self._visit_node_list(node.body)
+        return node
+
+    def visit_FunctionDef(self, node: ast.FunctionDef) -> ast.AST:
+        return self._visit_func_def(node)
+
+    def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> ast.AST:
+        return self._visit_func_def(node)
+
+    def visit_ClassDef(self, node: ast.ClassDef) -> ast.AST:
+        node.decorator_list = self._visit_node_list(node.decorator_list)
+        node.bases = self._visit_node_list(node.bases)
+        node.keywords = self._visit_node_list(node.keywords)
+        node.body = self._visit_node_list(node.body)
+        return node
+
+    def visit_AnnAssign(self, node: ast.AnnAssign) -> ast.AST:
+        # Mutate target and value, omit annotation.
+        node.target = self.visit(node.target)
+        if node.value is not None:
+            node.value = self.visit(node.value)
+        return node
+
+    def visit_TypeAlias(self, node: ast.AST) -> ast.AST:
+        return node
 
 
 class _ValueMutator(_BaseMutator):
@@ -1736,7 +1808,7 @@ class _OutputMutator(_BaseMutator):
             for a in (node.args.posonlyargs + node.args.args)
             if a.arg not in ("self", "cls")
         ]
-        return self.generic_visit(node)
+        return self._visit_func_def(node)
 
     # One body for both: it reads only `args`, which sync and async defs share.
     visit_AsyncFunctionDef = visit_FunctionDef
@@ -2543,6 +2615,43 @@ def _docstring_positions(
     return positions
 
 
+def _walk_behavioral(node: ast.AST) -> Iterator[ast.AST]:
+    """Walk an AST omitting inert annotation subtrees (Option A, Wesker#30)."""
+    stack = [node]
+    while stack:
+        current = stack.pop()
+        yield current
+        if isinstance(current, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            stack.extend(reversed(current.decorator_list))
+            stack.append(current.args)
+            stack.extend(reversed(current.body))
+        elif isinstance(current, ast.ClassDef):
+            stack.extend(reversed(current.decorator_list))
+            stack.extend(reversed(current.bases))
+            stack.extend(reversed(current.keywords))
+            stack.extend(reversed(current.body))
+        elif isinstance(current, ast.arg):
+            continue  # do not walk current.annotation
+        elif isinstance(current, ast.AnnAssign):
+            stack.append(current.target)
+            if current.value is not None:
+                stack.append(current.value)
+        elif isinstance(current, getattr(ast, "TypeAlias", ())) and isinstance(
+            current, ast.AST
+        ):
+            continue
+        else:
+            for field, val in ast.iter_fields(current):
+                if field in ("annotation", "returns", "type_params", "type_comment"):
+                    continue
+                if isinstance(val, ast.AST):
+                    stack.append(val)
+                elif isinstance(val, list):
+                    for item in reversed(val):
+                        if isinstance(item, ast.AST):
+                            stack.append(item)
+
+
 def _count_targets(
     func_node: ast.FunctionDef | ast.AsyncFunctionDef,
     category: MutationCategory,
@@ -2574,7 +2683,7 @@ def _count_targets(
         bindings = _scope_bindings(func_node)
         return sum(
             len(_SwapMutator._alternatives(node, stmt_ids, bindings))
-            for node in ast.walk(func_node)
+            for node in _walk_behavioral(func_node)
             if isinstance(node, ast.Call)
         )
     # (SWAP's WITHHELD counterpart is `count_swap_withheld` below — same walk, same plan.)
@@ -2628,7 +2737,7 @@ def count_swap_withheld(
     """
     return sum(
         _SwapMutator._withheld(node)
-        for node in ast.walk(func_node)
+        for node in _walk_behavioral(func_node)
         if isinstance(node, ast.Call)
     )
 
@@ -4258,6 +4367,7 @@ def _baseline_failures(
     qualname: str | None,
     timeout_ms: float = 5000,
     outcomes: dict[str, str] | None = None,
+    assertions: list[str] | None = None,
 ) -> tuple[set[int], set[str]]:
     """``id()`` of every test that FAILS against the UNMUTATED function, under
     ``evaluate_mutant``'s own call convention, AND the NAMED reasons the baseline was compromised.
@@ -4282,14 +4392,11 @@ def _baseline_failures(
     Keyed by identity, not name: parametrized cases share a ``__name__``, and only
     some of them may be runnable.
 
-    WHY this exists next to ``failing_on_baseline`` rather than inside it: the two
-    answer different questions and must not be merged. ``failing_on_baseline`` asks
-    "is this test's EXPECTATION wrong?" and counts only ``AssertionError`` on a bare
-    ``test_fn()``, staying deliberately conservative because its answer is shown to a
-    human as "your test may be broken". This asks "can this test distinguish anything
-    AT ALL?" — any outcome other than pass disqualifies it, because a test that
-    cannot run cannot detect. Conflating them either accuses innocent tests or
-    credits inert ones.
+    Two questions consume this one bounded execution: ``assertions`` collects only an
+    ``AssertionError`` (a wrong expectation), while the inert set asks whether the test can
+    distinguish anything at all. A crash, timeout or refused nested measurement must never
+    accuse the test of a wrong expectation. Re-running the assertion question with a bare
+    ``test_fn()`` used to recursively re-enter profiling outside the containment boundary.
 
     Measured on prism/economics.py::analyze (131 mutants): TestAnalyze.test_basic_output
     was credited with 123 crash "kills" while calling ``analyze`` exactly ZERO times —
@@ -4339,6 +4446,8 @@ def _baseline_failures(
                     run_code = _run_test_with_timeout(
                         test_fn, probe, patched, timeout_ms
                     )
+                    if assertions is not None and run_code == "assertion":
+                        assertions.append(callable_test_id(test_fn))
                     if outcomes is not None:
                         outcomes[callable_test_id(test_fn)] = baseline_outcome(
                             run_code, callable_item_status(test_fn)
@@ -4584,9 +4693,9 @@ def _build_test_scope(
             trace_session_budget_s,
             incomplete_reach=_reach,
         )
-        failing = _failing_on_baseline(test_functions, original_func)
+        failing = []
         inert, _unc = _baseline_failures(
-            test_functions, original_func, qualname, outcomes=_typed
+            test_functions, original_func, qualname, outcomes=_typed, assertions=failing
         )
         if _unc and uncontained is not None:
             # Union the NAMES it reported rather than re-asserting one. The probe used to hand
@@ -5140,6 +5249,81 @@ def _safe_code(obj: Any) -> Any:
         return None
 
 
+def _precompute_patch_targets(
+    func_name: str | None,
+    source_path: str | None,
+    qualname: str | None = None,
+) -> list[tuple[Any, bool]]:
+    """Discover the current module-qualified patch targets for one evaluation (#40).
+
+    Scans sys.modules to identify modules or owner classes binding the original function,
+    returning [(target, is_method)]. Owners are rediscovered under the execution lock:
+    reloads and re-exports can replace bindings without changing container lengths.
+    """
+    if not func_name or not source_path:
+        return []
+    import sys
+
+    from Wesker.self_profile import PRIVATE_PREFIX
+
+    targets: list[tuple[Any, bool]] = []
+    seen: set[int] = set()
+    for mod in list(sys.modules.values()):
+        if mod is None or _is_private_copy(
+            getattr(mod, "__name__", ""), PRIVATE_PREFIX
+        ):
+            continue
+        try:
+            obj = getattr(mod, func_name, None)
+        except Exception:  # noqa: BLE001, S112
+            continue
+        code = _safe_code(obj)
+        if code is None:
+            continue
+        try:
+            if (
+                _co_filename_matches(code.co_filename, source_path)
+                and id(mod) not in seen
+            ):
+                targets.append((mod, False))
+                seen.add(id(mod))
+        except Exception:  # noqa: BLE001, S112
+            continue
+
+    if qualname and "." in qualname:
+        owner_parts = qualname.split(".")[:-1]
+        method = qualname.split(".")[-1]
+        for mod in list(sys.modules.values()):
+            if mod is None or _is_private_copy(
+                getattr(mod, "__name__", ""), PRIVATE_PREFIX
+            ):
+                continue
+            owner: Any = mod
+            try:
+                for part in owner_parts:
+                    owner = getattr(owner, part)
+            except Exception:  # noqa: BLE001, S112
+                continue
+            if not isinstance(owner, type) or method not in getattr(
+                owner, "__dict__", {}
+            ):
+                continue
+            existing = _get_raw_attr(owner, method)
+            code = _safe_code(_unwrap_descriptor(existing))
+            if code is None:
+                continue
+            try:
+                if (
+                    _co_filename_matches(code.co_filename, source_path)
+                    and id(owner) not in seen
+                ):
+                    targets.append((owner, True))
+                    seen.add(id(owner))
+            except Exception:  # noqa: BLE001, S112
+                continue
+    return targets
+
+
 def _patch_module_qualified(
     _proof: _PatchProof,
     func_name: str | None,
@@ -5177,70 +5361,25 @@ def _patch_module_qualified(
     """
     if not func_name or not source_path:
         return []
-    import sys
 
-    from Wesker.self_profile import PRIVATE_PREFIX
+    # Reloads and late re-exports can change owners without changing sys.modules' size.
+    patch_targets = _precompute_patch_targets(func_name, source_path, qualname)
 
     saved: list[tuple[Any, Any]] = []
-    for mod in list(sys.modules.values()):
-        if mod is None or _is_private_copy(
-            getattr(mod, "__name__", ""), PRIVATE_PREFIX
-        ):
-            continue
+    for target, is_method in patch_targets:
         try:
-            obj = getattr(mod, func_name, None)
-        # BLE001/S112: sys.modules holds arbitrary modules whose attribute access can
-        # raise anything; one that cannot be read is not the binding being patched
+            if is_method:
+                existing = _get_raw_attr(target, func_name)
+                setattr(
+                    target, func_name, _preserve_descriptor_shape(existing, mutated_obj)
+                )
+                saved.append((target, existing))
+            else:
+                existing = getattr(target, func_name, None)
+                setattr(target, func_name, mutated_obj)
+                saved.append((target, existing))
         except Exception:  # noqa: BLE001, S112
             continue
-        code = _safe_code(obj)
-        if code is None:
-            continue
-        try:
-            if _co_filename_matches(code.co_filename, source_path):
-                setattr(mod, func_name, mutated_obj)
-                saved.append((mod, obj))
-        # BLE001/S112: a module that refuses the patch is left as it is
-        except Exception:  # noqa: BLE001, S112
-            continue
-
-    # Class-method owner patch: resolve ``Class.method`` within the defining module and patch the
-    # method on the class, so instance-dispatch call sites hit the mutant even when the class was never
-    # imported into the test namespace. Only a class that DEFINES the method directly (not inherited)
-    # and whose original method lives in source_path is touched — same precision as the module loop.
-    if qualname and "." in qualname:
-        owner_parts = qualname.split(".")[:-1]
-        method = qualname.split(".")[-1]
-        for mod in list(sys.modules.values()):
-            if mod is None or _is_private_copy(
-                getattr(mod, "__name__", ""), PRIVATE_PREFIX
-            ):
-                continue
-            owner: Any = mod
-            try:
-                for part in owner_parts:
-                    owner = getattr(owner, part)
-            # BLE001/S112: resolving the owner walks arbitrary module attributes; a path
-            # that raises does not lead to the defining owner
-            except Exception:  # noqa: BLE001, S112
-                continue
-            if not isinstance(owner, type) or method not in getattr(
-                owner, "__dict__", {}
-            ):
-                continue
-            existing = _get_raw_attr(owner, method)
-            code = _safe_code(_unwrap_descriptor(existing))
-            if code is None:
-                continue
-            try:
-                if _co_filename_matches(code.co_filename, source_path):
-                    setattr(
-                        owner, method, _preserve_descriptor_shape(existing, mutated_obj)
-                    )
-                    saved.append((owner, existing))
-            # BLE001/S112: an owner class that refuses the patch is left as it is
-            except Exception:  # noqa: BLE001, S112
-                continue
     return saved
 
 
@@ -5788,11 +5927,20 @@ def _entry_probe(fn: Any) -> Any:
         probe.entered = True  # type: ignore[attr-defined]  # ty: ignore[unresolved-attribute]
         return fn(*args, **kwargs)
 
+    from functools import update_wrapper
+
     probe.entered = False  # type: ignore[attr-defined]  # ty: ignore[unresolved-attribute]
     probe.__name__ = getattr(fn, "__name__", "mutant")
     probe.__qualname__ = getattr(fn, "__qualname__", probe.__name__)
     probe.__doc__ = getattr(fn, "__doc__", None)
     probe.__module__ = getattr(fn, "__module__", probe.__module__)
+    # Preserve unwrapping without reading deferred annotations or overwriting the entry marker.
+    update_wrapper(
+        probe,
+        fn,
+        assigned=("__name__", "__qualname__", "__doc__", "__module__"),
+        updated=(),
+    )
     return probe
 
 
@@ -6424,6 +6572,15 @@ def _serialized(fn):
     return _wrapped
 
 
+def _prepare_base_globals(original_func: Callable[..., Any] | None) -> dict[str, Any]:
+    """Copy current globals and their authoritative package metadata (#42/#46).
+
+    Same-size rebindings invalidate a snapshot. Copy for each evaluation rather than
+    guessing a package or treating dictionary length as an execution-context identity.
+    """
+    return dict(getattr(original_func, "__globals__", None) or {})
+
+
 @_serialized
 def evaluate_mutant(
     mutant: Mutant,
@@ -6445,11 +6602,11 @@ def evaluate_mutant(
 
     Kill attribution follows VALUE-SPECIFICATION PRECEDENCE (crash-as-spec): an
     *assertion* kill pins the return value, so it is the strongest verdict and
-    ends the search immediately. A *crash*/*timeout* kill only proves the mutant
-    runs differently — it does not pin the value — so it is provisional: the
-    search keeps going, looking for a later test that kills by assertion, and
-    only settles for the crash/timeout verdict once the covering tests are
-    exhausted. This makes ``killed_by`` independent of test order: a mutant that
+    ends the search immediately. A crash kill establishes a different execution
+    without pinning the value; an expired wall or step bound remains unresolved.
+    Search keeps going for a later assertion kill and retains the weaker outcome
+    only when the covering tests are exhausted. This makes ``killed_by`` independent
+    of test order: a mutant that
     ANY test kills by assertion is recorded value-killed, never a crash-survivor.
 
     With ``record_all_killers=True`` (full-matrix mode) every test is run and
@@ -6497,9 +6654,7 @@ def evaluate_mutant(
             # mutant — a false all-crash 100% that hides whether the mutation's
             # behavior is actually caught. Degrades to an empty namespace (the prior
             # behavior) when the caller passes no original_func.
-            namespace: dict[str, Any] = dict(
-                getattr(original_func, "__globals__", None) or {}
-            )
+            namespace = _prepare_base_globals(original_func)
             # S102: intentional: compiling AST mutants
             exec(code, namespace)  # noqa: S102  # nosec B102
             func_name = getattr(mutant.mutated_node, "name", None)
@@ -6550,7 +6705,11 @@ def evaluate_mutant(
     # evidence that a patch site was reached with it held (#19).
     _proof = _held_patch_proof()
     module_saved = _patch_module_qualified(
-        _proof, func_name, mutated_obj, source_path, qualname
+        _proof,
+        func_name,
+        mutated_obj,
+        source_path,
+        qualname,
     )
     try:
         # Run tests against mutated function
@@ -6581,12 +6740,15 @@ def evaluate_mutant(
             if remaining_ms <= 0:
                 if record_all_killers and killers:
                     break  # budget hit — keep the killers already collected
-                if first_reason is not None:
-                    break  # already have a crash/timeout kill; settle for it below
+                if first_reason is not None and first_reason not in (
+                    "undetermined",
+                    "timeout",
+                ):
+                    break  # already have a kill; settle for it below
                 return MutantResult(
                     mutant=mutant,
-                    killed=True,
-                    killed_by="timeout",
+                    killed=False,
+                    killed_by="undetermined",
                     contained=not saw_uncontained,
                     uncontained_test=uncontained_test,
                     entered=(getattr(mutated_obj, "entered", None) if ran else None),
@@ -6611,15 +6773,13 @@ def evaluate_mutant(
                     remaining_ms,
                 )
                 if result == "uncontained":
-                    # Timed out AND the worker could not be stopped. It still counts as a run-only
-                    # timeout kill, but the measurement is uncontained — carry the fact so the
-                    # profile refuses to gate on it (#14). Normalize to "timeout" for kill counting.
+                    # Timed out AND the worker could not be stopped. Measurement is uncontained (#14).
                     saw_uncontained = True
                     if uncontained_test is None:
                         from Wesker.ci import callable_test_id
 
                         uncontained_test = callable_test_id(test_fn)
-                    result = "timeout"
+                    result = "undetermined"
                 if result == "nested_measurement":
                     # NOT A KILL REASON (#28): the test runs the engine and its nested measurement
                     # was refused before it could wait for the lock this evaluation holds. Whatever
@@ -6647,7 +6807,11 @@ def evaluate_mutant(
                 # artifact. failing_on_baseline cannot catch it: it calls test_fn()
                 # with no argument, which raises TypeError, and it only counts
                 # AssertionError. Only on failure, so a passing suite pays nothing.
-                if result is not None and not patched and original_func is not None:
+                if (
+                    result in ("assertion", "exception", "crash")
+                    and not patched
+                    and original_func is not None
+                ):
                     result = (
                         None
                         if _outcome_on_original(
@@ -6675,10 +6839,15 @@ def evaluate_mutant(
 
                     tname = callable_test_id(test_fn)
                     if record_all_killers:
-                        killers.append(tname)
-                        reasons.append(result)
-                        if first_reason is None:
-                            first_reason = result
+                        if result in ("assertion", "exception", "crash"):
+                            killers.append(tname)
+                            reasons.append(result)
+                            if first_reason is None:
+                                first_reason = result
+                        elif first_reason is None:
+                            first_reason = (
+                                "diverged" if result == "diverged" else "undetermined"
+                            )
                     elif result in ("assertion", "exception"):
                         # Strongest verdict: the value is pinned — stop here. An exception
                         # kill is the same strength as an assertion: both are a test stating
@@ -6698,10 +6867,16 @@ def evaluate_mutant(
                             tests_run=ran,
                             elapsed_ms=_elapsed(start),
                         )
-                    elif first_reason is None:
-                        # Provisional crash/timeout kill — remember it, but keep
-                        # scanning: a later test may pin the value by assertion.
+                    elif result == "crash":
                         first_reason, first_killer = result, tname
+                    elif result == "diverged":
+                        if first_reason is None or first_reason in (
+                            "undetermined",
+                            "timeout",
+                        ):
+                            first_reason, first_killer = result, tname
+                    elif result in ("undetermined", "timeout") and first_reason is None:
+                        first_reason, first_killer = "undetermined", tname
             finally:
                 _unpatch_mutant(_proof, patched, saved, patch_target, func_name)
 
@@ -6714,7 +6889,7 @@ def evaluate_mutant(
                     if "assertion" in reasons
                     else "exception"
                     if "exception" in reasons
-                    else first_reason
+                    else "crash"
                 ),
                 test_name=killers[0],
                 killed_by_tests=killers,
@@ -6725,10 +6900,12 @@ def evaluate_mutant(
                 elapsed_ms=_elapsed(start),
             )
         if first_reason is not None:
-            # Killed, but only ever by crash/timeout — no test pinned the value.
+            # Deterministic SICP: crash kills count as kills; divergence and undetermined
+            # timeouts are named non-kills (issue #27).
+            is_kill = first_reason in ("assertion", "exception", "crash")
             return MutantResult(
                 mutant=mutant,
-                killed=True,
+                killed=is_kill,
                 killed_by=first_reason,
                 test_name=first_killer,
                 contained=not saw_uncontained,
@@ -6863,8 +7040,8 @@ def _run_test_with_timeout(
 ) -> str | None:
     """Run a single test function with a hard thread-based timeout.
 
-    Returns the kill reason ("assertion", "exception", "crash", "timeout") if killed,
-    or None if the test passed (mutant survived this test).
+    Returns a kill reason ("assertion", "exception", "crash"), an unresolved
+    execution code ("undetermined", "diverged"), or None if the test passed.
 
     AND ONE VALUE THAT IS NOT A KILL REASON: "uncontained" (#14). It means the timed-out
     worker outlived `abandon` and may still be running, so nothing measured after it is
@@ -6890,6 +7067,8 @@ def _run_test_with_timeout(
     import contextlib
     import io
 
+    from Wesker.monitoring import StepBudgetExceeded
+
     result_box: list[str | None] = [None]  # None = survived
 
     def _target() -> None:
@@ -6901,6 +7080,8 @@ def _run_test_with_timeout(
                     test_fn(mutated_func)
                 except TypeError:
                     test_fn()
+        except StepBudgetExceeded:
+            result_box[0] = "diverged"
         except AssertionError:
             result_box[0] = "assertion"
         # BLE001: any non-assertion exception from the test is a crash kill; the breadth
@@ -6918,7 +7099,10 @@ def _run_test_with_timeout(
             # an unpinned survivor, was re-classified killable off the same witness, and the
             # residual asked for an input that would write the same test and be discarded
             # again. That is not a slow path to a verdict; it is a loop with no exit.
-            result_box[0] = "exception" if _is_declared_failure(exc) else "crash"
+            if isinstance(exc, StepBudgetExceeded):
+                result_box[0] = "diverged"
+            else:
+                result_box[0] = "exception" if _is_declared_failure(exc) else "crash"
 
     # A `JoinedWorker`, not a bare Thread: it records that THIS thread started it and is about to
     # join it, which is the edge a nested acquire inside the test checks before it waits (#28).
@@ -6971,7 +7155,7 @@ def _run_test_with_timeout(
     if thread.refusal:
         return thread.refusal
     if timed_out:
-        return "timeout"
+        return "undetermined"
 
     return result_box[0]
 
@@ -7113,6 +7297,7 @@ def run_function_sampling(
             True,
             result.killed,
             result.refusal,
+            killed_by=result.killed_by,
         )
         if disposition not in SCORED_DISPOSITIONS:
             cr.unscored += 1
@@ -7175,8 +7360,7 @@ def _isolated_result(
     actually CALLED it — so a mutant installed but never entered (a decorator/lru_cache/capture
     holding the original) scores `not_entered`, outside the denominator, instead of a false survivor.
     An empty run stays `unobserved` (entered=None, the conservative pre-#18 default) so a function
-    whose covering tests never executed cannot read as fully specified. A timed-out run is a run-only
-    `timeout` kill; a verdict that measured the HARNESS — the mutant would not compile, or its
+    whose covering tests never executed cannot read as fully specified. A timed-out run is unresolved, never a kill; a verdict that measured the HARNESS — the mutant would not compile, or its
     covering tests could not be collected — is `constructed=False`, scored `harness_error`.
     """
     if run.memory_cut:
@@ -7191,8 +7375,8 @@ def _isolated_result(
     if run.timed_out:
         return MutantResult(
             mutant=mutant,
-            killed=True,
-            killed_by="timeout",
+            killed=False,
+            killed_by="undetermined",
             contained=run.contained,
             test_name=run.test_name,
             uncontained_test=None if run.contained else run.test_name,
@@ -7301,7 +7485,11 @@ def _evaluate_isolated(
         return MutantResult(mutant=mutant, killed=False, elapsed_ms=0.0), worker, None
     timeout_s = max(per_mutant_timeout_ms / 1000.0, _ISOLATED_MIN_TIMEOUT_S)
     t0 = time.monotonic()
-    run = worker.evaluate(source, timeout_s, node_ids=node_ids)
+    try:
+        run = worker.evaluate(source, timeout_s, node_ids=node_ids)
+    except BaseException:
+        worker.close()
+        raise
     if run.test_name:
         run = replace(
             run, test_name=identities.get(selector_key(run.test_name), run.test_name)
@@ -7350,6 +7538,49 @@ def next_routing_action(
     return "gap"
 
 
+def measurement_entry_disposition(active_owner: int | None) -> str:
+    """Refuse recursive profiling before any baseline runs (#28, pure — pinned)."""
+    return "begin" if active_owner is None else "nested_measurement"
+
+
+_MEASUREMENT_THREADS: set[int] = set()
+_MEASUREMENT_REGISTRY_LOCK = threading.Lock()
+
+
+def _measurement_boundary(fn):
+    """Guard the entire measurement, including baselines that run before mutant locking (#28)."""
+
+    @functools.wraps(
+        fn, assigned=("__module__", "__name__", "__qualname__", "__doc__"), updated=()
+    )
+    def _wrapped(*args, **kwargs):
+        tid = threading.get_ident()
+        registered = False
+        try:
+            with _MEASUREMENT_REGISTRY_LOCK:
+                owner = next(
+                    (t for t in (tid, *starter_chain()) if t in _MEASUREMENT_THREADS),
+                    None,
+                )
+                disposition = measurement_entry_disposition(owner)
+                if disposition == "begin":
+                    # Cleanup covers cancellation during registration as well as the body.
+                    registered = True
+                    _MEASUREMENT_THREADS.add(tid)
+            if disposition == "nested_measurement":
+                assert owner is not None
+                mark_refusal(disposition, owner)
+                raise MeasurementRefused(disposition, owner)
+            return fn(*args, **kwargs)
+        finally:
+            if registered:
+                with _MEASUREMENT_REGISTRY_LOCK:
+                    _MEASUREMENT_THREADS.discard(tid)
+
+    return _wrapped
+
+
+@_measurement_boundary
 def run_function_profiling(
     func_node: ast.FunctionDef | ast.AsyncFunctionDef,
     func_key: str,
@@ -7608,205 +7839,211 @@ def run_function_profiling(
             # MemoryError instead of taking the box down — a hard budget only where the OS accepts it.
             worker_mem_limit_mb * 1024 * 1024 if worker_mem_limit_mb else None,
         )
-    for count, mutant in enumerate(mutants):
-        if progress is not None:
-            progress(count, total_m, _elapsed(start))
-        if budget_ms is not None and _elapsed(start) > budget_ms:
-            budget_exhausted = True
-            break
-        # Memory guard: if this run has crossed the (capacity-derived, user-
-        # selectable) RAM budget, stop accumulating and reclaim rather than climb
-        # past the ceiling — the guarantee that a profile cannot take over the box.
-        if count % 16 == 0 and _over_budget(mem_budget, mem_baseline):
-            budget_exhausted = True
-            _reclaim()
-            break
 
-        # The allowance is derived from the live baseline and — critically — never exceeds the
-        # remaining aggregate deadline, so a single mutant cannot overshoot the budget by a full
-        # cap (#13). No budget → the cap is the bound.
-        remaining_ms = (
-            budget_ms - _elapsed(start)
-            if budget_ms is not None
-            else per_mutant_timeout_ms
-        )
-        allowance_ms = _adaptive_allowance(
-            baseline_ms, per_mutant_timeout_ms, remaining_ms
-        )
-        # The list this mutant is evaluated against, kept: a `not_entered` cause is a claim about
-        # the tests that actually RAN from it (#18), not about whatever `_tests_for` returns later.
-        _scoped = _tests_for(mutant)
-        if isolated:
-            assert _iso_ctx is not None
-            result, _iso_worker, _iso_run = _evaluate_isolated(
-                _iso_worker, mutant, _scoped, _iso_ctx, per_mutant_timeout_ms
+    try:
+        for count, mutant in enumerate(mutants):
+            if progress is not None:
+                progress(count, total_m, _elapsed(start))
+            if budget_ms is not None and _elapsed(start) > budget_ms:
+                budget_exhausted = True
+                break
+            # Memory guard: if this run has crossed the (capacity-derived, user-
+            # selectable) RAM budget, stop accumulating and reclaim rather than climb
+            # past the ceiling — the guarantee that a profile cannot take over the box.
+            if count % 16 == 0 and _over_budget(mem_budget, mem_baseline):
+                budget_exhausted = True
+                _reclaim()
+                break
+
+            # The allowance is derived from the live baseline and — critically — never exceeds the
+            # remaining aggregate deadline, so a single mutant cannot overshoot the budget by a full
+            # cap (#13). No budget → the cap is the bound.
+            remaining_ms = (
+                budget_ms - _elapsed(start)
+                if budget_ms is not None
+                else per_mutant_timeout_ms
             )
-            if _iso_run is not None:
-                _mem_cut = _mem_cut or _iso_run.memory_cut
-                _mem_enforced = _mem_enforced or _iso_run.mem_enforced
-        try:
-            if not isolated:
-                result = evaluate_mutant(
-                    mutant,
-                    _scoped,
-                    original_func,
-                    timeout_ms=allowance_ms,
-                    qualname=qualname,
-                    source_path=source_path,
+            allowance_ms = _adaptive_allowance(
+                baseline_ms, per_mutant_timeout_ms, remaining_ms
+            )
+            # The list this mutant is evaluated against, kept: a `not_entered` cause is a claim about
+            # the tests that actually RAN from it (#18), not about whatever `_tests_for` returns later.
+            _scoped = _tests_for(mutant)
+            if isolated:
+                assert _iso_ctx is not None
+                result, _iso_worker, _iso_run = _evaluate_isolated(
+                    _iso_worker, mutant, _scoped, _iso_ctx, per_mutant_timeout_ms
                 )
-        except Exception as exc:
-            # ONE EXCEPTION to "one bad mutant must never abort the run", and it is not a mutant
-            # at all: an ORPHANED execution lock. That lock is process-global and its owner no
-            # longer exists, so it is never coming back and EVERY remaining mutant fails the same
-            # way. MEASURED 2026-09-10: 14 mutants × a 5s acquire bound = 70s spent re-learning
-            # one fact, ending in a floor. The first refusal already decided the run, so it is
-            # re-raised for the caller to report ONCE, in seconds. Every other disposition can
-            # clear on its own and stays survivable below.
-            if (
-                isinstance(exc, ExecutionLockUnavailable)
-                and exc.disposition == "orphaned"
-            ):
-                raise
-            # A pathological mutant can crash the evaluation harness itself —
-            # e.g. self-profiling the engine's own internals, where the mutant
-            # replaces the live machinery that runs the profile. One bad mutant
-            # must never abort the whole run: record it as an un-evaluable
-            # survivor (conservative — never inflates the kill score) and move on.
+                if _iso_run is not None:
+                    _mem_cut = _mem_cut or _iso_run.memory_cut
+                    _mem_enforced = _mem_enforced or _iso_run.mem_enforced
+            try:
+                if not isolated:
+                    result = evaluate_mutant(
+                        mutant,
+                        _scoped,
+                        original_func,
+                        timeout_ms=allowance_ms,
+                        qualname=qualname,
+                        source_path=source_path,
+                    )
+            except Exception as exc:
+                # ONE EXCEPTION to "one bad mutant must never abort the run", and it is not a mutant
+                # at all: an ORPHANED execution lock. That lock is process-global and its owner no
+                # longer exists, so it is never coming back and EVERY remaining mutant fails the same
+                # way. MEASURED 2026-09-10: 14 mutants × a 5s acquire bound = 70s spent re-learning
+                # one fact, ending in a floor. The first refusal already decided the run, so it is
+                # re-raised for the caller to report ONCE, in seconds. Every other disposition can
+                # clear on its own and stays survivable below.
+                if (
+                    isinstance(exc, ExecutionLockUnavailable)
+                    and exc.disposition == "orphaned"
+                ):
+                    raise
+                # A pathological mutant can crash the evaluation harness itself —
+                # e.g. self-profiling the engine's own internals, where the mutant
+                # replaces the live machinery that runs the profile. One bad mutant
+                # must never abort the whole run: record it as an un-evaluable
+                # survivor (conservative — never inflates the kill score) and move on.
+                cr = results_by_cat.setdefault(
+                    mutant.category, CategoryResult(category=mutant.category)
+                )
+                cr.total += 1
+                cr.survived += 1
+                survivor_records.append(
+                    {
+                        "mutant_id": mutant.mutant_id,
+                        "mutant": mutant.description,
+                        "category": mutant.category.value,
+                        "mutated_line": mutant.mutated_line,
+                        "dimension": mutant.dimension,
+                        "change": _mutant_change(mutant),
+                        "diff_summary": _mutant_diff(mutant),
+                        "error": f"{type(exc).__name__}: {exc}",
+                        "elapsed_ms": 0.0,
+                    }
+                )
+                continue
+
+            if not result.contained:
+                all_contained = False
+                _uncontained_results.append(result)
             cr = results_by_cat.setdefault(
                 mutant.category, CategoryResult(category=mutant.category)
             )
-            cr.total += 1
-            cr.survived += 1
-            survivor_records.append(
-                {
-                    "mutant_id": mutant.mutant_id,
-                    "mutant": mutant.description,
-                    "category": mutant.category.value,
-                    "mutated_line": mutant.mutated_line,
-                    "dimension": mutant.dimension,
-                    "change": _mutant_change(mutant),
-                    "diff_summary": _mutant_diff(mutant),
-                    "error": f"{type(exc).__name__}: {exc}",
-                    "elapsed_ms": 0.0,
-                }
+            # What is this outcome EVIDENCE OF (#18)? Only a mutant that was built, installed and
+            # entered measures the SUITE; anything earlier measures this engine, and belongs
+            # outside the denominator rather than on either side of it.
+            #
+            # `contained=True` is passed deliberately: containment already has an owner in the #14
+            # break below (`all_contained` -> non-gateable, coverage_depth "cut"), and routing it
+            # through here too would silently move mutants out of a shipped contract's denominator.
+            # #18 owns the install/entry phases; W#19 revisits containment.
+            disposition = mutant_disposition(
+                result.constructed,
+                result.installed,
+                result.entered,
+                True,
+                result.killed,
+                result.refusal,
+                killed_by=result.killed_by,
             )
-            continue
-
-        if not result.contained:
-            all_contained = False
-            _uncontained_results.append(result)
-        cr = results_by_cat.setdefault(
-            mutant.category, CategoryResult(category=mutant.category)
-        )
-        # What is this outcome EVIDENCE OF (#18)? Only a mutant that was built, installed and
-        # entered measures the SUITE; anything earlier measures this engine, and belongs
-        # outside the denominator rather than on either side of it.
-        #
-        # `contained=True` is passed deliberately: containment already has an owner in the #14
-        # break below (`all_contained` -> non-gateable, coverage_depth "cut"), and routing it
-        # through here too would silently move mutants out of a shipped contract's denominator.
-        # #18 owns the install/entry phases; W#19 revisits containment.
-        disposition = mutant_disposition(
-            result.constructed,
-            result.installed,
-            result.entered,
-            True,
-            result.killed,
-            result.refusal,
-        )
-        if disposition not in SCORED_DISPOSITIONS:
-            cr.unscored += 1
-            cr.unscored_by[disposition] = cr.unscored_by.get(disposition, 0) + 1
-            _record = _unscored_record(result, disposition)
-            if disposition == "not_entered":
-                # WHY, by name (#18): from the tests that ran and what holds the original.
-                if _holders is None:
-                    _holders = _original_holders(
-                        original_func,
-                        getattr(func_node, "name", None),
-                        qualname,
-                        source_path,
+            if disposition not in SCORED_DISPOSITIONS:
+                cr.unscored += 1
+                cr.unscored_by[disposition] = cr.unscored_by.get(disposition, 0) + 1
+                _record = _unscored_record(result, disposition)
+                if disposition == "not_entered":
+                    # WHY, by name (#18): from the tests that ran and what holds the original.
+                    if _holders is None:
+                        _holders = _original_holders(
+                            original_func,
+                            getattr(func_node, "name", None),
+                            qualname,
+                            source_path,
+                        )
+                    _record.update(
+                        _not_entered_detail(
+                            result, _scoped, line_cov, _trace_truncated, *_holders
+                        )
                     )
-                _record.update(
-                    _not_entered_detail(
-                        result, _scoped, line_cov, _trace_truncated, *_holders
+                unscored_records.append(_record)
+                if result.refusal or disposition in ("diverged", "undetermined"):
+                    # Still an OPEN OBLIGATION for the widen (#28): an unknown it traces may kill this
+                    # mutant outright, as the full run over A∪B would — stopping the widen because the
+                    # only open mutants are refused would make seed+expand disagree with that run.
+                    _survivor_mutants[mutant.mutant_id] = mutant
+                    _refused_open[mutant.mutant_id] = disposition
+            elif result.killed:
+                cr.total += 1
+                cr.killed += 1
+                if result.killed_by == "assertion":
+                    cr.killed_by_assertion += 1
+                elif result.killed_by == "exception":
+                    # Its own counter, never folded into assertion: `value_killed` needs it to
+                    # count, and a reader needs to still see WHICH contract pinned the mutant.
+                    cr.killed_by_exception += 1
+                elif result.killed_by == "crash":
+                    cr.killed_by_crash += 1
+                elif result.killed_by == "timeout":
+                    cr.timed_out += 1
+                if result.test_name:
+                    kill_matrix.setdefault(mutant.description, []).append(
+                        result.test_name
                     )
+                # Carry diff_summary on EVERY kill: a crash/timeout kill is a value-survivor
+                # (see ProfilingResult.value_survivor_records) and needs the diff for a
+                # value-distinguishing witness search downstream.
+                killed_records.append(
+                    {
+                        "mutant_id": mutant.mutant_id,
+                        "mutant": mutant.description,
+                        "category": mutant.category.value,
+                        "mutated_line": mutant.mutated_line,
+                        "dimension": mutant.dimension,
+                        "change": _mutant_change(mutant),
+                        "killed_by": result.killed_by,
+                        "test": result.test_name,
+                        "diff_summary": _mutant_diff(mutant),
+                        "elapsed_ms": round(result.elapsed_ms, 1),
+                    }
                 )
-            unscored_records.append(_record)
-            if result.refusal:
-                # Still an OPEN OBLIGATION for the widen (#28): an unknown it traces may kill this
-                # mutant outright, as the full run over A∪B would — stopping the widen because the
-                # only open mutants are refused would make seed+expand disagree with that run.
+            else:
+                cr.total += 1
+                cr.survived += 1
+                survivor_records.append(
+                    {
+                        "mutant_id": mutant.mutant_id,
+                        "mutant": mutant.description,
+                        "category": mutant.category.value,
+                        "mutated_line": mutant.mutated_line,
+                        "dimension": mutant.dimension,
+                        "change": _mutant_change(mutant),
+                        "diff_summary": _mutant_diff(mutant),
+                        "elapsed_ms": round(result.elapsed_ms, 1),
+                    }
+                )
+                # A survivor of the seed: the target-first widen pass may kill it with an unknown test the seed
+                # never traced. (Profiling runs no equivalence check, so every else-branch mutant is a
+                # plain survivor eligible for the widen.)
                 _survivor_mutants[mutant.mutant_id] = mutant
-                _refused_open[mutant.mutant_id] = disposition
-        elif result.killed:
-            cr.total += 1
-            cr.killed += 1
-            if result.killed_by == "assertion":
-                cr.killed_by_assertion += 1
-            elif result.killed_by == "exception":
-                # Its own counter, never folded into assertion: `value_killed` needs it to
-                # count, and a reader needs to still see WHICH contract pinned the mutant.
-                cr.killed_by_exception += 1
-            elif result.killed_by == "crash":
-                cr.killed_by_crash += 1
-            elif result.killed_by == "timeout":
-                cr.timed_out += 1
-            if result.test_name:
-                kill_matrix.setdefault(mutant.description, []).append(result.test_name)
-            # Carry diff_summary on EVERY kill: a crash/timeout kill is a value-survivor
-            # (see ProfilingResult.value_survivor_records) and needs the diff for a
-            # value-distinguishing witness search downstream.
-            killed_records.append(
-                {
-                    "mutant_id": mutant.mutant_id,
-                    "mutant": mutant.description,
-                    "category": mutant.category.value,
-                    "mutated_line": mutant.mutated_line,
-                    "dimension": mutant.dimension,
-                    "change": _mutant_change(mutant),
-                    "killed_by": result.killed_by,
-                    "test": result.test_name,
-                    "diff_summary": _mutant_diff(mutant),
-                    "elapsed_ms": round(result.elapsed_ms, 1),
-                }
-            )
-        else:
-            cr.total += 1
-            cr.survived += 1
-            survivor_records.append(
-                {
-                    "mutant_id": mutant.mutant_id,
-                    "mutant": mutant.description,
-                    "category": mutant.category.value,
-                    "mutated_line": mutant.mutated_line,
-                    "dimension": mutant.dimension,
-                    "change": _mutant_change(mutant),
-                    "diff_summary": _mutant_diff(mutant),
-                    "elapsed_ms": round(result.elapsed_ms, 1),
-                }
-            )
-            # A survivor of the seed: the target-first widen pass may kill it with an unknown test the seed
-            # never traced. (Profiling runs no equivalence check, so every else-branch mutant is a
-            # plain survivor eligible for the widen.)
-            _survivor_mutants[mutant.mutant_id] = mutant
 
-        # #14 (reopened): an uncontained worker (abandon could not stop it) is STILL ALIVE — burning
-        # a core and able to perturb every later mutant's timing. This mutant's result is kept
-        # (partial evidence), but stop NOW rather than measure more against a compromised process:
-        # `all_contained` already forces non-gateable, and coverage_depth becomes "cut" below.
-        if not result.contained:
-            break
-        # #13 (reopened): the aggregate deadline is checked AFTER evaluation too. The pre-loop check
-        # catches an overrun only before the NEXT iteration, and the FINAL mutant has none — so a run
-        # whose last mutant crossed the wall would otherwise stay budget_exhausted=False /
-        # coverage_depth="profiled" / gateable. Mark it cut here so the overrun is honestly non-gateable.
-        if budget_ms is not None and _elapsed(start) > budget_ms:
-            budget_exhausted = True
-            break
+            # #14 (reopened): an uncontained worker (abandon could not stop it) is STILL ALIVE — burning
+            # a core and able to perturb every later mutant's timing. This mutant's result is kept
+            # (partial evidence), but stop NOW rather than measure more against a compromised process:
+            # `all_contained` already forces non-gateable, and coverage_depth becomes "cut" below.
+            if not result.contained:
+                break
+            # #13 (reopened): the aggregate deadline is checked AFTER evaluation too. The pre-loop check
+            # catches an overrun only before the NEXT iteration, and the FINAL mutant has none — so a run
+            # whose last mutant crossed the wall would otherwise stay budget_exhausted=False /
+            # coverage_depth="profiled" / gateable. Mark it cut here so the overrun is honestly non-gateable.
+            if budget_ms is not None and _elapsed(start) > budget_ms:
+                budget_exhausted = True
+                break
 
-    if _iso_worker is not None:
-        _iso_worker.close()
+    finally:
+        if _iso_worker is not None:
+            _iso_worker.close()
     if progress is not None:
         progress(total_m, total_m, _elapsed(start))
 
@@ -7846,6 +8083,7 @@ def run_function_profiling(
             widen_tests
             and not isolated
             and not budget_exhausted
+            and all_contained
             and _widen_holder is not None
             and (budget_ms is None or _elapsed(start) <= budget_ms)
         )
@@ -7855,7 +8093,7 @@ def run_function_profiling(
         next_routing_action(
             has_open_obligations=bool(_survivor_mutants) or _lines_incomplete,
             has_remaining_items=bool(_remaining_widen),
-            containment_lost=budget_exhausted,
+            containment_lost=budget_exhausted or not all_contained,
         )
         == "trace_next"
     ):
@@ -7901,6 +8139,8 @@ def run_function_profiling(
             scope_tests and exec_lines and not set(exec_lines).issubset(_covered_lines)
         )
         for _mid, _mutant in list(_survivor_mutants.items()):
+            if not all_contained:
+                break
             if budget_ms is not None and _elapsed(start) > budget_ms:
                 # A cut widen leaves some survivors NOT re-evaluated against the unknowns
                 # (closeout #6): a negative gap is only valid once every APPLICABLE unknown the
@@ -7923,6 +8163,9 @@ def run_function_profiling(
                 qualname=qualname,
                 source_path=source_path,
             )
+            if not _res.contained:
+                all_contained = False
+                _uncontained_results.append(_res)
             if not _res.killed:
                 _disp = mutant_disposition(
                     _res.constructed,
@@ -7931,12 +8174,9 @@ def run_function_profiling(
                     True,
                     _res.killed,
                     _res.refusal,
+                    killed_by=_res.killed_by,
                 )
-                if (
-                    _res.refusal
-                    and _disp not in SCORED_DISPOSITIONS
-                    and _mid not in _refused_open
-                ):
+                if _disp not in SCORED_DISPOSITIONS:
                     # The widened set holds a test that could not be measured here (#28), so this
                     # is no longer a survivor: over A∪B the full run names it by its refusal, and
                     # seed+expand must agree with the full run. Out of the denominator — but still
@@ -7944,12 +8184,24 @@ def run_function_profiling(
                     _cr = results_by_cat.setdefault(
                         _mutant.category, CategoryResult(category=_mutant.category)
                     )
-                    _cr.total -= 1
-                    _cr.survived -= 1
-                    _cr.unscored += 1
-                    _cr.unscored_by[_disp] = _cr.unscored_by.get(_disp, 0) + 1
+                    _previous = _refused_open.get(_mid)
+                    if _previous is None:
+                        _cr.total -= 1
+                        _cr.survived -= 1
+                        _cr.unscored += 1
+                    elif _previous != _disp:
+                        _left = _cr.unscored_by.get(_previous, 0) - 1
+                        if _left > 0:
+                            _cr.unscored_by[_previous] = _left
+                        else:
+                            _cr.unscored_by.pop(_previous, None)
+                    if _previous != _disp:
+                        _cr.unscored_by[_disp] = _cr.unscored_by.get(_disp, 0) + 1
                     survivor_records[:] = [
                         r for r in survivor_records if r["mutant_id"] != _mid
+                    ]
+                    unscored_records[:] = [
+                        r for r in unscored_records if r["mutant_id"] != _mid
                     ]
                     unscored_records.append(_unscored_record(_res, _disp))
                     _refused_open[_mid] = _disp
@@ -8171,16 +8423,7 @@ def run_function_profiling(
         is_gateable=_measurement_gateable(
             # `nested_measurement` (#28) beside the three #18 named: a mutant whose only possible
             # killer could not be measured here is unmeasured, and a verdict over it is a floor.
-            not any(
-                cr.unscored_by.get(reason, 0)
-                for cr in per_cat
-                for reason in (
-                    "harness_error",
-                    "not_installed",
-                    "not_entered",
-                    "nested_measurement",
-                )
-            ),
+            not unscored_records,
             _contained,
             not budget_exhausted,
             _identity_standing != "ambiguous",
@@ -8193,7 +8436,16 @@ def run_function_profiling(
         # from the mutation loop OR the baseline trace (#19): the depth must not read "profiled"
         # when the run stopped short or ran against a live abandoned worker. is_gateable already
         # reflects both; coverage_depth now agrees.
-        coverage_depth="cut" if budget_exhausted or not _contained else "profiled",
+        coverage_depth=(
+            "cut"
+            if budget_exhausted
+            or not _contained
+            or any(
+                r["disposition"] in ("diverged", "undetermined")
+                for r in unscored_records
+            )
+            else "profiled"
+        ),
         # Which execution mode measured this (#19): `isolated` ran each mutant in a killable worker
         # PROCESS — containment is a real guarantee — while `in_process` shares the interpreter and
         # can only ASK a runaway thread to stop. `execution_mode_standing` (4c) turns this into a
@@ -8498,6 +8750,7 @@ def check_equivalent(
 # ── Multi-Pass Convergence ───────────────────────────────────────
 
 
+@_measurement_boundary
 def run_function_converged(
     func_node: ast.FunctionDef | ast.AsyncFunctionDef,
     func_key: str,
@@ -8516,6 +8769,8 @@ def run_function_converged(
     trace_progress: Callable[[int, int, float], None] | None = None,
     trace_session_budget_s: float | None = DEFAULT_TRACE_SESSION_BUDGET_S,
     widen_tests: list[Callable[..., None]] | None = None,
+    isolated: bool = False,
+    worker_mem_limit_mb: int | None = None,
 ) -> ProfilingResult:
     """Multi-pass convergence with integrated equivalence detection.
 
@@ -8579,8 +8834,6 @@ def run_function_converged(
     start = time.monotonic()
     universe = estimate_universe_size(func_node, categories)
     dof_total = dof_universe(func_node, categories)
-    dims_covered: set[str] = set()
-    dims_pinned: set[str] = set()
     qualname = (
         func_key.split("::", 1)[1]
         if "::" in func_key
@@ -8652,343 +8905,344 @@ def run_function_converged(
     uncontained_stop = (
         False  # #14: set when a worker could not be stopped — halt all remaining passes
     )
+    from Wesker.tce import compute_node_key
 
-    for pass_idx in range(passes):
-        if _elapsed(start) > budget_ms:
-            break
-        mutants = generate_mutants(
-            func_node,
-            categories,
-            max_per_category=max_per_category,
-            pass_index=pass_idx,
-            category_order=category_order,
+    _orig_tce_key = compute_node_key(func_node)
+
+    _iso_worker: IsolatedMutantWorker | None = None
+    _iso_ctx = None
+    _mem_cut = False
+    _mem_enforced = False
+    if isolated:
+        import os
+
+        from Wesker.ci import _PROJECT_ROOT
+
+        _iso_ctx = (
+            _PROJECT_ROOT.get() or os.getcwd(),
+            source_path or "",
+            qualname or "",
+            _ISOLATED_WORKER_RECYCLE,
+            worker_mem_limit_mb * 1024 * 1024 if worker_mem_limit_mb else None,
         )
-        for mutant in mutants:
-            if mutant.mutant_id in seen:
-                continue
+
+    try:
+        for pass_idx in range(passes):
             if _elapsed(start) > budget_ms:
                 break
-
-            # Only the tests that EXECUTE this mutant's line can kill it; the rest
-            # behave identically under the mutation, so running them is pure cost.
-            scoped = _tests_for(mutant)
-            # Full-matrix mode runs every test, so budget for the whole suite (~50ms/test)
-            # rather than the first-killer per-mutant cap.
-            _cap_ms = (
-                max(per_mutant_timeout_ms, 50.0 * len(scoped))
-                if full_matrix
-                else per_mutant_timeout_ms
+            mutants = generate_mutants(
+                func_node,
+                categories,
+                max_per_category=max_per_category,
+                pass_index=pass_idx,
+                category_order=category_order,
             )
-            # …and the cap NEVER exceeds the remaining aggregate deadline, exactly as the
-            # exhaustive path does it (#13). This loop checked the budget before each mutant and
-            # then handed `evaluate_mutant` the flat cap, so one mutant could overrun the entire
-            # remaining wall. Measured on the same function and suite: this path's elapsed time
-            # was INVARIANT to the budget (25ms -> 525ms, 150ms -> 524ms) while the exhaustive
-            # path tracked it (25ms -> 40ms, 150ms -> 165ms). #13 reached the exhaustive path
-            # only — and this is the one `ci.profile_function` -> `profile_file` ->
-            # `profile_codebase` -> the GitHub Action actually runs.
-            _remaining_ms = budget_ms - _elapsed(start)
-            result = evaluate_mutant(
-                mutant,
-                scoped,
-                original_func,  # type: ignore[arg-type]
-                timeout_ms=_adaptive_allowance(None, _cap_ms, _remaining_ms),
-                qualname=qualname,
-                record_all_killers=full_matrix,
-                source_path=source_path,
-            )
-            if result.entered is False:
-                # Kept for the cause (#18): which tests RAN is a prefix of THIS list, and the widen
-                # rebuilds `_tests_for` before the aggregation below reads the result.
-                _unentered_scope[mutant.mutant_id] = scoped
+            for mutant in mutants:
+                if mutant.mutant_id in seen:
+                    continue
+                if _elapsed(start) > budget_ms:
+                    break
 
-            # Integrated equivalence: check survivors immediately
-            if not result.killed:
-                # TCE first (#24): a pure function of two code objects — no execution, no test
-                # run — and SOUND, since identical bytecode cannot behave differently. It is
-                # both cheaper than the boundary probes and strictly stronger, so it decides
-                # before they run. A miss falls through and costs nothing; different bytecode
-                # is not evidence of inequivalence, so the probes still get their turn.
-                _warrant = (
-                    WARRANT_BYTECODE
-                    if nodes_equivalent(func_node, mutant.mutated_node)
-                    else ""
+                # Only the tests that EXECUTE this mutant's line can kill it; the rest
+                # behave identically under the mutation, so running them is pure cost.
+                scoped = _tests_for(mutant)
+                # Full-matrix mode runs every test, so budget for the whole suite (~50ms/test)
+                # rather than the first-killer per-mutant cap.
+                _cap_ms = (
+                    max(per_mutant_timeout_ms, 50.0 * len(scoped))
+                    if full_matrix
+                    else per_mutant_timeout_ms
                 )
-                if _warrant or check_equivalent(func_node, mutant):
-                    # Carry the execution phases across (#18). Rebuilding the result from
-                    # scratch here silently restored the dataclass DEFAULTS — `constructed=True,
-                    # installed=True, entered=None` — so a mutant that was never built or never
-                    # entered came out of this branch looking like a normally-evaluated
-                    # equivalent, and its disposition was erased before the denominator ever
-                    # saw it. A partial reconstruction of a record is a data-loss bug wearing
-                    # the shape of a constructor call.
-                    result = MutantResult(
-                        mutant=mutant,
-                        killed=False,
-                        equivalent=True,
-                        equivalence_warrant=_warrant,
-                        constructed=result.constructed,
-                        installed=result.installed,
-                        entered=result.entered,
-                        # A refused measurement is a phase fact too (#28) — the same data-loss
-                        # this reconstruction already had to be taught about for entry.
-                        refusal=result.refusal,
-                        refused_test=result.refused_test,
-                        tests_run=result.tests_run,
-                        elapsed_ms=result.elapsed_ms,
+                # …and the cap NEVER exceeds the remaining aggregate deadline, exactly as the
+                # exhaustive path does it (#13). This loop checked the budget before each mutant and
+                # then handed `evaluate_mutant` the flat cap, so one mutant could overrun the entire
+                # remaining wall. Measured on the same function and suite: this path's elapsed time
+                # was INVARIANT to the budget (25ms -> 525ms, 150ms -> 524ms) while the exhaustive
+                # path tracked it (25ms -> 40ms, 150ms -> 165ms). #13 reached the exhaustive path
+                # only — and this is the one `ci.profile_function` -> `profile_file` ->
+                # `profile_codebase` -> the GitHub Action actually runs.
+                _remaining_ms = budget_ms - _elapsed(start)
+                if isolated:
+                    assert _iso_ctx is not None
+                    result, _iso_worker, _iso_run = _evaluate_isolated(
+                        _iso_worker, mutant, scoped, _iso_ctx, _cap_ms
                     )
-
-            seen[mutant.mutant_id] = result
-            # The SECOND denominator (#18). `dims_covered` is a different accounting axis from
-            # `CategoryResult.total` and lives in a different loop, so gating the aggregation
-            # left this one inflated: a dimension whose only mutant was never built or never
-            # entered was still counted as COVERED, which is the same claim-without-measurement
-            # in a quantity Detective reads directly.
-            _scored = (
-                mutant_disposition(
-                    result.constructed,
-                    result.installed,
-                    result.entered,
-                    True,
-                    result.killed,
-                    result.refusal,
-                )
-                in SCORED_DISPOSITIONS
-            )
-            if _scored and mutant.dimension and not _is_dead(mutant.dimension):
-                dim_key = f"{mutant.category.value}\x00{mutant.dimension}"
-                dims_covered.add(dim_key)
-                # A dimension counts as PINNED only when a test DISTINGUISHED the mutant's
-                # value — an assertion kill. A crash or timeout kill proves the tests RAN the
-                # mutated code, not that any of them checked what it returned, so it pins
-                # nothing: `CategoryResult.value_survived` already states this outright
-                # ("Value-unspecified DOF: survivors PLUS crash/timeout kills. For
-                # specification these are equivalent — none pins the return value"), and
-                # `value_killed` is `killed_by_assertion` alone.
-                #
-                # This is the difference between a mutation score and a specification
-                # measurement, and getting it wrong is not conservative — it inflates. Counting
-                # every kill made Wesker report 98% on its own ci.py, where Detective (which
-                # reads value_killed) reports 29% for the same code: mutating the machinery the
-                # tests drive makes them fall over, and every one of those crashes was being
-                # credited as pinned behavior. An equivalent mutant pins nothing either, and is
-                # excluded from the denominator elsewhere rather than credited here.
-                if result.killed and result.killed_by == "assertion":
-                    dims_pinned.add(dim_key)
-
-            # Build kill matrix and records for downstream consumers.
-            # ``mutated_line`` and ``dimension`` are what let a survivor be reported AT the
-            # source line it lives on, naming the behavior no test pins — an editor annotation
-            # or a SARIF result, rather than a count. Both are carried verbatim from the
-            # mutant; ``mutated_line`` is None when the mutator could not report a position.
-            record = {
-                "mutant_id": mutant.mutant_id,
-                "mutant": mutant.description,
-                "category": mutant.category.value,
-                "mutated_line": mutant.mutated_line,
-                "dimension": mutant.dimension,
-                "change": _mutant_change(mutant),
-                "diff_summary": _mutant_diff(mutant),
-                "elapsed_ms": round(result.elapsed_ms, 1),
-            }
-            if result.killed:
-                record["killed_by"] = result.killed_by
-                record["test"] = result.test_name
-                killed_records.append(record)
-                # First-killer mode records the single killer; full-matrix mode
-                # records every test that kills this mutant (the per-test
-                # attribution a greedy-convergence analysis needs).
-                if full_matrix and result.killed_by_tests:
-                    kill_matrix.setdefault(mutant.description, []).extend(
-                        result.killed_by_tests
+                    if _iso_run is not None:
+                        _mem_cut = _mem_cut or _iso_run.memory_cut
+                        _mem_enforced = _mem_enforced or _iso_run.mem_enforced
+                else:
+                    result = evaluate_mutant(
+                        mutant,
+                        scoped,
+                        original_func,  # type: ignore[arg-type]
+                        timeout_ms=_adaptive_allowance(None, _cap_ms, _remaining_ms),
+                        qualname=qualname,
+                        record_all_killers=full_matrix,
+                        source_path=source_path,
                     )
-                elif result.test_name:
-                    kill_matrix.setdefault(mutant.description, []).append(
-                        result.test_name
-                    )
-            elif result.refusal:
-                # Neither killed nor survived (#28): no survivor record, which every survivor
-                # reader (SARIF, annotations, the witness search) would report as an unpinned
-                # behaviour. The aggregation below names it in `unscored_records` instead. Still an
-                # open obligation for the widen: an unknown may kill it, as the full run would.
-                _survivor_mutants[mutant.mutant_id] = mutant
-            elif result.equivalent:
-                record["equivalent"] = True
-                survivor_records.append(record)
-                # A seed-declared equivalent may be a FALSE equivalent (target-first): `check_equivalent`
-                # ran against a mutant with an EMPTY seed covering set, so its boundary inputs never
-                # exercised a branch an unknown test reaches. The widen re-evaluates it too — a
-                # TRULY equivalent mutant stays equivalent (no test kills it), which is why this is
-                # sound; a false one is killed, matching a full run that scoped it to that test and
-                # never reached the equivalence check.
-                _survivor_mutants[mutant.mutant_id] = mutant
-            else:
-                survivor_records.append(record)
-                # A true survivor: the widen may kill it with an unknown test the seed never traced.
-                _survivor_mutants[mutant.mutant_id] = mutant
+                if result.entered is False:
+                    # Kept for the cause (#18): which tests RAN is a prefix of THIS list, and the widen
+                    # rebuilds `_tests_for` before the aggregation below reads the result.
+                    _unentered_scope[mutant.mutant_id] = scoped
 
-            # #14 (reopened): an uncontained worker (abandon could not stop it) is STILL ALIVE —
-            # burning a core and able to perturb every later mutant's timing. Keep THIS mutant's
-            # result (partial evidence), but stop NOW rather than measure more against a compromised
-            # process — and, because this path loops over passes, halt the OUTER loop too. The
-            # exhaustive path already breaks here; converged must not keep spawning workers alongside
-            # a runaway. `all_contained` (below) already forces the run non-gateable / depth="cut".
-            if not result.contained:
-                uncontained_stop = True
+                # Integrated equivalence: check survivors immediately
+                if not result.killed and result.killed_by not in (
+                    "diverged",
+                    "undetermined",
+                    "timeout",
+                ):
+                    # TCE first (#24): a pure function of two code objects — no execution, no test
+                    # run — and SOUND, since identical bytecode cannot behave differently. It is
+                    # both cheaper than the boundary probes and strictly stronger, so it decides
+                    # before they run. A miss falls through and costs nothing; different bytecode
+                    # is not evidence of inequivalence, so the probes still get their turn.
+                    _warrant = (
+                        WARRANT_BYTECODE
+                        if nodes_equivalent(
+                            func_node, mutant.mutated_node, original_key=_orig_tce_key
+                        )
+                        else ""
+                    )
+                    if _warrant or check_equivalent(func_node, mutant):
+                        # Preserve every execution fact, including future fields (#18/#28).
+                        # Reconstructing a partial record here previously erased phase metadata.
+                        result = replace(
+                            result, equivalent=True, equivalence_warrant=_warrant
+                        )
+
+                seen[mutant.mutant_id] = result
+
+                # Build kill matrix and records for downstream consumers.
+                # ``mutated_line`` and ``dimension`` are what let a survivor be reported AT the
+                # source line it lives on, naming the behavior no test pins — an editor annotation
+                # or a SARIF result, rather than a count. Both are carried verbatim from the
+                # mutant; ``mutated_line`` is None when the mutator could not report a position.
+                record = {
+                    "mutant_id": mutant.mutant_id,
+                    "mutant": mutant.description,
+                    "category": mutant.category.value,
+                    "mutated_line": mutant.mutated_line,
+                    "dimension": mutant.dimension,
+                    "change": _mutant_change(mutant),
+                    "diff_summary": _mutant_diff(mutant),
+                    "elapsed_ms": round(result.elapsed_ms, 1),
+                    "killed_by": result.killed_by,
+                    "disposition": mutant_disposition(
+                        result.constructed,
+                        result.installed,
+                        result.entered,
+                        result.contained,
+                        result.killed,
+                        result.refusal,
+                        killed_by=result.killed_by,
+                    ),
+                }
+                if result.killed:
+                    record["killed_by"] = result.killed_by
+                    record["test"] = result.test_name
+                    killed_records.append(record)
+                    # First-killer mode records the single killer; full-matrix mode
+                    # records every test that kills this mutant (the per-test
+                    # attribution a greedy-convergence analysis needs).
+                    if full_matrix and result.killed_by_tests:
+                        kill_matrix.setdefault(mutant.description, []).extend(
+                            result.killed_by_tests
+                        )
+                    elif result.test_name:
+                        kill_matrix.setdefault(mutant.description, []).append(
+                            result.test_name
+                        )
+                elif result.refusal:
+                    # Neither killed nor survived (#28): no survivor record, which every survivor
+                    # reader (SARIF, annotations, the witness search) would report as an unpinned
+                    # behaviour. The aggregation below names it in `unscored_records` instead. Still an
+                    # open obligation for the widen: an unknown may kill it, as the full run would.
+                    _survivor_mutants[mutant.mutant_id] = mutant
+                elif result.equivalent:
+                    record["equivalent"] = True
+                    survivor_records.append(record)
+                    # A seed-declared equivalent may be a FALSE equivalent (target-first): `check_equivalent`
+                    # ran against a mutant with an EMPTY seed covering set, so its boundary inputs never
+                    # exercised a branch an unknown test reaches. The widen re-evaluates it too — a
+                    # TRULY equivalent mutant stays equivalent (no test kills it), which is why this is
+                    # sound; a false one is killed, matching a full run that scoped it to that test and
+                    # never reached the equivalence check.
+                    _survivor_mutants[mutant.mutant_id] = mutant
+                else:
+                    survivor_records.append(record)
+                    # A true survivor: the widen may kill it with an unknown test the seed never traced.
+                    _survivor_mutants[mutant.mutant_id] = mutant
+
+                # #14 (reopened): an uncontained worker (abandon could not stop it) is STILL ALIVE —
+                # burning a core and able to perturb every later mutant's timing. Keep THIS mutant's
+                # result (partial evidence), but stop NOW rather than measure more against a compromised
+                # process — and, because this path loops over passes, halt the OUTER loop too. The
+                # exhaustive path already breaks here; converged must not keep spawning workers alongside
+                # a runaway. `all_contained` (below) already forces the run non-gateable / depth="cut".
+                if not result.contained:
+                    uncontained_stop = True
+                    break
+
+            if uncontained_stop:
                 break
 
-        if uncontained_stop:
-            break
-
-    # ── LAZY WIDENING (target-first) ───────────────────────────────────────────────────────
-    # The loop above ran against the SEEDED baseline (candidate tests only, when the caller seeded
-    # the holder). A surviving mutant may be killed by an UNKNOWN test the seed never traced, so
-    # before conceding a survivor, widen the baseline with `widen_tests` and re-evaluate ONLY the
-    # true survivors against it. `seed(A) + expand(B)` is byte-identical to a full trace over
-    # `A∪B` (LazySessionBaseline.expand), so a survivor can only move survivor->killed here, never
-    # the reverse — the final verdict equals the full-suite verdict (the differential oracle pins
-    # this). `test_functions` already contains the unknowns, so they become runnable once their
-    # coverage enters `line_cov`; equivalents are excluded (no test kills them), and a killed mutant
-    # is already resolved. If `expand` degrades (a partial build failed) it invalidates the holder,
-    # so the re-derived scope below rebuilds the FULL baseline — still a complete basis, never a
-    # seed-only false survivor.
-    _widen_holder = _SESSION_BASELINE.get()
-    # ── ITEM-INCREMENTAL WIDEN (target-first / #15 C) — see run_function_profiling for the full rationale.
-    # Converged's obligation is `_survivor_mutants`, which already carries the PROVISIONALLY-EQUIVALENT
-    # mutants re-added above: an empty/partial seed can misclassify a mutant equivalent, so the widen
-    # must re-observe them too — a truly-equivalent one keeps the obligation open (forcing the full
-    # traversal that CONFIRMS equivalence), a false one is killed and pruned early. Trace the unknowns
-    # one micro-batch at a time in stratum order, stopping the instant every obligation discharges. A
-    # containment loss or a budget cut mid-widen ends it as `unresolved` (loop control only —
-    # converged's own gateability path is unchanged), never a false gap; a true gap only once the
-    # APPLICABLE unknowns — the strata the driver handed over — are exhausted.
-    _remaining_widen = (
-        list(widen_tests)
-        if (
-            widen_tests
-            and not uncontained_stop
-            and _widen_holder is not None
-            and _elapsed(start) <= budget_ms
+        # ── LAZY WIDENING (target-first) ───────────────────────────────────────────────────────
+        # The loop above ran against the SEEDED baseline (candidate tests only, when the caller seeded
+        # the holder). A surviving mutant may be killed by an UNKNOWN test the seed never traced, so
+        # before conceding a survivor, widen the baseline with `widen_tests` and re-evaluate ONLY the
+        # true survivors against it. `seed(A) + expand(B)` is byte-identical to a full trace over
+        # `A∪B` (LazySessionBaseline.expand), so a survivor can only move survivor->killed here, never
+        # the reverse — the final verdict equals the full-suite verdict (the differential oracle pins
+        # this). `test_functions` already contains the unknowns, so they become runnable once their
+        # coverage enters `line_cov`; equivalents are excluded (no test kills them), and a killed mutant
+        # is already resolved. If `expand` degrades (a partial build failed) it invalidates the holder,
+        # so the re-derived scope below rebuilds the FULL baseline — still a complete basis, never a
+        # seed-only false survivor.
+        _widen_holder = _SESSION_BASELINE.get()
+        # ── ITEM-INCREMENTAL WIDEN (target-first / #15 C) — see run_function_profiling for the full rationale.
+        # Converged's obligation is `_survivor_mutants`, which already carries the PROVISIONALLY-EQUIVALENT
+        # mutants re-added above: an empty/partial seed can misclassify a mutant equivalent, so the widen
+        # must re-observe them too — a truly-equivalent one keeps the obligation open (forcing the full
+        # traversal that CONFIRMS equivalence), a false one is killed and pruned early. Trace the unknowns
+        # one micro-batch at a time in stratum order, stopping the instant every obligation discharges. A
+        # containment loss or a budget cut mid-widen ends it as `unresolved` (loop control only —
+        # converged's own gateability path is unchanged), never a false gap; a true gap only once the
+        # APPLICABLE unknowns — the strata the driver handed over — are exhausted.
+        _remaining_widen = (
+            list(widen_tests)
+            if (
+                widen_tests
+                and not uncontained_stop
+                and _widen_holder is not None
+                and _elapsed(start) <= budget_ms
+            )
+            else []
         )
-        else []
-    )
-    _widen_cut = False
-    while (
-        next_routing_action(
-            has_open_obligations=bool(_survivor_mutants),
-            has_remaining_items=bool(_remaining_widen),
-            containment_lost=uncontained_stop or _widen_cut,
-        )
-        == "trace_next"
-    ):
-        if _elapsed(start) > budget_ms:
-            _widen_cut = True
-            break
-        _batch, _remaining_widen = _remaining_widen[:1], _remaining_widen[1:]
-        # `_remaining_widen` is non-empty only when the holder is non-None (set together above).
-        assert _widen_holder is not None
-        # Persistence is held back per micro-batch and flushed ONCE after the loop (O(n), not O(n²)).
-        _widen_holder.expand(_batch, persist=False)
-        _wt: set[str] = set()
-        _wu: set[str] = set()
-        _tests_for, line_cov, exec_lines, _failing = _build_test_scope(
-            func_node,
-            test_functions,
-            original_func,
-            scope_tests,
-            None,
-            qualname,
-            trace_budget_s,
-            _wt,
-            trace_progress,
-            trace_session_budget_s,
-            _wu,
-            unscreened_out=_unscreened,
-        )
-        _trace_truncated |= _wt
-        _baseline_uncontained |= _wu
-        for _mid, _mutant in list(_survivor_mutants.items()):
+        _widen_cut = False
+        while (
+            next_routing_action(
+                has_open_obligations=bool(_survivor_mutants),
+                has_remaining_items=bool(_remaining_widen),
+                containment_lost=uncontained_stop or _widen_cut,
+            )
+            == "trace_next"
+        ):
             if _elapsed(start) > budget_ms:
                 _widen_cut = True
                 break
-            _scoped = _tests_for(_mutant)
-            _cap_ms = (
-                max(per_mutant_timeout_ms, 50.0 * len(_scoped))
-                if full_matrix
-                else per_mutant_timeout_ms
+            _batch, _remaining_widen = _remaining_widen[:1], _remaining_widen[1:]
+            # `_remaining_widen` is non-empty only when the holder is non-None (set together above).
+            assert _widen_holder is not None
+            # Persistence is held back per micro-batch and flushed ONCE after the loop (O(n), not O(n²)).
+            _widen_holder.expand(_batch, persist=False)
+            _wt: set[str] = set()
+            _wu: set[str] = set()
+            _tests_for, line_cov, exec_lines, _failing = _build_test_scope(
+                func_node,
+                test_functions,
+                original_func,
+                scope_tests,
+                None,
+                qualname,
+                trace_budget_s,
+                _wt,
+                trace_progress,
+                trace_session_budget_s,
+                _wu,
+                unscreened_out=_unscreened,
             )
-            _remaining_ms = budget_ms - _elapsed(start)
-            _res = evaluate_mutant(
-                _mutant,
-                _scoped,
-                original_func,  # type: ignore[arg-type]
-                timeout_ms=_adaptive_allowance(None, _cap_ms, _remaining_ms),
-                qualname=qualname,
-                record_all_killers=full_matrix,
-                source_path=source_path,
-            )
-            if not _res.killed and _res.refusal:
-                # The widened set holds a test that could not be measured here (#28): over A∪B the
-                # full run names this mutant by its refusal, not as a survivor. `seen` drives the
-                # aggregation, which keeps it out of the denominator and records it. It stays an
-                # open obligation — a later batch may trace the unknown that kills it outright.
+            _trace_truncated |= _wt
+            _baseline_uncontained |= _wu
+            for _mid, _mutant in list(_survivor_mutants.items()):
+                if _elapsed(start) > budget_ms:
+                    _widen_cut = True
+                    break
+                _scoped = _tests_for(_mutant)
+                _cap_ms = (
+                    max(per_mutant_timeout_ms, 50.0 * len(_scoped))
+                    if full_matrix
+                    else per_mutant_timeout_ms
+                )
+                _remaining_ms = budget_ms - _elapsed(start)
+                if isolated:
+                    assert _iso_ctx is not None
+                    _res, _iso_worker, _iso_run = _evaluate_isolated(
+                        _iso_worker, _mutant, _scoped, _iso_ctx, _cap_ms
+                    )
+                    if _iso_run is not None:
+                        _mem_cut = _mem_cut or _iso_run.memory_cut
+                        _mem_enforced = _mem_enforced or _iso_run.mem_enforced
+                else:
+                    _res = evaluate_mutant(
+                        _mutant,
+                        _scoped,
+                        original_func,  # type: ignore[arg-type]
+                        timeout_ms=_adaptive_allowance(None, _cap_ms, _remaining_ms),
+                        qualname=qualname,
+                        record_all_killers=full_matrix,
+                        source_path=source_path,
+                    )
+                if not _res.contained:
+                    seen[_mid] = _res
+                    uncontained_stop = True
+                    break
+                if not _res.killed and _res.refusal:
+                    # The widened set holds a test that could not be measured here (#28): over A∪B the
+                    # full run names this mutant by its refusal, not as a survivor. `seen` drives the
+                    # aggregation, which keeps it out of the denominator and records it. It stays an
+                    # open obligation — a later batch may trace the unknown that kills it outright.
+                    seen[_mid] = _res
+                    survivor_records[:] = [
+                        r for r in survivor_records if r["mutant_id"] != _mid
+                    ]
+                    continue
+                if _res.killed_by in ("diverged", "undetermined", "timeout"):
+                    seen[_mid] = _res
+                    survivor_records[:] = [
+                        r for r in survivor_records if r["mutant_id"] != _mid
+                    ]
+                    continue
+                if not _res.killed:
+                    continue  # still a survivor after widening — the honest gap
+                # Move survivor -> killed across EVERY view. `seen` drives the per-category
+                # re-derivation below, so updating it fixes counts and dimensions; the record/matrix
+                # views are built inline and must be updated to match it exactly.
                 seen[_mid] = _res
                 survivor_records[:] = [
                     r for r in survivor_records if r["mutant_id"] != _mid
                 ]
-                continue
-            if not _res.killed:
-                continue  # still a survivor after widening — the honest gap
-            # Move survivor -> killed across EVERY view. `seen` drives the per-category
-            # re-derivation below, so updating it fixes the counts; the record/matrix/dims views
-            # are built inline in the main loop and must be updated to match it exactly.
-            seen[_mid] = _res
-            survivor_records[:] = [
-                r for r in survivor_records if r["mutant_id"] != _mid
-            ]
-            _record = {
-                "mutant_id": _mutant.mutant_id,
-                "mutant": _mutant.description,
-                "category": _mutant.category.value,
-                "mutated_line": _mutant.mutated_line,
-                "dimension": _mutant.dimension,
-                "change": _mutant_change(_mutant),
-                "diff_summary": _mutant_diff(_mutant),
-                "elapsed_ms": round(_res.elapsed_ms, 1),
-                "killed_by": _res.killed_by,
-                "test": _res.test_name,
-            }
-            killed_records.append(_record)
-            if full_matrix and _res.killed_by_tests:
-                kill_matrix.setdefault(_mutant.description, []).extend(
-                    _res.killed_by_tests
-                )
-            elif _res.test_name:
-                kill_matrix.setdefault(_mutant.description, []).append(_res.test_name)
-            if (
-                mutant_disposition(
-                    _res.constructed,
-                    _res.installed,
-                    _res.entered,
-                    True,
-                    _res.killed,
-                    _res.refusal,
-                )
-                in SCORED_DISPOSITIONS
-                and _mutant.dimension
-                and not _is_dead(_mutant.dimension)
-            ):
-                _dk = f"{_mutant.category.value}\x00{_mutant.dimension}"
-                dims_covered.add(_dk)
-                if _res.killed_by == "assertion":
-                    dims_pinned.add(_dk)
-            del _survivor_mutants[_mid]
+                _record = {
+                    "mutant_id": _mutant.mutant_id,
+                    "mutant": _mutant.description,
+                    "category": _mutant.category.value,
+                    "mutated_line": _mutant.mutated_line,
+                    "dimension": _mutant.dimension,
+                    "change": _mutant_change(_mutant),
+                    "diff_summary": _mutant_diff(_mutant),
+                    "elapsed_ms": round(_res.elapsed_ms, 1),
+                    "killed_by": _res.killed_by,
+                    "test": _res.test_name,
+                }
+                killed_records.append(_record)
+                if full_matrix and _res.killed_by_tests:
+                    kill_matrix.setdefault(_mutant.description, []).extend(
+                        _res.killed_by_tests
+                    )
+                elif _res.test_name:
+                    kill_matrix.setdefault(_mutant.description, []).append(
+                        _res.test_name
+                    )
+                del _survivor_mutants[_mid]
 
-    # One save for the whole widen — see the same site in `run_function_profiling`.
-    if _widen_holder is not None:
-        _widen_holder.flush()
-    # The same typed-unknown remainder on each survivor as the profiling path (#31).
-    _carry_unscreened(survivor_records, _unscreened)
+        # One save for the whole widen — see the same site in `run_function_profiling`.
+        if _widen_holder is not None:
+            _widen_holder.flush()
+        # The same typed-unknown remainder on each survivor as the profiling path (#31).
+        _carry_unscreened(survivor_records, _unscreened)
+
+    finally:
+        if _iso_worker is not None:
+            _iso_worker.close()
 
     # Aggregate by category
     results_by_cat: dict[MutationCategory, CategoryResult] = {}
@@ -9003,6 +9257,10 @@ def run_function_converged(
     unscored_records: list[dict] = []
     # What holds the original, scanned ONCE and only if some mutant is not entered (#18).
     _holders: tuple[list[dict[str, str]], str] | None = None
+    # Derive both DOF views from the final outcomes, including widening. A seed survivor
+    # that becomes unresolved must not retain the earlier seed's covered dimension.
+    dims_covered: set[str] = set()
+    dims_pinned: set[str] = set()
     for result in seen.values():
         if not result.contained:
             all_contained = False
@@ -9019,8 +9277,21 @@ def run_function_converged(
             True,
             result.killed,
             result.refusal,
+            killed_by=result.killed_by,
         )
+        if (
+            disposition in SCORED_DISPOSITIONS
+            and result.mutant.dimension
+            and not _is_dead(result.mutant.dimension)
+        ):
+            _dimension_key = f"{cat.value}\x00{result.mutant.dimension}"
+            dims_covered.add(_dimension_key)
+            if result.killed and result.killed_by == "assertion":
+                dims_pinned.add(_dimension_key)
         if disposition not in SCORED_DISPOSITIONS:
+            survivor_records[:] = [
+                r for r in survivor_records if r["mutant_id"] != result.mutant.mutant_id
+            ]
             cr.unscored += 1
             cr.unscored_by[disposition] = cr.unscored_by.get(disposition, 0) + 1
             _record = _unscored_record(result, disposition)
@@ -9072,7 +9343,14 @@ def run_function_converged(
     budget_exhausted = _elapsed(start) > budget_ms
 
     # Determine coverage depth
-    if budget_exhausted or not all_contained:
+    if (
+        budget_exhausted
+        or not all_contained
+        or _mem_cut
+        or any(
+            r["disposition"] in ("diverged", "undetermined") for r in unscored_records
+        )
+    ):
         # An INVALIDATED measurement — the budget overran or a worker could not be contained
         # (#13/#14) — is CUT, not a legitimate sample: `is_gateable` is already False, and marking
         # the depth "cut" (as the exhaustive path does) is what lets the codebase rollup and the CI
@@ -9113,8 +9391,14 @@ def run_function_converged(
         dof_covered=len(dims_covered),
         dof_pinned=len(dims_pinned),
         coverage_depth=depth,
+        execution_mode="isolated" if isolated else "in_process",
+        memory_standing=(
+            "cut" if _mem_cut else memory_enforcement_standing(_mem_enforced)
+        )
+        if isolated
+        else "n/a",
         is_gateable=_measurement_gateable(
-            depth == "profiled",
+            depth == "profiled" and not unscored_records,
             all_contained,
             not budget_exhausted,
             _identity_standing != "ambiguous",

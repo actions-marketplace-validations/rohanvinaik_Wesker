@@ -99,7 +99,9 @@ from .swap_plan import SWAP_PAIR_BUDGET
 #    count stayed identical, which is a version bump the corpus cannot tell you
 #    anything about. Every verdict under policy 6 is a claim about a universe
 #    that never asked whether non-adjacent argument positions are distinguished.
-POLICY_VERSION = 7
+# 8: annotation subtrees are excluded from runtime mutation; wall bounds are
+#    unresolved execution evidence, never detection kills (#27/#30).
+POLICY_VERSION = 8
 
 # The behavioral fingerprint corpus: small functions that together reach every
 # category, every sub-mode, dead dimensions, the docstring skip, int
@@ -108,6 +110,12 @@ POLICY_VERSION = 7
 # part of the policy definition — extend it when a new category lands (that is
 # a policy change by definition), never rearrange it casually.
 _FINGERPRINT_CORPUS: tuple[str, ...] = (
+    # Annotation-only operations contribute nothing; definition defaults still execute.
+    (
+        "def fp_annotations(x: list[int | str] = 1 + 2) -> int | None:\n"
+        "    y: tuple[int, 3 + 4] = x\n"
+        "    return y\n"
+    ),
     # VALUE: docstring skipped; int (two dims), str, bool, float constants.
     'def fp_value():\n    """Doc."""\n    n = 1\n    n = n\n    return (n, "s", True, 1.5)\n',
     # BOUNDARY: orderings (boundary shift, direction, equality collapse, two
@@ -393,8 +401,13 @@ def mutation_policy(two_sign: bool = False) -> MutationPolicy:
             "a mutant is killed when a covering test fails under it",
             (
                 "assertion kills (value-specified) are distinguished from "
-                "crash/timeout kills (run-only), and an assertion kill takes "
+                "crash kills (run-only), and an assertion kill takes "
                 "precedence over a crash kill for the same mutant"
+            ),
+            (
+                "wall-clock bounds yield undetermined, never kills or survival evidence; "
+                "an explicit deterministic step-budget exhaustion is budget-relative, "
+                "not proof of nontermination, and remains unscored and unresolved"
             ),
             (
                 "survivors probe synthesized boundary inputs for likely "
@@ -412,6 +425,11 @@ def mutation_policy(two_sign: bool = False) -> MutationPolicy:
         ),
         "categories": _categories(two_sign),
         "exclusions": [
+            (
+                "annotation subtrees, return annotations, type parameters and type aliases "
+                "are outside the runtime mutation universe; definition defaults, decorators "
+                "and annotated-assignment values remain behavioral targets"
+            ),
             (
                 "first-order only: mutants are generated one at a time from the "
                 "original AST; kills do not certify compositions of operators "

@@ -89,13 +89,16 @@ def test_a_thread_that_outlives_the_run_makes_the_reach_unknown_and_is_not_cache
     assert traced[test_id].get(path, set()) == set()
 
 
-def test_an_unstoppable_worker_still_hands_threadings_hook_back(tmp_path, monkeypatch):
+def test_an_unstoppable_worker_retires_monitoring_without_changing_foreign_hooks(
+    tmp_path, monkeypatch
+):
     """The adversarial case: the traced worker cannot be stopped, so its own `finally` does not run
     when the joiner gives up. The JOINER must close the window — else every thread the process
     starts from then on is traced into a measurement that is over — and the runaway's late
     `finally` must not reinstall anything."""
     from Wesker import interrupt as INTERRUPT
     from Wesker import line_coverage as LC
+    from Wesker.monitoring import tool_id
 
     mod, path = _module(tmp_path, "thr_unstoppable_unit")
     monkeypatch.setattr(INTERRUPT, "abandon", lambda _thread: False)
@@ -110,27 +113,21 @@ def test_an_unstoppable_worker_still_hands_threadings_hook_back(tmp_path, monkey
         late.join()
         done.set()
 
-    hits: set[int] = set()
-
-    def local(frame, event, _arg):
-        if event == "line":
-            hits.add(frame.f_lineno)
-        return local
-
-    def dispatch(frame, event, _arg):
-        if event == "call" and os.path.realpath(frame.f_code.co_filename) == path:
-            return local
-        return None
-
     hook_before = threading.gettrace()
-    cut, contained = LC._traced_in_thread(runaway, dispatch, 0.1, [])
+    events_before = sys.monitoring.get_events(tool_id())
+    hits, cut, contained, _arcs = LC._trace_one_multi(
+        runaway, {path}, 0.1, capture_arcs=True
+    )
     assert cut is True and contained is False
     assert threading.gettrace() is hook_before, "the joiner left the window open"
+    assert sys.monitoring.get_events(tool_id()) == events_before
     assert done.wait(5)
     assert threading.gettrace() is hook_before, (
         "the runaway's late finally clobbered it"
     )
-    assert hits == set(), "a thread started after the window closed was traced into it"
+    assert sys.monitoring.get_events(tool_id()) == events_before
+    assert sys.monitoring.get_local_events(tool_id(), mod.double.__code__) == 0
+    assert hits == {}, "a thread started after the window closed was traced into it"
 
 
 # ── end-to-end through a live pytest session (Wesker only) ────────────────────────────

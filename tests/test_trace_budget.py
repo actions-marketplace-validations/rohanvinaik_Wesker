@@ -192,9 +192,8 @@ def test_session_budget_names_the_tests_it_never_reached():
     """An UNTRACED test's coverage is absent, not zero — and downstream those are identical. So the
     unreached tail must be reported, or a budget cut reads as a real completeness gap.
 
-    The budget is checked BEFORE each test, so the first always runs and the whole tail is named:
-    that holds at any machine speed. (Pinning WHICH tests fit inside a 1s budget does not — it
-    encodes how fast the box is, and a faster one silently fits more.)"""
+    The first test is interrupted under the remaining session allowance. The whole untraced tail
+    is named alongside it; a cut current test cannot disappear from the same ledger."""
     tests = [_heavy(f"heavy_{i}") for i in range(3)]
     cut: set[str] = set()
     traced = trace_suite(
@@ -206,7 +205,7 @@ def test_session_budget_names_the_tests_it_never_reached():
     # #16 was being written — a 2-test cut reporting as 1 — so the distinctness is asserted
     # here rather than assumed by the two set comparisons below.
     assert len(set(ids)) == 3, f"factory closures must not share an id: {ids}"
-    assert set(cut) == {ids[1], ids[2]}  # the entire untraced tail, by id
+    assert set(cut) == set(ids)  # the interrupted current test AND the untraced tail
     assert set(traced) == {ids[0]}  # and only the one that ran is reported as traced
 
 

@@ -1279,6 +1279,8 @@ def profile_file(
     cached_state: dict | None = None,
     full_matrix: bool = False,
     test_discovery: str = "auto",
+    isolated: bool = False,
+    worker_mem_limit_mb: int | None = None,
 ) -> list[dict]:
     """Profile all functions in a file with multi-pass convergence.
 
@@ -1345,6 +1347,8 @@ def profile_file(
             category_order=cat_order,
             full_matrix=full_matrix,
             source_path=full_path,
+            isolated=isolated,
+            worker_mem_limit_mb=worker_mem_limit_mb,
         )
         results.append(sr.to_dict())
 
@@ -1364,6 +1368,8 @@ def profile_function(
     cached_state: dict | None = None,
     full_matrix: bool = False,
     test_discovery: str = "auto",
+    isolated: bool = False,
+    worker_mem_limit_mb: int | None = None,
 ) -> dict | None:
     """Profile a single function by name — the interactive/library entry point.
 
@@ -1436,6 +1442,8 @@ def profile_function(
         category_order=cat_order,
         full_matrix=full_matrix,
         source_path=full_path,
+        isolated=isolated,
+        worker_mem_limit_mb=worker_mem_limit_mb,
     )
     return result.to_dict()
 
@@ -2006,6 +2014,8 @@ def profile_codebase(
     passes: int = 1,
     *,
     verbose: bool = True,
+    isolated: bool = False,
+    worker_mem_limit_mb: int | None = None,
 ) -> dict:
     """Profile all functions across multiple files with multi-pass convergence.
 
@@ -2066,6 +2076,8 @@ def profile_codebase(
             max_per_category=max_per_category,
             passes=passes,
             cached_state=cached_state,
+            isolated=isolated,
+            worker_mem_limit_mb=worker_mem_limit_mb,
         )
         file_ms = (time.monotonic() - file_start) * 1000
 
