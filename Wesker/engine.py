@@ -1544,6 +1544,11 @@ class _SwapMutator(_BaseMutator):
         return self.generic_visit(node)
 
 
+def _is_none_constant(node: ast.AST) -> bool:
+    """Whether an expression is the literal ``None`` — the value STATE's return_none writes."""
+    return isinstance(node, ast.Constant) and node.value is None
+
+
 class _StateMutator(_BaseMutator):
     """Remove self.x writes (plain, annotated, and augmented spellings — all
     three are the same behavioral question per attribute), replace return with
@@ -1625,7 +1630,9 @@ class _StateMutator(_BaseMutator):
     def visit_Return(self, node: ast.Return) -> ast.AST:
         if self.applied or self.mode != "return_none":
             return node
-        if node.value is not None:
+        # `return None` is not a target: rewriting it to `return None` is the original program, a
+        # survivor with an empty diff that no test can kill and no reader can act on.
+        if node.value is not None and not _is_none_constant(node.value):
             if self.current == self.target:
                 self._mark_applied(node)
                 return ast.Return(value=ast.Constant(value=None))

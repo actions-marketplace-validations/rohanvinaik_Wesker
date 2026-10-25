@@ -44,7 +44,9 @@ from Wesker.policy import (
 #     skip rule — and this failure is the entire point: find the drift before
 #     touching the golden.
 # W#47: the same policy-8 universe, with single-invocation observation semantics.
-GOLDEN_POLICY_ID = "8.51a0c2a545b5"
+# Policy 9: an existing `return None` is no longer a STATE return_none target (the rewrite was the
+# original program); the corpus gained fp_return_none.
+GOLDEN_POLICY_ID = "9.a75e42829200"
 
 # The same fact, readable: the engine's target counts over the fingerprint
 # corpus. A failure here names the category and function that moved.
@@ -82,6 +84,7 @@ GOLDEN_FINGERPRINT = {
     "fp_dataflow": {"ARITHMETIC": 1, "DATAFLOW": 2, "STATE": 1},
     "fp_str_arith": {"ARITHMETIC": 3, "STATE": 1, "SWAP": 1, "VALUE": 9},
     "fp_state_spellings": {"ARITHMETIC": 1, "STATE": 5, "STMT": 4},
+    "fp_return_none": {"BOUNDARY": 3, "STATE": 1},
 }
 
 

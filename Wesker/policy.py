@@ -101,7 +101,10 @@ from .swap_plan import SWAP_PAIR_BUDGET
 #    that never asked whether non-adjacent argument positions are distinguished.
 # 8: annotation subtrees are excluded from runtime mutation; wall bounds are
 #    unresolved execution evidence, never detection kills (#27/#30).
-POLICY_VERSION = 8
+# 9: an existing `return None` is no longer a STATE return_none target — the
+#    rewrite was the original program, an empty-diff survivor no test can kill.
+#    The corpus gained fp_return_none, so the change is visible in the counts.
+POLICY_VERSION = 9
 
 # The behavioral fingerprint corpus: small functions that together reach every
 # category, every sub-mode, dead dimensions, the docstring skip, int
@@ -203,6 +206,10 @@ _FINGERPRINT_CORPUS: tuple[str, ...] = (
         "    self.left = self.right = v\n"
         "    self.declared: int\n"
     ),
+    # STATE return_none (2026-10-25): an existing `return None` is not a target, the value
+    # return is. Without this entry the corpus could not see the no-op target the operator
+    # used to emit, and a cache keyed on the policy id would replay its empty-diff survivor.
+    "def fp_return_none(x):\n    if x is None:\n        return None\n    return x\n",
 )
 
 
@@ -300,6 +307,12 @@ def _categories(two_sign: bool = False) -> dict[str, dict[str, Any]]:
         MutationCategory.STATE.value: {
             "question": "are side effects, return values, and loop control pinned?",
             "sub_modes": {mode: desc for mode, desc in _STATE_SUB_MODES},
+            "skips": [
+                (
+                    "an existing `return None` under return_none: it is the value the operator "
+                    "writes, so the rewrite would be the original program"
+                )
+            ],
         },
         MutationCategory.TYPE.value: {
             "question": "is this type guard exercised?",
