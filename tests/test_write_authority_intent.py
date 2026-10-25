@@ -200,8 +200,9 @@ def test_removing_a_project_file_is_prevented(layout):
 def test_an_exclusive_create_in_the_project_is_prevented(layout):
     project, _ = layout
     with contain_writes() as blocked:
+        # The guard raises inside the open itself, so the open is the one call under test.
         with pytest.raises(WriteOutsideAuthority):
-            os.close(os.open("fresh", os.O_CREAT | os.O_EXCL | os.O_WRONLY))
+            os.open("fresh", os.O_CREAT | os.O_EXCL | os.O_WRONLY)
         with pytest.raises(WriteOutsideAuthority):
             os.mkdir("fresh_dir")
     assert not (project / "fresh").exists()

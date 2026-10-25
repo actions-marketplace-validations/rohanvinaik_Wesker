@@ -121,20 +121,11 @@ class WriteOutsideAuthority(BaseException):
 
 # The audited operations that change the filesystem. `os.replace` raises "os.rename", and
 # `os.unlink` raises "os.remove"; both spellings are listed so neither depends on that.
+_MKDIR = "os.mkdir"
+_RENAMES = ("os.rename", "os.replace")
+_REMOVALS = ("os.remove", "os.unlink", "os.rmdir", "shutil.rmtree")
 _EVENTS = frozenset(
-    {
-        "open",
-        "os.mkdir",
-        "os.rename",
-        "os.replace",
-        "os.remove",
-        "os.unlink",
-        "os.rmdir",
-        "shutil.rmtree",
-        "os.symlink",
-        "os.link",
-        "os.truncate",
-    }
+    {"open", _MKDIR, *_RENAMES, *_REMOVALS, "os.symlink", "os.link", "os.truncate"}
 )
 _WRITE_FLAGS = os.O_WRONLY | os.O_RDWR | os.O_CREAT | os.O_APPEND | os.O_TRUNC
 _EXCLUSIVE = os.O_CREAT | os.O_EXCL
@@ -179,14 +170,14 @@ def _effects(event: str, args: tuple) -> tuple[tuple[str, object, object, bool],
     """
     if event == "open":
         return _open_effect(args)
-    if event == "os.mkdir":
+    if event == _MKDIR:
         return (("create", args[0], _optional(args, 2), False),)
-    if event in ("os.rename", "os.replace"):
+    if event in _RENAMES:
         return (
             ("remove", args[0], _optional(args, 2), False),
             ("write", args[1], _optional(args, 3), False),
         )
-    if event in ("os.remove", "os.unlink", "os.rmdir", "shutil.rmtree"):
+    if event in _REMOVALS:
         return (("remove", args[0], _optional(args, 1), False),)
     if event == "os.symlink":
         return (("create", args[1], _optional(args, 2), False),)
@@ -285,18 +276,57 @@ def _created_ancestors(path: str) -> list[str]:
         current = parent
 
 
+def _concerns(event: str, args: tuple, window: object) -> bool:
+    """Whether the hook has anything to do for this audited event. While armed, every write does.
+    Unarmed, only an exclusive creation, which may become the test's room later."""
+    if window is not None:
+        return True
+    if event == "open":
+        flags = _optional(args, 2)
+        return isinstance(flags, int) and flags & _EXCLUSIVE == _EXCLUSIVE
+    return event == _MKDIR
+
+
+def _effect_standing(
+    effect: str,
+    raw: object,
+    dir_fd: object,
+    follow: bool,
+    roots: tuple[str, ...],
+    protected: str,
+) -> tuple[str, str | None]:
+    """The disposition of ONE effect and the path it lands on (`write_authority_disposition`)."""
+    path = _place(raw, dir_fd, follow)
+    if path == "":
+        return "no_effect", path
+    if path is None:
+        return "unplaceable", None
+    return (
+        write_authority_disposition(
+            effect,
+            path,
+            os.path.lexists(path),
+            os.path.isdir(path),
+            [
+                *roots,
+                *(
+                    c
+                    for c in _created_ancestors(path)
+                    if not (protected and _contains(c, protected))
+                ),
+            ],
+            _temp_root(),
+        ),
+        path,
+    )
+
+
 def _hook(event: str, args: tuple) -> None:
     if event not in _EVENTS:
         return
     window = _ACTIVE
-    if window is None:
-        # Unarmed, only an exclusive creation matters: it may become the test's room later.
-        if event == "open":
-            flags = _optional(args, 2)
-            if not (isinstance(flags, int) and flags & _EXCLUSIVE == _EXCLUSIVE):
-                return
-        elif event != "os.mkdir":
-            return
+    if not _concerns(event, args, window):
+        return
     if getattr(_LOCAL, "busy", False):
         return  # this hook's own resolution (a descriptor lookup) is not a test's effect
     _LOCAL.busy = True
@@ -305,33 +335,13 @@ def _hook(event: str, args: tuple) -> None:
         for effect, raw, dir_fd, follow in _effects(event, args):
             if blocked is None and effect != "create":
                 continue
-            path = _place(raw, dir_fd, follow)
-            if path == "":
-                code = "no_effect"
-            elif path is None:
-                code = "unplaceable"
-            else:
-                code = write_authority_disposition(
-                    effect,
-                    path,
-                    os.path.lexists(path),
-                    os.path.isdir(path),
-                    [
-                        *roots,
-                        *(
-                            c
-                            for c in _created_ancestors(path)
-                            if not (protected and _contains(c, protected))
-                        ),
-                    ],
-                    _temp_root(),
-                )
+            code, path = _effect_standing(effect, raw, dir_fd, follow, roots, protected)
             if code == "fresh_temp_entry" and path is not None:
                 _CREATED.add(path)
             elif blocked is not None and code in ("outside_authority", "unplaceable"):
                 blocked.append(path if path is not None else repr(raw))
                 raise WriteOutsideAuthority(f"{event}: {path or raw!r}")
-            if event in ("os.rename", "os.replace") and code == "no_effect":
+            if event in _RENAMES and code == "no_effect":
                 return  # a rename whose source is missing fails; its destination is untouched
     finally:
         _LOCAL.busy = False

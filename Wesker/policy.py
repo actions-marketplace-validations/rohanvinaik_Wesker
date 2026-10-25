@@ -377,8 +377,8 @@ def _categories(two_sign: bool = False) -> dict[str, dict[str, Any]]:
             # Form B (Def. 11.6): what the return-site rewrite cannot reach. Static (no observed
             # type decides it), so it is in the census and the fingerprint.
             "form_b": {
-                "yield": {mode: desc for mode, desc in _OUTPUT_YIELD_SUB_MODES},
-                "call": {mode: desc for mode, desc in _OUTPUT_CALL_SUB_MODES},
+                "yield": dict(_OUTPUT_YIELD_SUB_MODES),
+                "call": dict(_OUTPUT_CALL_SUB_MODES),
                 "rule": (
                     "a generator gets the yield modes; any other function gets "
                     "return_stale, and raise_swallow when its own body raises "

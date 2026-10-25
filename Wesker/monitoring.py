@@ -504,7 +504,10 @@ def _discovery_pending(code: CodeType, thread_id: int) -> list[Subscription]:
     attached = _discovered_for_code.get(code, ())
     pending: list[Subscription] = []
     named = False
-    for sub in list(_subscriptions_with_selectors.values()):
+    live = list(
+        _subscriptions_with_selectors.values()
+    )  # one C call: other threads subscribe and close
+    for sub in live:
         if sub.sub_id in attached:
             named = True
             continue
@@ -538,7 +541,10 @@ def _discovery_failed(exc: Exception) -> None:
     budget stop) is not caught, and still unwinds the thread as it must.
     """
     reason = f"discovery_failed:{type(exc).__name__}"
-    for sub in list(_subscriptions_with_selectors.values()):
+    live = list(
+        _subscriptions_with_selectors.values()
+    )  # one C call: other threads subscribe and close
+    for sub in live:
         sub.observation.failure = sub.observation.failure or reason
 
 

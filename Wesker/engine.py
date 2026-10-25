@@ -1907,6 +1907,18 @@ def _instantiate_output_template(src: str, value: ast.expr) -> ast.expr:
     return _Place().visit(tree)
 
 
+def _templated_return(mode: str, value: ast.expr) -> ast.expr | None:
+    """One of Def. 11.8's Form A templates instantiated over the return value (#44), or None when
+    the return already IS that template's constant: a no-op, never a target."""
+    if (
+        mode in _OUTPUT_TEMPLATE_CONSTANT
+        and isinstance(value, ast.Constant)
+        and value.value is _OUTPUT_TEMPLATE_CONSTANT[mode]
+    ):
+        return None
+    return _instantiate_output_template(_OUTPUT_TEMPLATES[mode], value)
+
+
 class _OutputMutator(_BaseMutator):
     """Output-space (codomain) perturbation — μ⁻ Form A (return-site rewrite).
 
@@ -1967,8 +1979,9 @@ class _OutputMutator(_BaseMutator):
         ``-(x)``/``abs(x)`` on a numeric return, ``type(x)()`` on a sized return (its empty),
         ``x[::-1]`` on a sequence, ``float('nan')`` on a float, and the rest of Def. 11.8's Form A
         operators instantiated from :data:`_OUTPUT_TEMPLATES`."""
+        repl: ast.expr | None
         if self.mode == "return_none":
-            repl: ast.expr = ast.Constant(value=None)
+            repl = ast.Constant(value=None)
         elif self.mode == "return_const":
             repl = ast.Constant(value=0)
         elif self.mode == "return_identity":
@@ -2009,17 +2022,11 @@ class _OutputMutator(_BaseMutator):
                 ctx=ast.Load(),
             )
         elif self.mode in _OUTPUT_TEMPLATES:
-            if (
-                self.mode in _OUTPUT_TEMPLATE_CONSTANT
-                and isinstance(value, ast.Constant)
-                and value.value is _OUTPUT_TEMPLATE_CONSTANT[self.mode]
-            ):
-                return None  # no-op: the return already IS this constant
-            repl = _instantiate_output_template(_OUTPUT_TEMPLATES[self.mode], value)
+            repl = _templated_return(self.mode, value)
         else:
             return None
-        if ast.dump(repl) == ast.dump(value):
-            return None  # no-op: the return already IS this value
+        if repl is None or ast.dump(repl) == ast.dump(value):
+            return None  # no-op: the return already IS this value (or this template's constant)
         return repl
 
     def visit_Return(self, node: ast.Return) -> ast.AST:
