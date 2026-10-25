@@ -321,21 +321,35 @@ def _effect_standing(
     )
 
 
+def _settle(
+    event: str,
+    effect: str,
+    raw: object,
+    dir_fd: object,
+    follow: bool,
+    window: tuple[list[str] | None, tuple[str, ...], str],
+) -> str:
+    """Settle ONE effect and return its disposition: record a fresh temporary entry, or, while armed,
+    record and prevent a write outside the authority (by raising before the operation runs)."""
+    blocked, roots, protected = window
+    code, path = _effect_standing(effect, raw, dir_fd, follow, roots, protected)
+    if code == "fresh_temp_entry" and path is not None:
+        _CREATED.add(path)
+    elif blocked is not None and code in ("outside_authority", "unplaceable"):
+        blocked.append(path if path is not None else repr(raw))
+        raise WriteOutsideAuthority(f"{event}: {path or raw!r}")
+    return code
+
+
 def _judge(
     event: str, args: tuple, window: tuple[list[str], tuple[str, ...], str] | None
 ) -> None:
-    """Settle each effect of one audited operation: record a fresh temporary entry, or, while armed,
-    record and prevent a write outside the authority (by raising before the operation runs)."""
-    blocked, roots, protected = window if window is not None else (None, (), "")
+    """Settle each effect of one audited operation. Unarmed, only a creation is followed."""
+    settled = window if window is not None else (None, (), "")
     for effect, raw, dir_fd, follow in _effects(event, args):
-        if blocked is None and effect != "create":
+        if settled[0] is None and effect != "create":
             continue
-        code, path = _effect_standing(effect, raw, dir_fd, follow, roots, protected)
-        if code == "fresh_temp_entry" and path is not None:
-            _CREATED.add(path)
-        elif blocked is not None and code in ("outside_authority", "unplaceable"):
-            blocked.append(path if path is not None else repr(raw))
-            raise WriteOutsideAuthority(f"{event}: {path or raw!r}")
+        code = _settle(event, effect, raw, dir_fd, follow, settled)
         if event in _RENAMES and code == "no_effect":
             return  # a rename whose source is missing fails; its destination is untouched
 
