@@ -2,6 +2,127 @@
 
 Notable changes, newest first. Dates are the commit dates.
 
+## Unreleased
+
+Development source after 1.2.2; no version or release is implied. The operator universe is unchanged —
+policy 8, the same categories and the same fingerprint counts — but the observation rule it declares
+changed twice, so the policy id moved twice.
+
+### Correctness
+
+- **A test exception never selects a second invocation.** The unpatched fallback called
+  `test_fn(mutated_func)` and, on any `TypeError`, called `test_fn()` again, so a body that changed
+  state and raised could run twice and read as a survivor. The calling convention is now chosen by
+  signature binding before the one bounded invocation. An unavailable signature keeps one injected
+  attempt, and a `TypeError` raised during execution is that test's crash, never a retry. (`ca215e4`,
+  W#47)
+- **A forwarding wrapper keeps its advertised call.** A `functools.wraps` wrapper whose own signature is
+  `(*args, **kwargs)` but which advertises zero arguments received the injected mutant and failed
+  before its test ran. Binding now honours the advertised signature where the actual one also binds,
+  and on 3.14 reads parameter shape without evaluating deferred annotations. (`3e98ad8`, W#47)
+
+Policy id: `8.dcc355186875` → `8.68a525594c46` → `8.51a0c2a545b5`; two-sign
+`8+neg.671d835828bf` → `8+neg.40ae45e28e39` → `8+neg.8d34cddbefca`. Detective's verdict cache keys
+on the id, so rows recorded under an older observation rule are not reused.
+
+### The Action
+
+- **A stalled badge run leaves evidence of where it stalled.** `WESKER_STACK_DUMP_S`, a positive whole
+  number of seconds, arms a periodic all-thread stack dump on a copy of stderr duplicated before
+  profiling starts. Unset arms nothing; a malformed value is named rather than read as unset.
+  `spec-full.yml` sets it to 900, bounds the job at 180 minutes (liveness, never the measurement's
+  budget) and lets a newer push supersede a running measurement. Every push of 2026-10-24 had run
+  that job for six hours with no output after the file count. (`9362bc5`, W#29)
+
+## 1.2.2 — 2026-10-24
+
+Paired with Detective 1.2.2. The engine is the one released as 1.2.1, and the mutation policy is
+unchanged (`8.dcc355186875`).
+
+- **Release artifacts are built and signed only after exact-commit CI.** The release workflow refuses
+  unless push CI for the exact checked-out release commit completed successfully. A pending, missing,
+  failed or wrong-commit run does not satisfy it, and an older green run cannot mask a newer failed
+  one. (`60df89b`)
+- The README shows live release and quality signals; the Action example documentation is updated.
+  (`6de166d`)
+
+## 1.2.1 — 2026-10-24
+
+The mutation policy is unchanged (`8.dcc355186875`).
+
+- **Cold opcode observations survive a co-resident coverage tool.** Global discovery is installed
+  before local event masks, so a tool that disables PY_START — coverage.py's `SysMonitor` core on
+  3.14 — no longer costs instruction events on a code object's first execution. (`8aa2b4e`, W#32)
+- The stale-source tests state the fingerprint contract across interpreter versions and exercise
+  tokenizer failures explicitly. (`8aa2b4e`)
+
+## 1.2.0 — 2026-10-24
+
+**Mutation policy 7 → 8.** Annotation subtrees — parameter and return annotations, type parameters
+and type aliases — are outside the runtime mutation universe (option A of W#30). Definition defaults,
+decorators and annotated-assignment values remain behavioural targets. Under PEP 563, and under PEP 649
+absent introspection, an annotation mutant is inert to every test that does not evaluate annotations,
+so it could only land in the candidate-equivalent residual. The fingerprint corpus gained
+`fp_annotations`. Policy 8 also declares the execution-outcome rules below.
+
+Policy id: `7.a73c76cd1d65` → `8.dcc355186875`.
+
+Requires Python 3.12 or newer. 3.14 is the standard interpreter, and the Action defaults to it.
+(`1561067`)
+
+### Execution outcomes
+
+- **A timeout is not a kill.** A wall-clock bound that fires before any kill is established records
+  `undetermined`; an explicit step budget that is exceeded records `diverged`. Both are named
+  dispositions outside the scored denominator — never a kill, never survival evidence.
+  `Wesker.monitoring.step_budget` is the deterministic counter; the engine does not yet arm it for
+  every test. (`a24171e`, `daad6cf`, W#27)
+- **A test that runs the engine inside a held evaluation is refused by name**, `nested_measurement`:
+  unscored and non-gateable, instead of deadlocking on the execution lock and orphaning it.
+  (`b2d790c`, W#28)
+- **A mutant that was installed but never entered names why** — `not_reached`, `decorator_wrapper`,
+  `captured_at_import`, `pre_bound_reference`, `holder_not_found` or `no_reach_data` — with the reach
+  and the holders that keep the original. (`7176e9a`, `23ab488`, W#18)
+- **Baselines are typed.** Every trace-evidence row carries `baseline_outcome` (passed, failed,
+  skipped, xfailed, error), and a skipped, xfailed or errored test is never proof. A thread a test
+  starts is traced while it runs; one that outlives its test marks the row `incomplete_thread` —
+  unknown, never negative. (`d8c228e`, `e212f7e`, `8ee8beb`, W#17)
+- **The whole-pool fallback runs only baseline-screened tests.** An unscreened remainder is recorded as
+  typed unknown on the survivor record and is never credited as a kill. (`87ebdd3`, W#31)
+
+### Interpreter instrumentation
+
+- **One owner of `sys.monitoring`.** Subscriptions with thread attribution and run tokens replace
+  per-site tool registration; INSTRUCTION events are dispatched with thread attribution and token
+  retirement; unresolved execution facts are retained rather than dropped. (`a24171e`, `daad6cf`,
+  `0884e46`, W#32)
+- Shape-hazard records keep their provenance (detected, declared, override) and their test-level
+  records. (`6b49414`, `34711f6`, W#19)
+
+### The live session
+
+- The session baseline names the files it traces (Detective #103). (`39be82d`)
+- A test whose file was edited after import fingerprints by name and never crashes the run
+  (Detective #104). (`9e5023c`)
+
+### Performance
+
+- **No failure report is formatted that nobody reads.** The in-process measurement session and the
+  isolated worker give every collected item a cheap `repr_failure`; the verdict is pytest's exit code
+  and the kill reason comes from the raw `excinfo`. Verdicts, generated suites and certificates are
+  identical. (`49f7e91`, `3718b0a`, `3e2a88a`, W#34)
+
+### The CLI
+
+- `--isolated` runs mutant evaluation in isolated worker subprocesses and `--mem-limit-mb` sets their
+  memory limit (default 512). The address-space cap is applied where the OS accepts it, which Linux
+  does and macOS often does not. (`daad6cf`; acceptance tests `8b6f222`; W#45)
+
+### Documentation
+
+- `AGENTS.md` is Wesker's one instruction base and `CLAUDE.md` imports it; the instruction files read
+  Detective's output whole. (`1ce3449`, `ed2256a`)
+
 ## 1.1.1 — 2026-09-14
 
 A patch release. The mutation policy is unchanged (`7.a73c76cd1d65`): no question in the universe moved.
