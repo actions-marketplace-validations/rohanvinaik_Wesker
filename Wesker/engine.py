@@ -1774,6 +1774,129 @@ class _ExceptionMutator(_BaseMutator):
         return self.generic_visit(node)
 
 
+# μ⁻ Fork 2 rewrites built from expression templates (Def. 11.8 (i)–(v), (vii)). ``__mu_value__``
+# marks the ONE place the original return value goes, and every template evaluates it exactly once:
+# a perturbation is p ∘ f (the operator post-composed on the output), so the return expression's own
+# side effects must happen once, as they do in f. A template that needs the value more than once, or
+# not at all (a constant), binds it through a lambda parameter (``__mu_v``); evaluating it twice, or
+# skipping it, would perturb more than the output. (return_none/return_const/return_nan above predate
+# this and drop the expression; they keep that shape because their ids and diffs are flag identity.)
+# Builtins and stdlib modules are reached through ``__import__``, so a parameter, local or global
+# named ``type``, ``round`` or ``min`` cannot turn the perturbation into a different function. Each
+# template is TOTAL on every type its mode is applicable to (Prop. 11.11: it never raises there) and
+# deterministic: a set element is chosen by the least ``repr``, never by iteration order, which
+# PYTHONHASHSEED moves between processes. A dispatching template falls through to the value
+# unchanged only for a type outside its mode's applicable set, which Fork 2 never emits it for.
+_MU_VALUE = "__mu_value__"
+_OUTPUT_TEMPLATES: dict[str, str] = {
+    # (i) universal: the type's canonical zero, and the same value as a different type
+    "return_zero_of": '__import__("builtins").type(__mu_value__)()',
+    "return_type": (
+        '(lambda __mu_v, __mu_b=__import__("builtins"): '
+        '__mu_v.encode("utf-8", "surrogatepass") if __mu_b.type(__mu_v) is __mu_b.str '
+        'else __mu_v.decode("latin-1") if __mu_b.type(__mu_v) is __mu_b.bytes '
+        "else __mu_b.int(__mu_v) if __mu_b.type(__mu_v) is __mu_b.bool "
+        'else __import__("decimal").Decimal(__mu_v) '
+        "if __mu_b.type(__mu_v) in (__mu_b.int, __mu_b.float) "
+        "else __mu_v)(__mu_value__)"
+    ),
+    # (ii) boolean
+    "return_not": "not __mu_value__",
+    "return_true": "(lambda __mu_v: True)(__mu_value__)",
+    "return_false": "(lambda __mu_v: False)(__mu_value__)",
+    # (iii) numeric
+    "return_plus_one": "__mu_value__ + 1",
+    "return_minus_one": "__mu_value__ - 1",
+    "return_next_up": '__import__("math").nextafter(__mu_value__, __import__("math").inf)',
+    "return_next_down": '__import__("math").nextafter(__mu_value__, -__import__("math").inf)',
+    "return_scale": "__mu_value__ * 2",
+    "return_round": '__import__("builtins").round(__mu_value__, 0)',
+    "return_inf": '(lambda __mu_v: __import__("math").inf)(__mu_value__)',
+    # (iv) string
+    "return_truncate": "__mu_value__[:-1]",
+    "return_swapcase": "__mu_value__.swapcase()",
+    "return_pad": '__mu_value__ + " "',
+    "return_reverse": "__mu_value__[::-1]",
+    # (v) container. A dict's drop is its drop-field; its default-field is return_field_default.
+    "return_drop": (
+        '(lambda __mu_v, __mu_b=__import__("builtins"): '
+        "__mu_v[:-1] if __mu_b.type(__mu_v) in (__mu_b.list, __mu_b.tuple) "
+        "else __mu_b.dict(__mu_b.list(__mu_v.items())[:-1]) "
+        "if __mu_b.type(__mu_v) is __mu_b.dict "
+        "else __mu_v - {__mu_b.min(__mu_v, key=__mu_b.repr)} "
+        "if __mu_v and __mu_b.type(__mu_v) in (__mu_b.set, __mu_b.frozenset) "
+        "else __mu_v)(__mu_value__)"
+    ),
+    "return_duplicate": "(lambda __mu_v: __mu_v + __mu_v[-1:])(__mu_value__)",
+    "return_singleton": (
+        '(lambda __mu_v, __mu_b=__import__("builtins"): '
+        "__mu_v[:1] if __mu_b.type(__mu_v) in (__mu_b.list, __mu_b.tuple) "
+        "else __mu_v & {__mu_b.min(__mu_v, key=__mu_b.repr)} "
+        "if __mu_v and __mu_b.type(__mu_v) in (__mu_b.set, __mu_b.frozenset) "
+        "else __mu_v)(__mu_value__)"
+    ),
+    "return_ctype": (
+        '(lambda __mu_v, __mu_b=__import__("builtins"): '
+        "__mu_b.tuple(__mu_v) if __mu_b.type(__mu_v) is __mu_b.list "
+        "else __mu_b.list(__mu_v) if __mu_b.type(__mu_v) is __mu_b.tuple "
+        "else __mu_b.frozenset(__mu_v) if __mu_b.type(__mu_v) is __mu_b.set "
+        "else __mu_b.set(__mu_v) if __mu_b.type(__mu_v) is __mu_b.frozenset "
+        "else __mu_v)(__mu_value__)"
+    ),
+    "return_field_default": (
+        '(lambda __mu_v, __mu_b=__import__("builtins"): '
+        "{**__mu_v, __mu_b.list(__mu_v)[-1]: None} if __mu_v else __mu_v)(__mu_value__)"
+    ),
+    # (vii) ordered: a local transposition, and the adjacent date, datetime or timedelta
+    "return_sortbreak": "(lambda __mu_v: __mu_v[1:2] + __mu_v[:1] + __mu_v[2:])(__mu_value__)",
+    "return_adjacent": (
+        '(lambda __mu_v, __mu_b=__import__("builtins"), __mu_d=__import__("datetime"): '
+        "(__mu_v + __mu_d.timedelta(microseconds=1) "
+        "if __mu_v.replace(tzinfo=None) < __mu_d.datetime.max "
+        "else __mu_v - __mu_d.timedelta(microseconds=1)) "
+        "if __mu_b.type(__mu_v) is __mu_d.datetime "
+        "else (__mu_v + __mu_d.timedelta(days=1) if __mu_v < __mu_d.date.max "
+        "else __mu_v - __mu_d.timedelta(days=1)) "
+        "if __mu_b.type(__mu_v) is __mu_d.date "
+        "else (__mu_v + __mu_d.timedelta(microseconds=1) if __mu_v < __mu_d.timedelta.max "
+        "else __mu_v - __mu_d.timedelta(microseconds=1)) "
+        "if __mu_b.type(__mu_v) is __mu_d.timedelta "
+        "else __mu_v)(__mu_value__)"
+    ),
+}
+
+# A template whose result is a constant still evaluates the return, so the syntactic no-op check in
+# `_OutputMutator._perturbed` cannot see that `return True` under →True is the original program. Its
+# constant is named here so that case is skipped as the guaranteed-equivalent it is.
+_OUTPUT_TEMPLATE_CONSTANT: dict[str, bool] = {
+    "return_true": True,
+    "return_false": False,
+}
+
+
+@functools.cache
+def _output_template(src: str) -> ast.expr:
+    """The parsed template expression (cached; callers deep-copy before use)."""
+    return ast.parse(src, mode="eval").body
+
+
+def _instantiate_output_template(src: str, value: ast.expr) -> ast.expr:
+    """The template with its ``__mu_value__`` load replaced by a copy of the return value.
+
+    Every template node takes the return value's source position, as a hand-built rewrite takes
+    the return's from ``fix_missing_locations``; the parse alone would leave them all at line 1."""
+    tree = copy.deepcopy(_output_template(src))
+    for node in ast.walk(tree):
+        if "lineno" in node._attributes:
+            ast.copy_location(node, value)
+
+    class _Place(ast.NodeTransformer):
+        def visit_Name(self, node: ast.Name) -> ast.AST:
+            return copy.deepcopy(value) if node.id == _MU_VALUE else node
+
+    return _Place().visit(tree)
+
+
 class _OutputMutator(_BaseMutator):
     """Output-space (codomain) perturbation — μ⁻ Form A (return-site rewrite).
 
@@ -1832,7 +1955,8 @@ class _OutputMutator(_BaseMutator):
         value. The type-conditional sub-modes (Fork 2) are emitted only for an OBSERVED codomain
         type (:func:`_output_sub_modes`), so each is applied only where it cannot raise:
         ``-(x)``/``abs(x)`` on a numeric return, ``type(x)()`` on a sized return (its empty),
-        ``x[::-1]`` on a sequence, ``float('nan')`` on a float."""
+        ``x[::-1]`` on a sequence, ``float('nan')`` on a float, and the rest of Def. 11.8's Form A
+        operators instantiated from :data:`_OUTPUT_TEMPLATES`."""
         if self.mode == "return_none":
             repl: ast.expr = ast.Constant(value=None)
         elif self.mode == "return_const":
@@ -1874,6 +1998,14 @@ class _OutputMutator(_BaseMutator):
                 ),
                 ctx=ast.Load(),
             )
+        elif self.mode in _OUTPUT_TEMPLATES:
+            if (
+                self.mode in _OUTPUT_TEMPLATE_CONSTANT
+                and isinstance(value, ast.Constant)
+                and value.value is _OUTPUT_TEMPLATE_CONSTANT[self.mode]
+            ):
+                return None  # no-op: the return already IS this constant
+            repl = _instantiate_output_template(_OUTPUT_TEMPLATES[self.mode], value)
         else:
             return None
         if ast.dump(repl) == ast.dump(value):
@@ -3071,10 +3203,12 @@ _OUTPUT_SUB_MODES = (
 )
 
 # μ⁻ Fork 2 — the type-conditional output perturbations, keyed by observed codomain type name.
-# Emitted ONLY for an OBSERVED return type, so each is applied only where it cannot raise (the
-# type-directed AST in _OutputMutator._perturbed). The certificate then names the observed codomain
-# as its observing set; the two-sign policy id and the static census stay Fork-1, so Fork 2's reach
-# is a per-run observing-set extension, not a policy change.
+# Emitted ONLY where every OBSERVED return type is applicable, so each is applied only where it
+# cannot raise (the type-directed AST in _OutputMutator._perturbed). Which modes a run measures is
+# decided by its observed codomain, which the certificate names as its observing set, so the static
+# census stays Fork-1. The TABLE itself is part of the two-sign policy manifest: adding, removing or
+# retyping a mode moves the two-sign policy id, since the same observed codomain then asks different
+# questions.
 _OUTPUT_TYPE_CONDITIONAL = (
     (
         "return_negate",
@@ -3100,6 +3234,123 @@ _OUTPUT_TYPE_CONDITIONAL = (
         "return_reorder",
         "return value -> reversed (is order load-bearing?)",
         frozenset({"list", "tuple"}),
+    ),
+    # The rest of Def. 11.8's Form A operators, each rewritten from _OUTPUT_TEMPLATES. Appended,
+    # never interleaved, so the modes above keep their order, ids and diffs.
+    (
+        "return_zero_of",
+        "return value -> the type's zero (is the output not trivially zero?)",
+        frozenset({"float", "complex", "Decimal", "Fraction"}),
+    ),
+    (
+        "return_type",
+        "return value -> the same value as another type (is the output type load-bearing?)",
+        frozenset({"str", "bytes", "bool", "int", "float"}),
+    ),
+    (
+        "return_not",
+        "return value -> its logical negation (is the boolean load-bearing?)",
+        frozenset({"bool"}),
+    ),
+    (
+        "return_true",
+        "return value -> True (must the predicate not be constantly true?)",
+        frozenset({"bool"}),
+    ),
+    (
+        "return_false",
+        "return value -> False (must the predicate not be constantly false?)",
+        frozenset({"bool"}),
+    ),
+    (
+        "return_plus_one",
+        "return value -> plus one (is the exact value pinned?)",
+        frozenset({"int", "float"}),
+    ),
+    (
+        "return_minus_one",
+        "return value -> minus one (is the exact value pinned?)",
+        frozenset({"int", "float"}),
+    ),
+    (
+        "return_next_up",
+        "return value -> the next float up (is the exact real value pinned?)",
+        frozenset({"float"}),
+    ),
+    (
+        "return_next_down",
+        "return value -> the next float down (is the exact real value pinned?)",
+        frozenset({"float"}),
+    ),
+    (
+        "return_scale",
+        "return value -> doubled (are magnitude and units load-bearing?)",
+        frozenset({"int", "float"}),
+    ),
+    (
+        "return_round",
+        "return value -> rounded to a whole number (is the precision load-bearing?)",
+        frozenset({"float"}),
+    ),
+    (
+        "return_inf",
+        "return value -> infinity (must the output be bounded?)",
+        frozenset({"float"}),
+    ),
+    (
+        "return_truncate",
+        "return value -> its last character dropped (is the full content load-bearing?)",
+        frozenset({"str", "bytes"}),
+    ),
+    (
+        "return_swapcase",
+        "return value -> its case swapped (is the case load-bearing?)",
+        frozenset({"str", "bytes"}),
+    ),
+    (
+        "return_pad",
+        "return value -> a trailing space appended (is the whitespace load-bearing?)",
+        frozenset({"str"}),
+    ),
+    (
+        "return_reverse",
+        "return value -> its characters reversed (is the character order load-bearing?)",
+        frozenset({"str", "bytes"}),
+    ),
+    (
+        "return_drop",
+        "return value -> one element dropped (are cardinality and every element load-bearing?)",
+        frozenset({"list", "tuple", "set", "frozenset", "dict"}),
+    ),
+    (
+        "return_duplicate",
+        "return value -> its last element repeated (is multiplicity load-bearing?)",
+        frozenset({"list", "tuple"}),
+    ),
+    (
+        "return_singleton",
+        "return value -> a single element (is the cardinality load-bearing?)",
+        frozenset({"list", "tuple", "set", "frozenset"}),
+    ),
+    (
+        "return_ctype",
+        "return value -> the sibling container type (is the container's contract load-bearing?)",
+        frozenset({"list", "tuple", "set", "frozenset"}),
+    ),
+    (
+        "return_field_default",
+        "return value -> its last field set to None (is each field's value load-bearing?)",
+        frozenset({"dict"}),
+    ),
+    (
+        "return_sortbreak",
+        "return value -> its first two elements transposed (is sortedness load-bearing?)",
+        frozenset({"list", "tuple"}),
+    ),
+    (
+        "return_adjacent",
+        "return value -> the adjacent moment (is the exact position in the order load-bearing?)",
+        frozenset({"date", "datetime", "timedelta"}),
     ),
 )
 

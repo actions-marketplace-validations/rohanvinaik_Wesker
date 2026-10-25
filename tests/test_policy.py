@@ -18,6 +18,7 @@ from dataclasses import asdict
 from Wesker.engine import (
     _EXCEPTION_SUB_MODES,
     _OUTPUT_SUB_MODES,
+    _OUTPUT_TYPE_CONDITIONAL,
     _STATE_SUB_MODES,
     MutationCategory,
     _SwapMutator,
@@ -156,6 +157,20 @@ def test_manifest_sub_modes_are_the_engine_tuples():
     assert mutation_policy(two_sign=True).categories["OUTPUT"]["sub_modes"] == dict(
         _OUTPUT_SUB_MODES
     )
+
+
+def test_two_sign_manifest_declares_the_type_conditional_table():
+    # #44: Fork 2's table is the question set a two-sign run asks of an observed codomain. It was
+    # left out of the manifest ("type-conditional perturbations are out of this policy"), so adding
+    # 23 operators to it would not have moved the two-sign id, and a receipt measured before them
+    # would have read as current. Derived from the engine table, never restated.
+    two = mutation_policy(two_sign=True)
+    assert two.categories["OUTPUT"]["type_conditional"] == {
+        mode: {"question": desc, "types": sorted(types)}
+        for mode, desc, types in _OUTPUT_TYPE_CONDITIONAL
+    }
+    # The id before #44 (Wesker 204a760, policy 9). Its universe lacked the new operators.
+    assert two.policy_id != "9+neg.aaff90df3dbf"
 
 
 def test_manifest_duals_are_the_engine_table():

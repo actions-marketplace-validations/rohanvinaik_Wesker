@@ -40,6 +40,7 @@ from .engine import (
     _DATAFLOW_SUB_MODES,
     _EXCEPTION_SUB_MODES,
     _OUTPUT_SUB_MODES,
+    _OUTPUT_TYPE_CONDITIONAL,
     _STATE_SUB_MODES,
     MutationCategory,
     _ArithmeticMutator,
@@ -105,6 +106,9 @@ from .swap_plan import SWAP_PAIR_BUDGET
 # 9: an existing `return None` is no longer a STATE return_none target — the
 #    rewrite was the original program, an empty-diff survivor no test can kill.
 #    The corpus gained fp_return_none, so the change is visible in the counts.
+#    (Not a bump: #44 added the rest of Def. 11.8's μ⁻ operators to the TWO-SIGN manifest, which
+#    moves only the `+neg` digest. The one-sign universe did not change, so its id and every
+#    one-sign receipt stay valid; a shared counter bump would have invalidated them for nothing.)
 POLICY_VERSION = 9
 
 # The behavioral fingerprint corpus: small functions that together reach every
@@ -361,10 +365,17 @@ def _categories(two_sign: bool = False) -> dict[str, dict[str, Any]]:
                 "is the output's existence and input-dependence pinned? (μ⁻ Form A)"
             ),
             "sub_modes": {mode: desc for mode, desc in _OUTPUT_SUB_MODES},
+            # Fork 2 (Def. 11.10): which of these a run measures is decided by its observed
+            # codomain, but the table is the question set, so it belongs to the policy.
+            "type_conditional": {
+                mode: {"question": desc, "types": sorted(types)}
+                for mode, desc, types in _OUTPUT_TYPE_CONDITIONAL
+            },
             "form": (
-                "A — return-site rewrite; always-applicable perturbations only "
-                "(the independence pair + existence). Type-conditional perturbations "
-                "and Form B are out of this policy."
+                "A — return-site rewrite. sub_modes apply to every return (Fork 1); a "
+                "type_conditional mode applies only where every observed return type is "
+                "in its types (Fork 2, output_mode_applies), and never raises there. "
+                "Form B is out of this policy."
             ),
         }
     return cats
@@ -517,6 +528,9 @@ def mutation_policy(two_sign: bool = False) -> MutationPolicy:
             "operator": "mu-minus",
             "form": "A",
             "sub_modes": [mode for mode, _desc in _OUTPUT_SUB_MODES],
+            "type_conditional": [
+                mode for mode, _desc, _types in _OUTPUT_TYPE_CONDITIONAL
+            ],
         }
     canonical = json.dumps(manifest, sort_keys=True, separators=(",", ":"))
     digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:12]
