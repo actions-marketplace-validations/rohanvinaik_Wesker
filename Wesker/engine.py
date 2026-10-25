@@ -4236,10 +4236,12 @@ def build_session_baseline(
         if outcome is not None:
             inert.add(id(test_fn))
             current_inert.append(test_id)
-            if outcome == "assertion":
+            if baseline_failure_standing(outcome, typed) == "wrong_expectation":
                 # An assertion that fails on correct code is a WRONG EXPECTATION — the
                 # narrower thing failing_on_baseline reports to a human. Other outcomes
-                # are ambiguous and are barred from attribution without accusation.
+                # are ambiguous and are barred from attribution without accusation, and so
+                # is an assertion pytest did not count as the test's own verdict (a fixture's
+                # setup, a teardown — typed `error`), which the run code alone cannot tell (#17).
                 failing.append(test_id)
     pending: PendingPersist | None = None
     if project_root and cache is not None and not persist:
@@ -4372,6 +4374,33 @@ def baseline_probe_disposition(outcome: str | None) -> str:
     return "inert"
 
 
+def baseline_failure_standing(run_code: str | None, outcome: str) -> str:
+    """Whether a test's baseline run is a WRONG EXPECTATION a person should read (#17, pure — pinned).
+
+    ``failing_tests`` names the narrower thing a human can act on: an assertion that fails on the
+    UNMUTATED program. Both baselines decided it from the run code alone — ``"assertion"`` — one line
+    after computing the TYPED outcome (`trace_evidence.baseline_outcome`) from the same run. The run
+    code cannot see which pytest PHASE raised: a fixture whose setup asserts is an AssertionError too,
+    so pytest's ERROR was filed as a failed expectation and Detective's audit told the reader "is the
+    TEST's expectation wrong, or is the CODE broken?" about a test that never reached its own
+    assertions (measured 2026-10-25: typed ``error``, named in ``failing_tests``).
+
+      "wrong_expectation"    the run raised AssertionError AND pytest says the test ``failed``: its
+                             own assertion does not hold on the original. The only code that names.
+      "not_an_expectation"   it raised AssertionError, but the typed outcome says it never ran to a
+                             verdict of its own (``error``: setup or teardown) or pytest does not count
+                             it (``skipped`` / ``xfailed``, or a category this does not know). Barred
+                             from attribution like any inert test, accused of nothing.
+      "not_failing"          no AssertionError at all. Other run codes stay barred without accusation,
+                             as before: under the direct-call contract a crash is ambiguous.
+    """
+    if run_code != "assertion":
+        return "not_failing"
+    if outcome == "failed":
+        return "wrong_expectation"
+    return "not_an_expectation"
+
+
 def _baseline_failures(
     test_functions: list[Callable[..., None]],
     original_func: Callable[..., Any] | None,
@@ -4457,12 +4486,16 @@ def _baseline_failures(
                     run_code = _run_test_with_timeout(
                         test_fn, probe, patched, timeout_ms
                     )
-                    if assertions is not None and run_code == "assertion":
+                    typed = baseline_outcome(run_code, callable_item_status(test_fn))
+                    # A wrong expectation by the TYPED outcome, not the run code alone (#17).
+                    if (
+                        assertions is not None
+                        and baseline_failure_standing(run_code, typed)
+                        == "wrong_expectation"
+                    ):
                         assertions.append(callable_test_id(test_fn))
                     if outcomes is not None:
-                        outcomes[callable_test_id(test_fn)] = baseline_outcome(
-                            run_code, callable_item_status(test_fn)
-                        )
+                        outcomes[callable_test_id(test_fn)] = typed
                     disposition = baseline_probe_disposition(run_code)
                     # An uncontained probe is BOTH: inert, because a test that never finished
                     # cannot be credited with distinguishing anything; and a containment failure,

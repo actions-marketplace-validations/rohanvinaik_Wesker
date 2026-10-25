@@ -53,6 +53,12 @@
     "refusal": "",
     "standing": "complete"
   },
+  "Wesker/engine.py::baseline_failure_standing": {
+    "cut_reasons": [],
+    "function_digest": "983ad7f1bb7769ef",
+    "refusal": "",
+    "standing": "complete"
+  },
   "Wesker/engine.py::baseline_probe_disposition": {
     "cut_reasons": [],
     "function_digest": "f3326547ffa1b1b4",
