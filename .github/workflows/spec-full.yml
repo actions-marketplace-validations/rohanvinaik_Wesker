@@ -15,6 +15,8 @@
 # slowest run this job has completed (39 min, 2026-09-21). A run that stalls must end with
 # evidence of where it stalled, so WESKER_STACK_DUMP_S dumps every thread's stack every 15 minutes
 # to a private copy of stderr — every push of 2026-10-24 sat silent for six hours and left none.
+# The dump runs on a clock of its own (a child process signalling SIGURG): pytest cancels
+# faulthandler's own timer on every failing test, which silenced the first version of this (W#29).
 # A newer push supersedes a running measurement of older code (`concurrency`).
 #
 # Actions are pinned to full commit SHAs (the release in the trailing comment): a tag can be moved

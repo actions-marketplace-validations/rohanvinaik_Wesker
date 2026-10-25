@@ -6,7 +6,11 @@ leaves no stack, so the stall could not be located. ``WESKER_STACK_DUMP_S`` arms
 all-thread dump on a PRIVATE copy of stderr, because the live session captures (and hostile
 mutants of the capture machinery can close) fd 2 for long stretches of the run.
 
-The descriptor behaviour is process-global, so the wiring cases run in a subprocess.
+The descriptor behaviour is process-global, so the wiring cases run in a subprocess. A dump is
+counted by its thread header, "(most recent call first)": these scripts run one Python thread,
+so one header is one dump. The first version counted faulthandler's "Timeout (" banner, which
+only its own timer prints; that timer is gone (pytest cancels it on every failing test, W#29),
+and the clock that replaced it signals a registered handler, which prints no banner.
 """
 
 from __future__ import annotations
@@ -76,8 +80,7 @@ def test_the_dump_reaches_the_real_stderr_after_fd2_is_captured(tmp_path):
     assert proc.returncode == 0, proc.stderr
     assert "finished" in proc.stdout
     # One dump fired before the cancel, on the private descriptor, and none after it.
-    assert proc.stderr.count("Timeout (") == 1, proc.stderr
-    assert "most recent call first" in proc.stderr
+    assert proc.stderr.count("most recent call first") == 1, proc.stderr
 
 
 _MAIN_WITH_A_SLOW_PROFILE = """
@@ -97,21 +100,21 @@ _MAIN_WITH_A_SLOW_PROFILE = """
 def test_main_arms_the_dump_around_profiling_when_asked(tmp_path):
     proc = _run(_MAIN_WITH_A_SLOW_PROFILE, "1", tmp_path)
     assert proc.returncode == 1, proc.stderr
-    assert proc.stderr.count("Timeout (") == 1, proc.stderr
+    assert proc.stderr.count("most recent call first") == 1, proc.stderr
     assert "WESKER REFUSED TO REPORT" in proc.stderr
 
 
 def test_main_arms_nothing_by_default(tmp_path):
     proc = _run(_MAIN_WITH_A_SLOW_PROFILE, None, tmp_path)
     assert proc.returncode == 1, proc.stderr
-    assert "Timeout (" not in proc.stderr
+    assert "most recent call first" not in proc.stderr
     assert "WESKER_STACK_DUMP_S" not in proc.stderr
 
 
 def test_a_malformed_setting_is_named_and_arms_nothing(tmp_path):
     proc = _run(_MAIN_WITH_A_SLOW_PROFILE, "fifteen minutes", tmp_path)
     assert proc.returncode == 1, proc.stderr
-    assert "Timeout (" not in proc.stderr
+    assert "most recent call first" not in proc.stderr
     assert (
         "WESKER_STACK_DUMP_S must be a positive whole number of seconds" in proc.stderr
     )

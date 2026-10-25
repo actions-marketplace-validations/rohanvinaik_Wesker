@@ -442,6 +442,26 @@ def stack_dump_setting(raw: str) -> tuple[str, int]:
     return "armed", seconds
 
 
+# The tick the dump clock sends. SIGURG is ignored by default, so if the code under measurement
+# ever replaces or removes the handler, a stray tick is dropped instead of ending the run.
+_DUMP_SIGNAL = "SIGURG"
+
+# The dump clock: a child that signals its parent every `every` seconds until it is terminated
+# or its parent is gone. Standard library only, and it holds none of the parent's pipes.
+_DUMP_CLOCK = (
+    "import os, sys, time\n"
+    "parent, every, signum = int(sys.argv[1]), float(sys.argv[2]), int(sys.argv[3])\n"
+    "while True:\n"
+    "    time.sleep(every)\n"
+    "    if os.getppid() != parent:\n"
+    "        break\n"
+    "    try:\n"
+    "        os.kill(parent, signum)\n"
+    "    except OSError:\n"
+    "        break\n"
+)
+
+
 def _arm_stack_dump(seconds: int) -> Callable[[], None]:
     """Arm a periodic all-thread stack dump on a PRIVATE copy of stderr; return its cancel.
 
@@ -449,26 +469,70 @@ def _arm_stack_dump(seconds: int) -> Callable[[], None]:
     self-profiling runs mutants of that capture machinery, so fd 2 can point at a capture file —
     or be closed — for long stretches of the run (see ``_stream_reentry``). A dump written to fd 2
     there vanishes with the capture. A descriptor duplicated before profiling starts still reaches
-    the CI log. ``repeat=True`` and no exit: the job's own time limit ends the run, and successive
-    dumps show whether a stall moves. A diagnostic must never break the run it observes, so a
-    failure to arm degrades to a cancel that does nothing.
+    the CI log. No exit: the job's own time limit ends the run, and successive dumps show whether
+    a stall moves. A diagnostic must never break the run it observes, so a failure to arm
+    degrades to a cancel that does nothing.
+
+    THE CLOCK IS ITS OWN PROCESS (W#29). The first version armed
+    ``faulthandler.dump_traceback_later``, which is ONE process-wide timer. pytest's own
+    faulthandler plugin cancels that timer in ``pytest_exception_interact``, unconditionally, on
+    every failing test (and on entering pdb). A self-measurement fails tests within seconds, so
+    the dump armed before profiling was gone long before the stall. The 636 s local reproduction
+    printed nothing, and sampling it showed no watchdog thread at all. Measured directly: a 1 s
+    timer stops the moment pytest.main runs one failing test, and keeps going across a passing
+    one. Now faulthandler dumps from a SIGURG handler (``faulthandler.register``, C-level, so it
+    fires while every Python thread is deadlocked), and a separate child process sends the signal
+    every ``seconds``. Nothing pytest or the measured code does to faulthandler's timer reaches it.
     """
     import faulthandler
+    import signal
 
+    signum = getattr(signal, _DUMP_SIGNAL, None)
+    if signum is None or not hasattr(faulthandler, "register"):
+        print(
+            "WARNING: WESKER_STACK_DUMP_S needs POSIX signals; no stack dump is armed",
+            file=sys.stderr,
+        )
+        return lambda: None
     try:
         stream = os.fdopen(os.dup(sys.stderr.fileno()), "w")
     # BLE001: a diagnostic degrades silently; it never fails the run it observes
     except Exception:  # noqa: BLE001
         return lambda: None
     try:
-        faulthandler.dump_traceback_later(seconds, repeat=True, file=stream)
+        faulthandler.register(signum, file=stream, all_threads=True, chain=False)
     # BLE001: a diagnostic degrades silently; it never fails the run it observes
     except Exception:  # noqa: BLE001
         stream.close()
         return lambda: None
+    try:
+        clock = subprocess.Popen(
+            [
+                sys.executable,
+                "-c",
+                _DUMP_CLOCK,
+                str(os.getpid()),
+                str(seconds),
+                str(signum),
+            ],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    # BLE001: a diagnostic degrades silently; it never fails the run it observes
+    except Exception:  # noqa: BLE001
+        faulthandler.unregister(signum)
+        stream.close()
+        return lambda: None
 
     def cancel() -> None:
-        faulthandler.cancel_dump_traceback_later()
+        clock.terminate()
+        try:
+            clock.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            clock.kill()
+            clock.wait()
+        faulthandler.unregister(signum)
         stream.close()
 
     return cancel
