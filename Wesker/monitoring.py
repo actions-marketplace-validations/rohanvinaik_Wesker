@@ -757,9 +757,8 @@ def subscribe(
                 # Purge match cache for this subscription. Snapshot the keys in one C call:
                 # discovery fills this cache without the lock, and a Python-level walk of the
                 # live dict would raise "changed size during iteration" mid-close.
-                keys_to_remove = [
-                    k for k in list(_selector_match_cache) if k[0] == sub_id
-                ]
+                cached_keys = list(_selector_match_cache)
+                keys_to_remove = [k for k in cached_keys if k[0] == sub_id]
                 for k in keys_to_remove:
                     _selector_match_cache.pop(k, None)
                 _recompute_global_events(tool)

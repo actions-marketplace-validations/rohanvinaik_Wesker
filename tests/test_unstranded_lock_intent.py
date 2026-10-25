@@ -94,8 +94,9 @@ def test_rlock_recursion_count_still_reports_depth() -> None:
 
 def test_a_raise_after_taking_gives_the_lock_back() -> None:
     real = threading.RLock()
+    interrupted = _RaisesAfterTaking(real, Abandoned())
     with pytest.raises(Abandoned):
-        acquire_unstranded(_RaisesAfterTaking(real, Abandoned()))
+        acquire_unstranded(interrupted)
     assert _depth(real) == 0
     got: list[bool] = []
     t = threading.Thread(target=lambda: got.append(real.acquire(timeout=1)))
@@ -110,10 +111,11 @@ def test_a_reentrant_raise_after_taking_undoes_only_its_own_acquire() -> None:
     """The thread already holds the lock once. The interrupted re-entrant acquire is undone, and the
     outer hold survives intact. An `_is_owned()` test would read True either way and could not tell."""
     real = threading.RLock()
+    interrupted = _RaisesAfterTaking(real, Abandoned())
     real.acquire()
     try:
         with pytest.raises(Abandoned):
-            acquire_unstranded(_RaisesAfterTaking(real, Abandoned()))
+            acquire_unstranded(interrupted)
         assert _depth(real) == 1
     finally:
         real.release()
@@ -124,13 +126,14 @@ def test_a_raise_before_taking_releases_nothing() -> None:
     """Nothing was taken, so nothing is given back: no RuntimeError from releasing an unowned lock,
     and a re-entrant caller's outer hold is not spent on an acquire that never happened."""
     real = threading.RLock()
+    signalled = _RaisesBeforeTaking(real, KeyboardInterrupt())
     with pytest.raises(KeyboardInterrupt):
-        acquire_unstranded(_RaisesBeforeTaking(real, KeyboardInterrupt()))
+        acquire_unstranded(signalled)
     assert _depth(real) == 0
     real.acquire()
     try:
         with pytest.raises(KeyboardInterrupt):
-            acquire_unstranded(_RaisesBeforeTaking(real, KeyboardInterrupt()))
+            acquire_unstranded(signalled)
         assert _depth(real) == 1
     finally:
         real.release()
@@ -262,21 +265,16 @@ def test_an_abandoned_worker_parked_in_discovery_leaves_the_broker_lock_free(
         os.environ,
         PYTHONPATH=os.pathsep.join([str(REPO), os.environ.get("PYTHONPATH", "")]),
     )
-    try:
-        proc = subprocess.run(
-            [sys.executable, "-c", _BROKER_SCENARIO, str(tmp_path)],
-            capture_output=True,
-            text=True,
-            timeout=60,
-            env=env,
-            check=False,
-        )
-    except (
-        subprocess.TimeoutExpired
-    ) as exc:  # pragma: no cover - the defect's own symptom
-        pytest.fail(
-            f"the scenario hung (stranded broker lock, W#29): {exc.stdout!r} {exc.stderr!r}"
-        )
+    # No try/except around the run: a stranded lock hangs the scenario, and its own faulthandler
+    # deadline (15 s, exit=True) prints every thread's stack and exits long before this timeout.
+    proc = subprocess.run(
+        [sys.executable, "-c", _BROKER_SCENARIO, str(tmp_path)],
+        capture_output=True,
+        text=True,
+        timeout=60,
+        env=env,
+        check=False,
+    )
     transcript = proc.stdout + proc.stderr
     assert "PARKED" in proc.stdout, transcript
     assert "ABANDON_RETURNED False" in proc.stdout, (
