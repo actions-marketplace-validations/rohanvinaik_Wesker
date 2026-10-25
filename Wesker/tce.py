@@ -52,6 +52,10 @@ from typing import Any
 #: the one discipline the whole tool's credibility rests on.
 WARRANT_BYTECODE = "bytecode_identity"
 
+#: The filename every TCE compilation carries: both sides of a comparison must compile under the
+#: same name, or the code objects differ on `co_filename` alone.
+_TCE_FILENAME = "<tce>"
+
 
 def _op_key(ins: Any) -> tuple:
     """One instruction reduced to what the interpreter will DO with it.
@@ -171,8 +175,8 @@ def bytecode_equivalent(original_src: str, mutant_src: str) -> bool:
     user could not have answered.
     """
     try:
-        a = compile(original_src, "<tce>", "exec")
-        b = compile(mutant_src, "<tce>", "exec")
+        a = compile(original_src, _TCE_FILENAME, "exec")
+        b = compile(mutant_src, _TCE_FILENAME, "exec")
     except (SyntaxError, ValueError, MemoryError, RecursionError):
         return False
     return code_identical(a, b)
@@ -187,7 +191,7 @@ def compute_node_key(node: Any) -> tuple | None:
     """
     try:
         src = ast.unparse(node)
-        code = compile(src, "<tce>", "exec")
+        code = compile(src, _TCE_FILENAME, "exec")
         return _code_key(code)
     except (SyntaxError, ValueError, MemoryError, RecursionError):
         return None
@@ -211,7 +215,7 @@ def nodes_equivalent(
     try:
         if original_key is not None:
             mutant_src = ast.unparse(mutant_node)
-            mutant_code = compile(mutant_src, "<tce>", "exec")
+            mutant_code = compile(mutant_src, _TCE_FILENAME, "exec")
             return original_key == _code_key(mutant_code)
         return bytecode_equivalent(ast.unparse(original_node), ast.unparse(mutant_node))
     # BLE001: an optimisation must never fail the run

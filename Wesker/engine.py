@@ -7035,6 +7035,56 @@ def _is_declared_failure(exc: BaseException) -> bool:
     )
 
 
+def _test_signature_view(fn: Any, follow_wrapped: bool) -> Any:
+    """A binding-only view of a test callable, never executed and never mutated (#47).
+
+    Peels bound methods, partials and callable instances down to the function whose
+    parameters decide binding; with ``follow_wrapped`` it follows a ``functools.wraps`` chain
+    to the ADVERTISED signature. A plain function becomes a copy without ``__annotations__``
+    or ``__annotate__``, so binding never evaluates a deferred annotation (3.14).
+    """
+    import inspect
+    from functools import partial
+
+    # Explicit signature declarations already supply parameter metadata.
+    if getattr(fn, "__signature__", None) is not None:
+        return fn
+    if isinstance(fn, types.MethodType):
+        return types.MethodType(
+            _test_signature_view(fn.__func__, follow_wrapped), fn.__self__
+        )
+    if follow_wrapped:
+        unwrapped = inspect.unwrap(
+            fn,
+            stop=lambda candidate: (
+                getattr(candidate, "__signature__", None) is not None
+            ),
+        )
+        if unwrapped is not fn:
+            return _test_signature_view(unwrapped, False)
+    if isinstance(fn, types.FunctionType):
+        # FunctionType supplies binding metadata without copying __annotations__
+        # or __annotate__. Never execute this view or mutate the original function.
+        view = types.FunctionType(
+            fn.__code__,
+            fn.__globals__,
+            fn.__name__,
+            fn.__defaults__,
+            fn.__closure__,
+        )
+        view.__kwdefaults__ = fn.__kwdefaults__
+        return view
+    if isinstance(fn, partial):
+        return partial(
+            _test_signature_view(fn.func, follow_wrapped), *fn.args, **fn.keywords
+        )
+    if not inspect.isclass(fn):
+        call = inspect.getattr_static(type(fn), "__call__", None)
+        if isinstance(call, (types.FunctionType, staticmethod, classmethod)):
+            return _test_signature_view(call.__get__(fn, type(fn)), follow_wrapped)
+    return fn
+
+
 def _test_call_args(test_fn: Callable[..., None], mutated_func: Any) -> tuple[Any, ...]:
     """Choose an injected or empty call without executing the test (#47).
 
@@ -7044,47 +7094,6 @@ def _test_call_args(test_fn: Callable[..., None], mutated_func: Any) -> tuple[An
     """
     import inspect
     import sys
-    import types
-    from functools import partial
-
-    def _signature_view(fn: Any, follow_wrapped: bool) -> Any:
-        # Explicit signature declarations already supply parameter metadata.
-        if getattr(fn, "__signature__", None) is not None:
-            return fn
-        if isinstance(fn, types.MethodType):
-            return types.MethodType(
-                _signature_view(fn.__func__, follow_wrapped), fn.__self__
-            )
-        if follow_wrapped:
-            unwrapped = inspect.unwrap(
-                fn,
-                stop=lambda candidate: (
-                    getattr(candidate, "__signature__", None) is not None
-                ),
-            )
-            if unwrapped is not fn:
-                return _signature_view(unwrapped, False)
-        if isinstance(fn, types.FunctionType):
-            # FunctionType supplies binding metadata without copying __annotations__
-            # or __annotate__. Never execute this view or mutate the original function.
-            view = types.FunctionType(
-                fn.__code__,
-                fn.__globals__,
-                fn.__name__,
-                fn.__defaults__,
-                fn.__closure__,
-            )
-            view.__kwdefaults__ = fn.__kwdefaults__
-            return view
-        if isinstance(fn, partial):
-            return partial(
-                _signature_view(fn.func, follow_wrapped), *fn.args, **fn.keywords
-            )
-        if not inspect.isclass(fn):
-            call = inspect.getattr_static(type(fn), "__call__", None)
-            if isinstance(call, (types.FunctionType, staticmethod, classmethod)):
-                return _signature_view(call.__get__(fn, type(fn)), follow_wrapped)
-        return fn
 
     injected = (mutated_func,)
     signature_options: dict[str, Any] = {}
@@ -7095,13 +7104,15 @@ def _test_call_args(test_fn: Callable[..., None], mutated_func: Any) -> tuple[An
         signature_options["annotation_format"] = Format.STRING
     try:
         actual = inspect.signature(
-            _signature_view(test_fn, False), follow_wrapped=False, **signature_options
+            _test_signature_view(test_fn, False),
+            follow_wrapped=False,
+            **signature_options,
         )
     except (TypeError, ValueError):
         return injected
     try:
         advertised = inspect.signature(
-            _signature_view(test_fn, True), **signature_options
+            _test_signature_view(test_fn, True), **signature_options
         )
     except (TypeError, ValueError):
         advertised = actual
@@ -9468,6 +9479,14 @@ def run_function_converged(
     if _ident is None:
         _ident = _live_collection_identity()
     _identity_standing, _identity_conflicts, _identity_basis = _ident
+    # W#21: "cut" when a mutant hit the worker's memory cap, else the enforced/telemetry
+    # capability; "n/a" in-process, where no worker cap exists.
+    if not isolated:
+        _memory_standing = "n/a"
+    elif _mem_cut:
+        _memory_standing = "cut"
+    else:
+        _memory_standing = memory_enforcement_standing(_mem_enforced)
 
     return ProfilingResult(
         function_key=func_key,
@@ -9483,11 +9502,7 @@ def run_function_converged(
         dof_pinned=len(dims_pinned),
         coverage_depth=depth,
         execution_mode="isolated" if isolated else "in_process",
-        memory_standing=(
-            "cut" if _mem_cut else memory_enforcement_standing(_mem_enforced)
-        )
-        if isolated
-        else "n/a",
+        memory_standing=_memory_standing,
         is_gateable=_measurement_gateable(
             depth == "profiled" and not unscored_records,
             all_contained,
