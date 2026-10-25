@@ -8540,20 +8540,14 @@ def run_function_profiling(
         ),
         collection_conflicts=_identity_conflicts,
         proof_basis=_identity_basis,
-        # A cut is any invalid measurement — budget overrun OR an uncontained worker (#13/#14),
+        # A cut is a RUN that stopped short — budget overrun OR an uncontained worker (#13/#14),
         # from the mutation loop OR the baseline trace (#19): the depth must not read "profiled"
-        # when the run stopped short or ran against a live abandoned worker. is_gateable already
-        # reflects both; coverage_depth now agrees.
-        coverage_depth=(
-            "cut"
-            if budget_exhausted
-            or not _contained
-            or any(
-                r["disposition"] in ("diverged", "undetermined")
-                for r in unscored_records
-            )
-            else "profiled"
-        ),
+        # when the run stopped short or ran against a live abandoned worker. A per-mutant outcome
+        # (`diverged`, `undetermined`, #27) is not a cut: every mutant was evaluated, and the
+        # unscored record already names the ones that reached no verdict. Marking the depth "cut"
+        # for them told every consumer the universe was never measured (Detective #80), while
+        # is_gateable stays False through the unscored records either way.
+        coverage_depth="cut" if budget_exhausted or not _contained else "profiled",
         # Which execution mode measured this (#19): `isolated` ran each mutant in a killable worker
         # PROCESS — containment is a real guarantee — while `in_process` shares the interpreter and
         # can only ASK a runaway thread to stop. `execution_mode_standing` (4c) turns this into a
@@ -8857,6 +8851,38 @@ def check_equivalent(
 
 
 # ── Multi-Pass Convergence ───────────────────────────────────────
+
+
+def converged_coverage_depth(
+    budget_exhausted: bool,
+    contained: bool,
+    memory_cut: bool,
+    evaluated: int,
+    universe: int,
+    passes: int,
+) -> str:
+    """How much of the mutant universe a converged run measured (W#27, pure — pinned).
+
+    * ``cut``       — the RUN stopped short: the budget overran, a worker could not be contained
+      (#13/#14) or a mutant hit the worker's memory cap (W#21). An invalid measurement, never a
+      sample, so the codebase rollup and the CI gate drop it rather than count it.
+    * ``profiled``  — every universe mutant was EVALUATED.
+    * ``converged`` — a sample deepened over several passes.
+    * ``sampled``   — a single-pass sample.
+
+    ``evaluated`` counts scored AND unscored mutants. A mutant that reached no verdict (`diverged`,
+    `undetermined`, `not_entered`, ...) was still evaluated, and its unscored record names why;
+    comparing only the SCORED count against the universe read every such run as a sample, and the
+    per-mutant outcomes #27 added were folded into "cut" — a universe Detective then reported as
+    "cut before it was measured" beside "every operator-universe mutant tested" (Detective #80).
+    """
+    if budget_exhausted or not contained or memory_cut:
+        return "cut"
+    if evaluated >= universe > 0:
+        return "profiled"
+    if passes > 1:
+        return "converged"
+    return "sampled"
 
 
 @_measurement_boundary
@@ -9451,27 +9477,16 @@ def run_function_converged(
     survived = total - killed
     budget_exhausted = _elapsed(start) > budget_ms
 
-    # Determine coverage depth
-    if (
-        budget_exhausted
-        or not all_contained
-        or _mem_cut
-        or any(
-            r["disposition"] in ("diverged", "undetermined") for r in unscored_records
-        )
-    ):
-        # An INVALIDATED measurement — the budget overran or a worker could not be contained
-        # (#13/#14) — is CUT, not a legitimate sample: `is_gateable` is already False, and marking
-        # the depth "cut" (as the exhaustive path does) is what lets the codebase rollup and the CI
-        # gate DROP it rather than count it as a completeness measurement. A clean sample keeps its
-        # own depth below; only invalidation overrides to "cut".
-        depth = "cut"
-    elif total >= universe > 0:
-        depth = "profiled"
-    elif passes > 1:
-        depth = "converged"
-    else:
-        depth = "sampled"
+    # An INVALIDATED run is CUT, never a sample, so the rollup and the CI gate drop it; per-mutant
+    # outcomes are counted as evaluated, never as a cut (see `converged_coverage_depth`).
+    depth = converged_coverage_depth(
+        budget_exhausted,
+        all_contained,
+        _mem_cut,
+        total + sum(cr.unscored for cr in per_cat),
+        universe,
+        passes,
+    )
 
     # Read ONCE per result, next to the gate that consumes it (#58): the live collection's
     # own answer about module identity, not a reconstruction of it.

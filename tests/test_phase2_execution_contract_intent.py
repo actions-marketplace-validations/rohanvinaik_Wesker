@@ -113,7 +113,10 @@ def test_converged_unresolved_outcome_keeps_identity_and_denominators(
     )
     assert result.total_mutants == result.total_killed == result.dof_covered == 0
     assert not result.is_gateable
-    assert result.coverage_depth == "cut"
+    # A per-mutant outcome was evaluated; it is never a run-level cut (Detective #80). It stays out
+    # of the gateable verdict through its unscored record, asserted above and below. The converged
+    # path reads `sampled` here only because generation is patched to one mutant of a larger universe.
+    assert result.coverage_depth != "cut"
     assert result.survivor_records == []
     assert result.unscored_records[0]["disposition"] == (
         "undetermined" if outcome == "timeout" else outcome

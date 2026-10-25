@@ -1916,6 +1916,33 @@ def truncation_cause(
     return "uncontained"
 
 
+def unresolved_cause(unscored_by: dict) -> str:
+    """Whether a function evaluated in FULL still holds mutants with no verdict (#27, pure — pinned).
+
+    Truncation answers whether the RUN stopped short. This answers the other question a completeness
+    number depends on: whether every evaluated mutant reached a verdict. The two used to share one
+    signal — a per-mutant outcome set ``coverage_depth="cut"`` — so a function whose every mutant
+    was evaluated was refused as "only PARTIALLY evaluated" under the remedy for a test that could
+    not be stopped, which is false of both. They are separate facts with separate remedies:
+
+      "undetermined"  a mutant reached the wall-clock bound without a verdict: no kill, no survival,
+                      nothing established. Named first, because it is the one with no evidence at all.
+      "diverged"      a mutant exceeded a deterministic step budget relative to the original's
+                      iterations: budget-relative evidence, never a kill and never proof of
+                      nontermination.
+      "resolved"      every evaluated mutant reached a verdict (other unscored outcomes have their own
+                      owners and are not this decision's business).
+
+    Read off ``unscored_by``, the per-disposition counts `ProfilingResult.to_dict` emits, so the
+    rollup consumes the engine's record instead of re-deriving it.
+    """
+    if unscored_by.get("undetermined", 0):
+        return "undetermined"
+    if unscored_by.get("diverged", 0):
+        return "diverged"
+    return "resolved"
+
+
 # The remedy each cause needs, in the order a reader should act on them: a worker that could not be
 # stopped is the one no budget fixes, so it comes first.
 _TRUNCATION_REMEDIES = (
@@ -2006,6 +2033,61 @@ def describe_truncation(truncated: list[dict], limit: int = 20) -> str:
     return "\n".join(blocks)
 
 
+# The remedy each unresolved cause needs. Neither is a budget problem by default: a larger budget
+# helps an undetermined mutant only when it was merely slow, and never a diverged one.
+_UNRESOLVED_REMEDIES = (
+    (
+        "undetermined",
+        (
+            "A mutant reached the wall-clock bound without a verdict — no kill and no survival, so "
+            "its question is missing from both sides of the ratio. Most often the mutant does not "
+            "terminate on a test's input: a deterministic step budget decides that, and more budget "
+            "helps only a mutant that was merely slow."
+        ),
+    ),
+    (
+        "diverged",
+        (
+            "A mutant exceeded the deterministic step budget relative to the original's iterations "
+            "— budget-relative evidence, never a kill and never proof of nontermination, so its "
+            "question is missing from both sides of the ratio."
+        ),
+    ),
+)
+
+
+def describe_unresolved(unresolved: list[dict], limit: int = 20) -> str:
+    """The functions holding mutants with no verdict, grouped by cause under its remedy (pure).
+
+    The sibling of `describe_truncation`, for a run that was NOT cut: one renderer for the Action's
+    refusal and the CLI's warning, naming each function and the mutants that reached no verdict.
+    """
+    remedies = dict(_UNRESOLVED_REMEDIES)
+    known = [cause for cause, _ in _UNRESOLVED_REMEDIES]
+    recorded = {str(u.get("cause", "")) for u in unresolved}
+    blocks: list[str] = []
+    for cause in known + sorted(recorded - set(known)):
+        group = [u for u in unresolved if str(u.get("cause", "")) == cause]
+        if not group:
+            continue
+        header = (
+            remedies.get(cause) or f"No verdict, cause not recorded: {cause or 'none'}."
+        )
+        lines = [f"{header} [{len(group)}]"]
+        for u in group[:limit]:
+            mutants = [str(m) for m in (u.get("mutants") or [])]
+            named = ", ".join(mutants[:5]) + (
+                f", … +{len(mutants) - 5}" if len(mutants) > 5 else ""
+            )
+            lines.append(
+                f"  {u.get('function_key') or '?'} — {named or 'mutants not recorded'}"
+            )
+        if len(group) > limit:
+            lines.append(f"  … and {len(group) - limit} more")
+        blocks.append("\n".join(lines))
+    return "\n".join(blocks)
+
+
 def profile_codebase(
     project_root: str,
     targets: list[str],
@@ -2047,6 +2129,7 @@ def profile_codebase(
     total_equivalent = 0
     total_truncated = 0
     truncated_functions: list[dict] = []
+    unresolved_functions: list[dict] = []
     total_universe = 0
     total_dof = 0
     total_dof_covered = 0
@@ -2121,6 +2204,23 @@ def profile_codebase(
                         "tested": r.get("total_mutants", 0),
                         "universe": r.get("universe_size", 0),
                         "containment_lost": list(r.get("containment_lost") or []),
+                    }
+                )
+                continue
+            # A run that was NOT cut can still hold mutants with no verdict (#27). Before the depth
+            # stopped calling them a cut, they reached this gate as "truncated", named under the
+            # wrong remedy (a test that could not be stopped); now they reach it under their own.
+            unresolved = unresolved_cause(dict(r.get("unscored_by") or {}))
+            if unresolved != "resolved":
+                unresolved_functions.append(
+                    {
+                        "function_key": r.get("function_key", ""),
+                        "cause": unresolved,
+                        "mutants": [
+                            str(u.get("mutant_id", "?"))
+                            for u in (r.get("unscored_records") or [])
+                            if u.get("disposition") == unresolved
+                        ],
                     }
                 )
         total_truncated = len(truncated_functions)
@@ -2228,6 +2328,12 @@ def profile_codebase(
         # Which functions, and why (`truncation_cause`), so a refusal names the function and the
         # remedy instead of a count.
         "truncated_functions": truncated_functions,
+        # Functions evaluated in full whose universe still holds a mutant with no verdict
+        # (`unresolved_cause`): those mutants are missing from both sides of the ratio, so a
+        # non-zero count means the number is not a completeness measurement either — but nothing
+        # was cut, so it is reported apart from truncation, with its own remedy.
+        "total_unresolved": len(unresolved_functions),
+        "unresolved_functions": unresolved_functions,
         "passes": passes,
         "elapsed_ms": round(elapsed),
         "per_file": per_file,

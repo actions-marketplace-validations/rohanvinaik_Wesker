@@ -188,6 +188,40 @@ def gate_truncation(report: dict) -> str | None:
     )
 
 
+def gate_unresolved(report: dict) -> str | None:
+    """Refuse to call a run with no-verdict mutants a completeness measurement (#27).
+
+    The sibling of `gate_truncation` for a run that was NOT cut: every mutant was evaluated, but
+    some reached no verdict (a wall-clock bound fired, or a deterministic step budget was exceeded).
+    Those questions are missing from both sides of the ratio, exactly as a truncated run's are, so
+    the badge refuses — under their own remedy, never the "PARTIALLY evaluated" one, which is false
+    of a run that measured everything. ``--allow-truncation`` covers it as it did when these mutants
+    were reported as cuts.
+    """
+    unresolved = report.get("total_unresolved", 0)
+    if not unresolved:
+        return None
+    from Wesker.ci import describe_unresolved
+
+    detail = describe_unresolved(report.get("unresolved_functions") or [])
+    return (
+        f"{unresolved} function(s) were evaluated in full, but some mutants reached no verdict.\n"
+        "Those mutants are missing from both sides of the ratio, so this is not a completeness "
+        "measurement.\n" + detail
+    )
+
+
+def _completeness_refusal(report: dict, allow_sample: bool) -> str | None:
+    """The refusal a cut or unresolved run earns, or None — under ``allow_sample``, warnings instead."""
+    for refusal in (gate_truncation(report), gate_unresolved(report)):
+        if not refusal:
+            continue
+        if not allow_sample:
+            return refusal
+        print(f"\nWARNING: {refusal}", file=sys.stderr)
+    return None
+
+
 # ── Reporting ────────────────────────────────────────────────────
 
 
@@ -542,11 +576,9 @@ def main(argv: list[str] | None = None) -> int:
     for gate in (gate_execution_mode(report), gate_suite_health(report)):
         if gate:
             return _fail(gate)
-    truncation = gate_truncation(report)
-    if truncation and not args.allow_truncation:
-        return _fail(truncation)
-    if truncation:
-        print(f"\nWARNING: {truncation}", file=sys.stderr)
+    refusal = _completeness_refusal(report, args.allow_truncation)
+    if refusal:
+        return _fail(refusal)
 
     Path(".wesker").mkdir(exist_ok=True)
     Path(".wesker/mutation_report.json").write_text(json.dumps(report, indent=2))

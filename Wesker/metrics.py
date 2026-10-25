@@ -33,7 +33,7 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 
-from Wesker.ci import describe_truncation, profile_codebase
+from Wesker.ci import describe_truncation, describe_unresolved, profile_codebase
 from Wesker.self_profile import profiler_for_targets
 
 # ---------------------------------------------------------------------------
@@ -542,6 +542,24 @@ def main():
             print(
                 "\n".join("     " + ln for ln in detail.splitlines()), file=sys.stderr
             )
+    unresolved = mutation.get("total_unresolved", 0)
+    if unresolved:
+        # Evaluated in full, but with mutants that reached no verdict: missing from both sides of
+        # the ratio like a truncated run's, and named under their own remedy (#27).
+        print(
+            f"  !! WARNING: {unresolved} function(s) hold mutants with no verdict — the kill\n"
+            f"     rate below leaves those questions out of both sides of the ratio.",
+            file=sys.stderr,
+        )
+        print(
+            "\n".join(
+                "     " + ln
+                for ln in describe_unresolved(
+                    mutation.get("unresolved_functions") or []
+                ).splitlines()
+            ),
+            file=sys.stderr,
+        )
     equiv = mutation.get("total_equivalent", 0)
     universe = mutation.get("total_universe", 0)
     equiv_note = f" ({equiv} equivalent)" if equiv else ""

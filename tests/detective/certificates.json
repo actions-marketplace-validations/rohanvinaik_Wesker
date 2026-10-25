@@ -35,6 +35,12 @@
     "refusal": "",
     "standing": "complete"
   },
+  "Wesker/ci.py::unresolved_cause": {
+    "cut_reasons": [],
+    "function_digest": "9ddf71c42ab725ae",
+    "refusal": "",
+    "standing": "complete"
+  },
   "Wesker/engine.py::_baseline_failures": {
     "cut_reasons": [],
     "function_digest": "9ed39ddb1a438d8f",
@@ -56,6 +62,12 @@
   "Wesker/engine.py::baseline_reach": {
     "cut_reasons": [],
     "function_digest": "617f43ba6edc8de8",
+    "refusal": "",
+    "standing": "complete"
+  },
+  "Wesker/engine.py::converged_coverage_depth": {
+    "cut_reasons": [],
+    "function_digest": "3d4de3a4aec48071",
     "refusal": "",
     "standing": "complete"
   },
