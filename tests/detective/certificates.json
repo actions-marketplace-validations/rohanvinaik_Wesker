@@ -203,5 +203,11 @@
     "function_digest": "5a0e2f360f570d34",
     "refusal": "",
     "standing": "complete"
+  },
+  "Wesker/write_authority.py::write_authority_disposition": {
+    "cut_reasons": [],
+    "function_digest": "38b0d22b851bd2d4",
+    "refusal": "",
+    "standing": "complete"
   }
 }

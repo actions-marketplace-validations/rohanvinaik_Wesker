@@ -46,6 +46,8 @@ from typing import Any
 
 from Wesker.interrupt import Abandoned
 from Wesker.trace_evidence import item_run_status
+from Wesker.write_authority import declared_roots, session_write_roots
+from Wesker.write_authority import install as install_write_authority
 
 __all__ = ["run_in_session", "session_callables"]
 
@@ -521,14 +523,18 @@ def run_in_session(
                 return None
             box["ran"] = True
             try:
-                if quiet:
-                    with (
-                        contextlib.redirect_stdout(real_stdout),
-                        contextlib.redirect_stderr(real_stderr),
-                    ):
+                # The session's pytest temporary directory is its tests' write authority under a
+                # mutant (Detective #105). Read here, before any test runs against one: the first
+                # read creates it, and creating it rotates pytest's numbered directories.
+                with declared_roots(session_write_roots(session.config)):
+                    if quiet:
+                        with (
+                            contextlib.redirect_stdout(real_stdout),
+                            contextlib.redirect_stderr(real_stderr),
+                        ):
+                            box["result"] = body(calls, session)
+                    else:
                         box["result"] = body(calls, session)
-                else:
-                    box["result"] = body(calls, session)
             # BLE001: captured to re-raise below
             except BaseException as exc:  # noqa: BLE001
                 # pytest.main would otherwise absorb this (SystemExit especially) and the
@@ -591,6 +597,8 @@ def run_in_session(
     # consumer inside `body` admits only this session's manifest (#26). Reset in `finally` — with
     # the manifest token — restores the enclosing scope even if collection or the body raises.
     scope_token = _MEASUREMENT_SCOPE.set(next(_SCOPE_COUNTER))
+    # Before collection, so a temporary directory a test module or fixture creates is known (#105).
+    install_write_authority()
     try:
         os.chdir(project_root)
         if project_root not in sys.path:

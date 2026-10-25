@@ -36,6 +36,12 @@ import pytest
 
 from Wesker.isolation import aggregate_kill_reason, classify_kill_reason
 from Wesker.pytest_runner import _install_cheap_failure_repr
+from Wesker.write_authority import (
+    contain_writes,
+    declared_roots,
+    install,
+    session_write_roots,
+)
 
 
 def _build_mutant(target_file: str, func_name: str, mutant_source: str) -> Any | None:
@@ -134,6 +140,11 @@ class _MutantPlugin:
         #: kill reason, whatever pytest's exit code says about the stopped node.
         self.diverged_nodes: list[str] = []
         self._mutant_codes: tuple[Any, ...] = ()
+        #: The first node whose run against the mutant tried to write outside its write authority
+        #: (Detective #105), and the paths that run was prevented from writing. Such a node records
+        #: no kill reason: its failure is the guard's, never the mutant's.
+        self.write_blocked: str | None = None
+        self.blocked_writes: list[str] = []
 
     def pytest_collection_finish(self, session: Any) -> None:
         """Compile after pytest establishes the actual package/import regime."""
@@ -182,8 +193,12 @@ class _MutantPlugin:
             if patched or module_saved:
                 self.installed = True
             self.ran += 1
+            # Armed only here, where the mutant is installed (#105) — never around `pytest.main`,
+            # whose collection and basetemp creation are the harness's writes. The basetemp is read
+            # before arming because the first read creates it.
+            roots = session_write_roots(getattr(item, "config", None))
             try:
-                with arm:
+                with arm, declared_roots(roots), contain_writes() as blocked:
                     outcome = yield
             finally:
                 _unpatch_mutant(proof, patched, saved, target, self._func_name)
@@ -192,6 +207,12 @@ class _MutantPlugin:
         if arm.stopped:
             # Budget-relative, never a kill (W#27): whatever pytest made of the stopped node.
             self.diverged_nodes.append(getattr(item, "nodeid", ""))
+        if blocked and self.write_blocked is None:
+            # The guard's failure, never the mutant's (Detective #105).
+            self.write_blocked = getattr(item, "nodeid", None) or "?"
+            self.blocked_writes = list(dict.fromkeys(blocked))[:3]
+        # Both facts are recorded; the engine's per-mutant disposition ranks them.
+        if arm.stopped or blocked:
             return
         self._record(item, outcome, _is_declared_failure)
 
@@ -308,6 +329,9 @@ def _evaluate_full(
         "entered": bool(getattr(plugin._mutated, "entered", False)),
         # W#21: this mutant hit the worker's address-space cap — a budget CUT, not a kill.
         "memory_cut": plugin.memory_cut,
+        # Detective #105: a node whose write was prevented, and what it was prevented from writing.
+        "write_blocked": plugin.write_blocked,
+        "blocked_writes": plugin.blocked_writes,
     }
 
 
@@ -396,6 +420,8 @@ def _trace_baseline_run(target_abspath: str, node_ids: list[str]) -> dict[str, A
 
 
 def _setup(spec: dict[str, Any]) -> None:
+    # Before collection, so a temporary directory a test module or fixture creates is known (#105).
+    install()
     root = spec["project_root"]
     os.chdir(root)
     if root not in sys.path:
@@ -457,9 +483,14 @@ def main() -> int:
     target = _resolve_target(spec["project_root"], spec["target_file"])
     # One-shot's verdict IS its exit code (`run_mutant_isolated` reads `mutant_verdict` off it); the
     # richer killed_by/constructed payload travels only over the server protocol the engine uses.
-    return _evaluate_full(
+    payload = _evaluate_full(
         target, spec["func_qualname"], spec["node_ids"], spec["mutant_source"]
-    )["rc"]
+    )
+    if payload["write_blocked"] and not payload["killed_by"]:
+        # A prevented write is never a kill (#105). The exit code has no refusal to carry, so the
+        # run reads as a harness outcome, outside the denominator, rather than the failure pytest saw.
+        return int(pytest.ExitCode.INTERNAL_ERROR)
+    return payload["rc"]
 
 
 if __name__ == "__main__":

@@ -123,6 +123,11 @@ class IsolatedRun:
     #: W#27 — a node's loop budget stopped the mutant: the named non-kill `diverged`. pytest's exit
     #: code reads the stopped node as a failure, so the engine checks this before the verdict.
     diverged: bool = False
+    #: Detective #105 — the first node whose run against the mutant tried to write outside its write
+    #: authority (None when none did), and the paths it was prevented from writing. That node's
+    #: failure is the guard's: it records no kill reason, so `killed_by` speaks for the other nodes.
+    write_blocked: str | None = None
+    blocked_writes: tuple[str, ...] = ()
 
     @property
     def outcome(self) -> str:
@@ -772,6 +777,8 @@ class IsolatedMutantWorker:
             memory_cut=bool(data.get("memory_cut", False)),
             mem_enforced=bool(data.get("enforced", False)),
             diverged=bool(data.get("diverged", False)),
+            write_blocked=data.get("write_blocked") or None,
+            blocked_writes=tuple(str(p) for p in data.get("blocked_writes") or ()),
         )
 
     def _reap(self) -> bool:

@@ -67,6 +67,7 @@ from .subsumption import redundancy_groups
 from .swap_plan import SWAP_PAIR_BUDGET, swap_label, swap_plan
 from .tce import WARRANT_BYTECODE, nodes_equivalent
 from .trace_evidence import TraceEvidence, baseline_outcome, build_trace_ledger
+from .write_authority import WRITE_OUTSIDE_AUTHORITY, contain_writes
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator
@@ -247,6 +248,9 @@ class MutantResult:
     # it out of the denominator under the refusal's own name.
     refusal: str = ""
     refused_test: str | None = None
+    # The paths a `write_outside_authority` refusal prevented (Detective #105), at most three: where
+    # the refused test, run against this mutant, tried to write outside its write authority.
+    blocked_writes: list[str] = field(default_factory=list)
     # How many of the tests handed to `evaluate_mutant` STARTED, in order (#18): the tests that
     # ran are `test_functions[:tests_run]`. A cause named for `not_entered` is a claim about THOSE
     # tests, not the whole scope — the allowance can end the scan before a test that reaches the
@@ -296,10 +300,12 @@ def mutant_disposition(
     * ``not_installed``  — built, but no call site was rebound to it. A survivor here is a
       patch blind spot, not a specification gap; `_patch_module_qualified` skips any object
       without ``__code__``, so an `lru_cache`/`partial`-wrapped target lands here.
-    * ``refusal`` itself, when one is set and nothing killed the mutant — today only
-      ``nested_measurement`` (#28): a test the verdict needed runs the engine, and inside this
-      held evaluation its nested measurement was refused rather than left to wait for itself. The
-      test was never observed to pass or fail, so the mutant is neither killed nor survived.
+    * ``refusal`` itself, when one is set and nothing killed the mutant — ``nested_measurement``
+      (#28): a test the verdict needed runs the engine, and inside this held evaluation its nested
+      measurement was refused rather than left to wait for itself; or ``write_outside_authority``
+      (Detective #105): a test run against the mutant tried to write outside its write authority
+      and the write was prevented, so the run's outcome is the guard's. Either way the test was
+      never observed to pass or fail, so the mutant is neither killed nor survived.
       Ahead of ``not_entered`` because the refused test may have been the one to enter it.
     * ``diverged``       — an explicit deterministic step budget was exceeded (issue #27).
       Reported as its own named outcome, never a value kill.
@@ -984,7 +990,8 @@ def _unscored_record(result: MutantResult, disposition: str) -> dict:
     Both profiling paths build the record here, for the reason `_containment_lost` gives: two
     builders of one record are two answers to one question. `test` is present only for a refused
     nested measurement, the case whose remedy is a specific test (measure it in a killable worker,
-    `--isolated`, where its nested engine re-enters the lock on its own thread instead).
+    `--isolated`, where its nested engine re-enters the lock on its own thread instead), and for a
+    write the authority prevented (Detective #105), where `blocked_writes` also names the paths.
     """
     mutant = result.mutant
     record: dict[str, Any] = {
@@ -1005,6 +1012,8 @@ def _unscored_record(result: MutantResult, disposition: str) -> dict:
         record["uncontained_test"] = result.uncontained_test
     if result.refused_test:
         record["test"] = result.refused_test
+    if result.blocked_writes:
+        record["blocked_writes"] = list(result.blocked_writes)
     return record
 
 
@@ -7184,6 +7193,8 @@ def evaluate_mutant(
         # kills is NAMED rather than read as a survivor; a kill another test earns outranks it.
         refusal = ""
         refused_test: str | None = None
+        # What a `write_outside_authority` refusal prevented (Detective #105), for the refused test.
+        refused_writes: list[str] = []
         # How many tests actually got to run against this mutant. `entered` is only
         # INTERPRETABLE when at least one did: with an empty scoped set — which is the normal
         # state of Detective's synthesis path, where the tests do not exist yet — the probe is
@@ -7286,13 +7297,22 @@ def evaluate_mutant(
                     else {}
                 )
                 observed_t0 = time.monotonic()
-                result = _run_test_with_timeout(
-                    test_fn,
-                    _unwrap_descriptor(mutated_obj),
-                    patched,
-                    test_wall_ms,
-                    **step_args,
-                )
+                # Armed for exactly the run that executes the mutant (Detective #105): the working
+                # directory is the project root, so a mutated path lands there unless the write is
+                # prevented. The window's record, not the test's outcome, says whether one was: the
+                # run's failure — or its pass, if the target swallowed the guard — is the guard's.
+                # The original-control below runs the ORIGINAL with every installed binding restored,
+                # so it stays unarmed, like the baseline.
+                with contain_writes() as blocked:
+                    result = _run_test_with_timeout(
+                        test_fn,
+                        _unwrap_descriptor(mutated_obj),
+                        patched,
+                        test_wall_ms,
+                        **step_args,
+                    )
+                if blocked and result != "uncontained":
+                    result = WRITE_OUTSIDE_AUTHORITY
                 observed_ms = _elapsed(observed_t0)
                 if arm_cap is not None:
                     # A budgeted observation took as long as THIS machine needs for its iterations.
@@ -7334,16 +7354,19 @@ def evaluate_mutant(
 
                         uncontained_test = callable_test_id(test_fn)
                     result = "undetermined"
-                if result == "nested_measurement":
+                if result in ("nested_measurement", WRITE_OUTSIDE_AUTHORITY):
                     # NOT A KILL REASON (#28): the test runs the engine and its nested measurement
                     # was refused before it could wait for the lock this evaluation holds. Whatever
                     # the test did after that — fail on the refusal, swallow it, pass — says nothing
                     # about this mutant, so it is neither a kill nor a pass. Kept by name; the loop
-                    # goes on, because another test may still kill the mutant outright.
+                    # goes on, because another test may still kill the mutant outright. A prevented
+                    # write (#105) is the same kind of fact: the run never finished as the mutant
+                    # would have run it.
                     if refused_test is None:
                         from Wesker.ci import callable_test_id
 
                         refusal, refused_test = result, callable_test_id(test_fn)
+                        refused_writes = list(dict.fromkeys(blocked))[:3]
                     result = None
                 # A failure is only a KILL if the mutation CAUSED it. When the mutant
                 # could not be patched into the test's namespace, the unpatched path
@@ -7485,6 +7508,7 @@ def evaluate_mutant(
             # Nothing killed it, but a test that might have was refused (#28): not a survivor.
             refusal=refusal,
             refused_test=refused_test,
+            blocked_writes=refused_writes,
             elapsed_ms=_elapsed(start),
         )
     finally:
@@ -8294,6 +8318,21 @@ def _isolated_result(
             uncontained_test=None if run.contained else run.test_name,
             installed=run.installed,
             entered=entered,
+            elapsed_ms=elapsed_ms,
+        )
+    if run.write_blocked and run.constructed and not run.killed_by:
+        # Detective #105: the run failed only because a write outside the test's authority was
+        # prevented — pytest's exit code reads `failed`, but that failure is the guard's. Named, never
+        # a kill; a node that killed the mutant on its own (`killed_by`) still stands below.
+        return MutantResult(
+            mutant=mutant,
+            killed=False,
+            contained=run.contained,
+            installed=run.installed,
+            entered=entered,
+            refusal=WRITE_OUTSIDE_AUTHORITY,
+            refused_test=run.write_blocked,
+            blocked_writes=list(run.blocked_writes),
             elapsed_ms=elapsed_ms,
         )
     verdict = mutant_verdict(run.outcome)
