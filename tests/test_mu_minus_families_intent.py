@@ -304,6 +304,31 @@ def test_count_equals_generation_under_every_observed_type():
         ), tname
 
 
+# The ids Wesker 1addf57 generated for `return x / 2`, one table per interpreter family. A content id
+# hashes `ast.dump(..., include_attributes=True)`, whose default output changed in Python 3.13 (empty
+# optional fields are omitted), so the same mutation has one id under 3.12 and another under 3.13+.
+# Both tables were measured at 1addf57 and again at 6ba533d (3.12.12 and 3.14.6) and agree, so the
+# property below holds in each family; the cross-family difference predates the new operators.
+_IDS_AT_1ADDF57 = {
+    "3.13+": {
+        "return_none": "OUTPUT_988a4470",
+        "return_const": "OUTPUT_6dc24194",
+        "return_identity": "OUTPUT_637e0fc8",
+        "return_negate": "OUTPUT_63dccc59",
+        "return_abs": "OUTPUT_0b3b40ca",
+        "return_nan": "OUTPUT_ccc01580",
+    },
+    "3.12": {
+        "return_none": "OUTPUT_a6d1d302",
+        "return_const": "OUTPUT_e6e0a7d3",
+        "return_identity": "OUTPUT_bb386c45",
+        "return_negate": "OUTPUT_d9b1d53a",
+        "return_abs": "OUTPUT_af8eac1d",
+        "return_nan": "OUTPUT_cf3813ee",
+    },
+}
+
+
 def test_the_nine_built_operators_keep_their_ids():
     # Appended to the table, never interleaved: the ids below are the ones Wesker 1addf57 generated.
     # A survivor's id and diff are what `flag` records, so moving them would orphan every flag.
@@ -315,14 +340,8 @@ def test_the_nine_built_operators_keep_their_ids():
         observed_return_types=frozenset({"float"}),
     )
     ids = {_sub_mode(m): m.mutant_id for m in muts}
-    assert {k: ids[k] for k in ("return_none", "return_const", "return_identity")} == {
-        "return_none": "OUTPUT_988a4470",
-        "return_const": "OUTPUT_6dc24194",
-        "return_identity": "OUTPUT_637e0fc8",
-    }
-    assert ids["return_negate"] == "OUTPUT_63dccc59"
-    assert ids["return_abs"] == "OUTPUT_0b3b40ca"
-    assert ids["return_nan"] == "OUTPUT_ccc01580"
+    expected = _IDS_AT_1ADDF57["3.13+" if sys.version_info >= (3, 13) else "3.12"]
+    assert {k: ids[k] for k in expected} == expected
 
 
 def test_a_template_takes_the_return_values_source_position():
