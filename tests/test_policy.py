@@ -44,7 +44,7 @@ from Wesker.policy import (
 #     skip rule — and this failure is the entire point: find the drift before
 #     touching the golden.
 # W#47: the same policy-8 universe, with single-invocation observation semantics.
-GOLDEN_POLICY_ID = "8.68a525594c46"
+GOLDEN_POLICY_ID = "8.51a0c2a545b5"
 
 # The same fact, readable: the engine's target counts over the fingerprint
 # corpus. A failure here names the category and function that moved.

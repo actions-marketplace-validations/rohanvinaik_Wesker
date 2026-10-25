@@ -7035,6 +7035,87 @@ def _is_declared_failure(exc: BaseException) -> bool:
     )
 
 
+def _test_call_args(test_fn: Callable[..., None], mutated_func: Any) -> tuple[Any, ...]:
+    """Choose an injected or empty call without executing the test (#47).
+
+    Honor a wrapper's advertised signature when its own signature also binds.
+    Fixture-bound wrappers can change arity, so their own signature is the fallback.
+    Uninspectable callables retain one injected attempt, never an execution retry.
+    """
+    import inspect
+    import sys
+    import types
+    from functools import partial
+
+    def _signature_view(fn: Any, follow_wrapped: bool) -> Any:
+        # Explicit signature declarations already supply parameter metadata.
+        if getattr(fn, "__signature__", None) is not None:
+            return fn
+        if isinstance(fn, types.MethodType):
+            return types.MethodType(
+                _signature_view(fn.__func__, follow_wrapped), fn.__self__
+            )
+        if follow_wrapped:
+            unwrapped = inspect.unwrap(
+                fn,
+                stop=lambda candidate: (
+                    getattr(candidate, "__signature__", None) is not None
+                ),
+            )
+            if unwrapped is not fn:
+                return _signature_view(unwrapped, False)
+        if isinstance(fn, types.FunctionType):
+            # FunctionType supplies binding metadata without copying __annotations__
+            # or __annotate__. Never execute this view or mutate the original function.
+            view = types.FunctionType(
+                fn.__code__,
+                fn.__globals__,
+                fn.__name__,
+                fn.__defaults__,
+                fn.__closure__,
+            )
+            view.__kwdefaults__ = fn.__kwdefaults__
+            return view
+        if isinstance(fn, partial):
+            return partial(
+                _signature_view(fn.func, follow_wrapped), *fn.args, **fn.keywords
+            )
+        if not inspect.isclass(fn):
+            call = inspect.getattr_static(type(fn), "__call__", None)
+            if isinstance(call, (types.FunctionType, staticmethod, classmethod)):
+                return _signature_view(call.__get__(fn, type(fn)), follow_wrapped)
+        return fn
+
+    injected = (mutated_func,)
+    signature_options: dict[str, Any] = {}
+    if sys.version_info >= (3, 14):
+        from annotationlib import Format
+
+        # Binding needs parameter shape, not deferred annotation values or effects.
+        signature_options["annotation_format"] = Format.STRING
+    try:
+        actual = inspect.signature(
+            _signature_view(test_fn, False), follow_wrapped=False, **signature_options
+        )
+    except (TypeError, ValueError):
+        return injected
+    try:
+        advertised = inspect.signature(
+            _signature_view(test_fn, True), **signature_options
+        )
+    except (TypeError, ValueError):
+        advertised = actual
+    for signature in (advertised, actual):
+        for args in (injected, ()):
+            try:
+                actual.bind(*args)
+                signature.bind(*args)
+            except TypeError:
+                continue
+            return args
+    raise TypeError("test accepts neither an injected function nor no arguments")
+
+
 def _run_test_with_timeout(
     test_fn: Callable[..., None],
     mutated_func: Any,
@@ -7079,25 +7160,7 @@ def _run_test_with_timeout(
 
     def _target() -> None:
         try:
-            call_args: tuple[Any, ...] = ()
-            if not patched:
-                import inspect
-
-                call_args = (mutated_func,)
-                try:
-                    call_signature = inspect.signature(test_fn, follow_wrapped=False)
-                except (TypeError, ValueError):
-                    # An unavailable signature supplies no evidence for a different
-                    # convention. Keep one injected attempt, without an execution retry.
-                    pass
-                else:
-                    try:
-                        call_signature.bind(*call_args)
-                    except TypeError:
-                        # Only binding, never execution, selects the zero-argument form.
-                        # A fixture wrapper's own signature matters, not its __wrapped__.
-                        call_signature.bind()
-                        call_args = ()
+            call_args = () if patched else _test_call_args(test_fn, mutated_func)
             test_fn(*call_args)
         except StepBudgetExceeded:
             result_box[0] = "diverged"

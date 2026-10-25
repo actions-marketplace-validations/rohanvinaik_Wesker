@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import ast
 import functools
+import sys
 
 import pytest
 
@@ -105,6 +106,23 @@ def test_unavailable_signature_does_not_authorize_an_empty_retry(signature_error
     assert calls == [mutant]
 
 
+def test_forwarding_wrapper_preserves_the_advertised_zero_argument_call():
+    calls = []
+
+    def zero_argument_test():
+        calls.append("body")
+
+    @functools.wraps(zero_argument_test)
+    def forwarding_wrapper(*args, **kwargs):
+        calls.append("wrapper")
+        return zero_argument_test(*args, **kwargs)
+
+    assert (
+        engine._run_test_with_timeout(forwarding_wrapper, object(), False, 1000) is None
+    )
+    assert calls == ["wrapper", "body"]
+
+
 def test_wrapper_uses_its_actual_call_signature():
     calls = []
 
@@ -120,6 +138,30 @@ def test_wrapper_uses_its_actual_call_signature():
         is None
     )
     assert calls == ["entered"]
+
+
+@pytest.mark.skipif(
+    sys.version_info < (3, 14), reason="deferred annotations require Python 3.14"
+)
+def test_argument_binding_does_not_evaluate_deferred_annotations():
+    namespace = {"calls": []}
+    source = (
+        "def annotation():\n"
+        "    calls.append('annotation')\n"
+        "    return MissingType\n"
+        "def case() -> annotation():\n"
+        "    calls.append('body')\n"
+    )
+    # S102: do not inherit this test module's future-annotations flag; exercise 3.14 deferral.
+    annotation_code = compile(
+        source, "<deferred-test-annotation>", "exec", dont_inherit=True
+    )
+    exec(annotation_code, namespace)  # noqa: S102
+
+    assert (
+        engine._run_test_with_timeout(namespace["case"], object(), False, 1000) is None
+    )
+    assert namespace["calls"] == ["body"]
 
 
 @pytest.mark.parametrize("patched", [False, True])

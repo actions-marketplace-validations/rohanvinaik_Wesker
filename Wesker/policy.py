@@ -401,7 +401,9 @@ def mutation_policy(two_sign: bool = False) -> MutationPolicy:
             "a mutant is killed when a covering test fails under it",
             (
                 "each test observation invokes the test at most once; a no-argument "
-                "unpatched fallback requires pre-execution signature binding; "
+                "unpatched fallback requires pre-execution signature binding against "
+                "the callable and compatible advertised wrapper signatures, with "
+                "annotation-free Python function signature views; "
                 "a TypeError during execution never triggers a retry"
             ),
             (
