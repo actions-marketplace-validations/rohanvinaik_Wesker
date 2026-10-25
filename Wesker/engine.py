@@ -27,7 +27,7 @@ from collections.abc import Iterator
 from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
 from enum import Enum
-from typing import TYPE_CHECKING, Any, ClassVar, TypeGuard
+from typing import TYPE_CHECKING, Any, ClassVar, Self, TypeGuard
 
 from .interrupt import (
     JoinedWorker,
@@ -6615,8 +6615,15 @@ def evaluate_mutant(
     qualname: str | None = None,
     record_all_killers: bool = False,
     source_path: str | None = None,
+    step_plan: StepPlan | None = None,
+    liveness_ceiling_ms: float | None = None,
 ) -> MutantResult:
     """Evaluate a mutant against test functions.
+
+    With a ``step_plan`` (W#27), each test's ORIGINAL loop count is measured once per pass before
+    the mutant is installed, and every mutant observation of a test the original passed under the
+    count is bounded at ``step_cap(count, factor, floor)`` iterations; exceeding it is the named
+    non-kill ``diverged``. Without one, observations are bounded by the wall clock alone.
 
     Compiles the mutated function, then monkey-patches it into each test's
     module namespace before invoking the test with zero args (standard pytest
@@ -6636,8 +6643,16 @@ def evaluate_mutant(
     when any killer pinned the value, else the first reason. Full-matrix mode
     shares ``timeout_ms`` across the whole test set, so callers must budget it
     for the full suite.
+
+    ``liveness_ceiling_ms`` is the caller's remaining AGGREGATE deadline. A step-budgeted
+    observation's wall is widened up to it (:func:`~Wesker.monitoring.armed_wall_ms`) so the wall
+    can never decide what the budget decides; without a ceiling no wall is widened.
     """
     start = time.monotonic()
+    # The mutant's shared allowance runs on its own clock (W#27). Time that is not the mutant's to
+    # spend moves it forward: the original's counted run, and every step-budgeted observation, which
+    # its own count and widened liveness wall bound instead.
+    allowance_t0 = start
 
     # The module-qualified patch (module-level bindings AND class-method owners) needs the ABSOLUTE
     # source path to match call-site objects by co_filename. Callers pass qualname but not source_path,
@@ -6666,6 +6681,9 @@ def evaluate_mutant(
                 if original_func is not None
                 else None
             )
+            # A runtime wrapper adds no loop of its own; its body is the original's, so there is no
+            # mutant code for a loop budget to count (W#27) — the wall clock bounds it.
+            mutant_codes: tuple[types.CodeType, ...] = ()
         else:
             module_ast = _mutant_module(mutant.mutated_node)
             ast.fix_missing_locations(module_ast)
@@ -6681,6 +6699,10 @@ def evaluate_mutant(
             exec(code, namespace)  # noqa: S102  # nosec B102
             func_name = getattr(mutant.mutated_node, "name", None)
             mutated_obj = namespace.get(func_name) if func_name else None
+            # The code the mutant's loops live in, read BEFORE the entry probe wraps it (W#27).
+            mutant_codes = (
+                _step_codes_of(mutated_obj) if mutated_obj is not None else ()
+            )
             if mutated_obj is not None:
                 # Make ENTERING the mutant observable, not just installing it (#18). Wrapped here,
                 # at the single point the object is built, so every install path downstream —
@@ -6722,6 +6744,12 @@ def evaluate_mutant(
     # the mutant — not only tests that call a bare imported name. Restored in the
     # finally regardless of how the loop exits. No-op when source_path is absent,
     # so existing callers/output are unchanged.
+    # W#27: the ORIGINAL's loop count on a test sets that test's budget. It is measured lazily, the
+    # first time a test is about to observe a mutant this pass (`_measure_original_step_in_place`),
+    # so a test the first-kill short-circuit never reaches is never run for it.
+    original_codes = _step_codes_of(original_func) if original_func is not None else ()
+    budgeted = step_plan is not None and bool(mutant_codes) and bool(original_codes)
+
     # `@_serialized` holds the execution lock for this whole call, so one proof covers the entire
     # patch/run/restore phase below. The decorator owns EXCLUSION; the proof owns the type-level
     # evidence that a patch site was reached with it held (#19).
@@ -6743,6 +6771,11 @@ def evaluate_mutant(
         first_killer: str | None = None
         saw_uncontained = False  # a timed-out worker that could not be stopped (#14)
         uncontained_test: str | None = None  # the first test whose worker that was
+        if step_plan is not None and step_plan.uncontained_test is not None:
+            # An ORIGINAL counted run left a live worker behind (W#27): every observation in this
+            # process after it shares an interpreter with a runaway, so none of them is contained.
+            saw_uncontained = True
+            uncontained_test = step_plan.uncontained_test
         # A test whose nested measurement was refused (#28): it runs the engine, so inside this
         # held evaluation it could not be measured at all. Remembered so a mutant nothing else
         # kills is NAMED rather than read as a survivor; a kill another test earns outranks it.
@@ -6758,7 +6791,7 @@ def evaluate_mutant(
         # is scored a plain survivor, exactly as before #18.
         ran = 0
         for test_fn in test_functions:
-            remaining_ms = timeout_ms - _elapsed(start)
+            remaining_ms = timeout_ms - _elapsed(allowance_t0)
             if remaining_ms <= 0:
                 if record_all_killers and killers:
                     break  # budget hit — keep the killers already collected
@@ -6777,6 +6810,23 @@ def evaluate_mutant(
                     tests_run=ran,
                     elapsed_ms=_elapsed(start),
                 )
+            if step_plan is not None and budgeted:
+                # The original's counted run of THIS test, once per pass, before the mutant is
+                # patched into the test's namespace. Its time is not the mutant's to spend.
+                spent_ms = _measure_original_step_in_place(
+                    step_plan,
+                    test_fn,
+                    original_func,
+                    original_codes,
+                    module_saved,
+                    func_name,
+                    max(timeout_ms, _ORIGINAL_COUNT_FLOOR_MS),
+                )
+                allowance_t0 += spent_ms / 1000.0
+                remaining_ms = timeout_ms - _elapsed(allowance_t0)
+                if step_plan.uncontained_test is not None and not saw_uncontained:
+                    saw_uncontained = True
+                    uncontained_test = step_plan.uncontained_test
             # Strategy: monkey-patch the mutated function into the test's namespace
             # so the test calls the mutant instead of the original. Uses __globals__
             # (the test function's defining module globals) which works reliably for
@@ -6788,12 +6838,91 @@ def evaluate_mutant(
             )
             ran += 1
             try:
+                arm_codes: tuple[types.CodeType, ...] = ()
+                arm_cap: int | None = None
+                original_state, original_count = "unmeasured", 0
+                test_wall_ms = remaining_ms
+                if step_plan is not None and budgeted:
+                    from Wesker.ci import callable_test_id
+                    from Wesker.monitoring import armed_wall_ms, mutant_step_cap
+
+                    test_key = callable_test_id(test_fn)
+                    original_state, original_count = step_plan.originals.get(
+                        test_key, ("unmeasured", 0)
+                    )
+                    cap_code, cap = mutant_step_cap(
+                        original_state,
+                        original_count,
+                        step_plan.factor,
+                        step_plan.floor,
+                    )
+                    if cap_code == "armed" and cap is not None:
+                        arm_codes = mutant_codes
+                        if step_plan.enforce:
+                            arm_cap = cap
+                            # The wall bounds liveness only: widen it to what reaching the cap
+                            # costs, inside the aggregate deadline, so it cannot decide first.
+                            test_wall_ms = armed_wall_ms(
+                                cap,
+                                step_plan.original_ms.get(test_key, 0.0),
+                                remaining_ms,
+                                None
+                                if liveness_ceiling_ms is None
+                                else liveness_ceiling_ms - _elapsed(start),
+                            )
+                step_sink: list[int] = []
+                # Only an armed observation carries the budget arguments, so an unbudgeted run
+                # makes exactly the call it always made.
+                step_args: dict[str, Any] = (
+                    {
+                        "step_codes": arm_codes,
+                        "step_cap": arm_cap,
+                        "step_sink": step_sink,
+                    }
+                    if arm_codes
+                    else {}
+                )
+                observed_t0 = time.monotonic()
                 result = _run_test_with_timeout(
                     test_fn,
                     _unwrap_descriptor(mutated_obj),
                     patched,
-                    remaining_ms,
+                    test_wall_ms,
+                    **step_args,
                 )
+                observed_ms = _elapsed(observed_t0)
+                if arm_cap is not None:
+                    # A budgeted observation took as long as THIS machine needs for its iterations.
+                    # Charged to the shared allowance, a slower core would starve the tests after
+                    # it — a later kill read `diverged`, a survivor `undetermined` (measured under
+                    # `taskpolicy -b`) — the wall deciding what the count decides (W#27).
+                    allowance_t0 += observed_ms / 1000.0
+                if step_plan is not None and step_plan.log_path and budgeted:
+                    from Wesker.ci import callable_test_id
+
+                    test_key = callable_test_id(test_fn)
+                    _record_step_observation(
+                        step_plan,
+                        {
+                            "source": source_path,
+                            "qualname": qualname,
+                            "mutant": getattr(mutant, "mutant_id", ""),
+                            "category": getattr(
+                                mutant.category, "value", str(mutant.category)
+                            ),
+                            "description": getattr(mutant, "description", ""),
+                            "test": test_key,
+                            "original": original_state,
+                            "original_iterations": original_count,
+                            "original_ms": round(
+                                step_plan.original_ms.get(test_key, -1.0), 3
+                            ),
+                            "mutant_iterations": step_sink[0] if step_sink else None,
+                            "mutant_ms": round(observed_ms, 3),
+                            "wall_bound_ms": round(test_wall_ms, 3),
+                            "result": result,
+                        },
+                    )
                 if result == "uncontained":
                     # Timed out AND the worker could not be stopped. Measurement is uncontained (#14).
                     saw_uncontained = True
@@ -6841,7 +6970,7 @@ def evaluate_mutant(
                             original_func,
                             module_saved,
                             func_name,
-                            max(timeout_ms - _elapsed(start), 1.0),
+                            max(timeout_ms - _elapsed(allowance_t0), 1.0),
                         )
                         == result
                         else result
@@ -7146,11 +7275,250 @@ def _test_call_args(test_fn: Callable[..., None], mutated_func: Any) -> tuple[An
     raise TypeError("test accepts neither an injected function nor no arguments")
 
 
+#: The least wall bound an ORIGINAL's counted run gets (W#27). The in-process mutant allowance is
+#: calibrated for one mutant's tests and can be a few milliseconds; the original's counted run is a
+#: different observation that must COMPLETE to be a basis, so it is never held to that allowance.
+#: A test the original cannot finish inside this bound is `original_undetermined` and gets no
+#: budget — the wall clock bounds its mutants exactly as before.
+_ORIGINAL_COUNT_FLOOR_MS = 5000.0
+
+
+@dataclass
+class StepPlan:
+    """One function profiling pass's deterministic loop budget (W#27).
+
+    ``originals`` caches, per test id, what the ORIGINAL's counted run of that test established
+    (:func:`~Wesker.monitoring.original_step_observation`) and its loop count — measured once per
+    pass, the first time the test is about to observe a mutant, through the same worker the mutants
+    run in (in-process: `_measure_original_step_in_place`, bindings restored for that run; isolated:
+    `_isolated_step_caps`, in the parent). Every mutant observation of that test then gets
+    ``step_cap(count, factor, floor)`` when the original passed under the count
+    (:func:`~Wesker.monitoring.mutant_step_cap`), and no budget otherwise.
+
+    ``enforce=False`` counts without bounding: the calibration instrument
+    (``WESKER_STEP_CALIBRATION_LOG``), which observes how far TERMINATING mutants actually go so
+    the factor and floor are chosen from data. A calibration run is a measurement of the
+    instrument, not a policy-conforming profile; its verdicts are those of the unbudgeted engine.
+    """
+
+    factor: int
+    floor: int
+    enforce: bool = True
+    log_path: str = ""
+    originals: dict[str, tuple[str, int]] = field(default_factory=dict)
+    #: The wall time each ORIGINAL counted run took, per test id (W#27): what reaching a cap costs
+    #: on THIS machine, in THIS process, measured rather than assumed.
+    original_ms: dict[str, float] = field(default_factory=dict)
+    #: The first test whose ORIGINAL counted run could not be stopped, if any: an uncontained
+    #: worker poisons every later observation, so the evaluation that met it reports it (#14).
+    uncontained_test: str | None = None
+
+
+def step_plan_from_env() -> StepPlan:
+    """The plan a profiling pass runs under: enforcing, unless a calibration log is requested."""
+    import os
+
+    from Wesker.monitoring import STEP_BUDGET_FACTOR, STEP_BUDGET_FLOOR
+
+    log_path = os.environ.get("WESKER_STEP_CALIBRATION_LOG", "").strip()
+    return StepPlan(
+        STEP_BUDGET_FACTOR,
+        STEP_BUDGET_FLOOR,
+        enforce=not log_path,
+        log_path=log_path,
+    )
+
+
+def _step_codes_of(obj: Any) -> tuple[types.CodeType, ...]:
+    """The code a loop budget counts for a callable (W#27): the innermost function's own code.
+
+    Descriptors are peeled and ``__wrapped__`` chains followed (the entry probe and any
+    ``functools.wraps`` decorator), so the count lands on the body the mutation lives in; the
+    budget adds nested code (comprehensions, inner functions) itself. A callable with no Python
+    code — a builtin, a C extension, a wrapper that hides its target — has none, and then no
+    budget is armed: the wall clock bounds it as before.
+    """
+    import inspect
+
+    fn = _unwrap_descriptor(obj)
+    try:
+        fn = inspect.unwrap(fn)
+    # BLE001: a wrapper chain that cannot be followed (a cycle, a hostile __wrapped__) yields no
+    # code to count, never a crash in the measurement
+    except Exception:  # noqa: BLE001
+        return ()
+    code = getattr(fn, "__code__", None)
+    return (code,) if isinstance(code, types.CodeType) else ()
+
+
+def _measure_original_steps(
+    plan: StepPlan,
+    test_functions: list[Callable[..., None]],
+    original_func: Any,
+    original_codes: tuple[types.CodeType, ...],
+    bound_ms: float,
+) -> None:
+    """Count the ORIGINAL's loop iterations on every test not yet measured this pass (W#27).
+
+    The isolated path's counter: no mutant is installed in this process there, so the tests run
+    against the original as they stand, through `_run_test_with_timeout` itself — the worker, the
+    argument selection and the redirects a mutant observation gets — so the count and the cap
+    compare like with like. Cached on the plan: each test is measured once per pass.
+    """
+    from Wesker.ci import callable_test_id
+    from Wesker.monitoring import original_step_observation
+
+    target = _unwrap_descriptor(original_func)
+    for test_fn in test_functions:
+        key = callable_test_id(test_fn)
+        if key in plan.originals:
+            continue
+        sink: list[int] = []
+        t0 = time.monotonic()
+        outcome = _run_test_with_timeout(
+            test_fn, target, False, bound_ms, step_codes=original_codes, step_sink=sink
+        )
+        plan.original_ms[key] = _elapsed(t0)
+        if outcome == "uncontained" and plan.uncontained_test is None:
+            plan.uncontained_test = key
+        state = original_step_observation(
+            "passed" if outcome is None else outcome, bool(sink)
+        )
+        plan.originals[key] = (state, sink[0] if sink else 0)
+
+
+def _measure_original_step_in_place(
+    plan: StepPlan,
+    test_fn: Callable[..., None],
+    original_func: Any,
+    original_codes: tuple[types.CodeType, ...],
+    module_saved: list[tuple[Any, Any]],
+    func_name: str | None,
+    bound_ms: float,
+) -> float:
+    """Count the ORIGINAL's loop iterations on one test, mid-evaluation; return the ms it took (W#27).
+
+    Called the first time a test is about to observe a mutant this pass, so a test the first-kill
+    short-circuit never reaches is never run for a count. The mutant is already installed on its
+    module-qualified owners at that point, so — exactly as ``_outcome_on_original`` does — those
+    bindings are restored for this one run and re-installed afterwards; the test's own namespace
+    has not been patched yet. A test already counted this pass costs nothing.
+    """
+    from Wesker.ci import callable_test_id
+    from Wesker.monitoring import original_step_observation
+
+    key = callable_test_id(test_fn)
+    if key in plan.originals:
+        return 0.0
+    live: list[tuple[Any, Any]] = []
+    if func_name is not None:
+        for target, saved in module_saved:
+            try:
+                live.append((target, _get_raw_attr(target, func_name)))
+                setattr(target, func_name, saved)
+            # BLE001/S112: a target that cannot be read or rebound keeps its current binding
+            except Exception:  # noqa: BLE001, S112
+                continue
+    t0 = time.monotonic()
+    sink: list[int] = []
+    try:
+        outcome = _run_test_with_timeout(
+            test_fn,
+            _unwrap_descriptor(original_func),
+            False,
+            bound_ms,
+            step_codes=original_codes,
+            step_sink=sink,
+        )
+    finally:
+        for target, current in live:
+            try:
+                setattr(target, func_name, current)
+            # BLE001/S110: re-installing one binding must not skip the rest
+            except Exception:  # noqa: BLE001, S110
+                pass
+    spent = _elapsed(t0)
+    plan.original_ms[key] = spent
+    if outcome == "uncontained" and plan.uncontained_test is None:
+        plan.uncontained_test = key
+    plan.originals[key] = (
+        original_step_observation("passed" if outcome is None else outcome, bool(sink)),
+        sink[0] if sink else 0,
+    )
+    return spent
+
+
+def _record_step_observation(plan: StepPlan, row: dict[str, Any]) -> None:
+    """Append one calibration observation as a JSON line (W#27). Never fails the run."""
+    if not plan.log_path:
+        return
+    import json
+
+    try:
+        with open(plan.log_path, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(row, sort_keys=True) + "\n")
+    # BLE001: the calibration log is a diagnostic; an unwritable path never fails a measurement
+    except Exception:  # noqa: BLE001
+        return
+
+
+class _StepArm:
+    """Arm a step budget around ONE test invocation, degrading to an unbounded run (W#27).
+
+    Entering can fail: a budget the test itself already opened does not nest, every
+    ``sys.monitoring`` tool id may be held, an exclusive JUMP subscription may exist on the same
+    code. A failure to MEASURE must never become a verdict, so the run then proceeds unbounded
+    and uncounted (``counted`` False) — the wall clock bounds it, exactly as before the budget.
+    """
+
+    def __init__(self, codes: tuple[types.CodeType, ...], cap: int | None) -> None:
+        self._codes = codes
+        self._cap = cap
+        self._cm: Any = None
+        self._count: Any = None
+
+    def __enter__(self) -> Self:
+        if not self._codes:
+            return self
+        from Wesker.monitoring import step_budget
+
+        cm = step_budget(self._codes, self._cap)
+        try:
+            self._count = cm.__enter__()
+        # BLE001: a budget that cannot be opened (nesting, no tool id, exclusive overlap) leaves
+        # the run uncounted and wall-bounded; instrumentation failure is never a verdict
+        except Exception:  # noqa: BLE001
+            return self
+        self._cm = cm
+        return self
+
+    def __exit__(self, *exc: object) -> bool:
+        if self._cm is not None:
+            self._cm.__exit__(*exc)
+        return False
+
+    @property
+    def counted(self) -> bool:
+        return self._count is not None
+
+    @property
+    def iterations(self) -> int:
+        return self._count.iterations if self._count is not None else 0
+
+    @property
+    def stopped(self) -> bool:
+        return bool(self._count is not None and self._count.stopped)
+
+
 def _run_test_with_timeout(
     test_fn: Callable[..., None],
     mutated_func: Any,
     patched: bool,
     timeout_ms: float,
+    *,
+    step_codes: tuple[types.CodeType, ...] = (),
+    step_cap: int | None = None,
+    step_sink: list[int] | None = None,
 ) -> str | None:
     """Run a single test function with a hard thread-based timeout.
 
@@ -7159,6 +7527,13 @@ def _run_test_with_timeout(
 
     Select arguments before invoking the test (#47). A TypeError raised after
     entry is an execution outcome, never permission to retry without the mutant.
+
+    ``step_codes`` arms a deterministic loop budget on the WORKER thread around the test body
+    (W#27): the codes' backward jumps are counted and, with a ``step_cap``, the run is stopped
+    the moment the count passes it. A stopped run is ``diverged`` whatever the test made of the
+    stop — an observation our interruption perturbed is not evidence for a kill or a pass. The
+    count is appended to ``step_sink`` when it was actually taken; argument selection runs before
+    the budget opens, so only the test body is counted.
 
     AND ONE VALUE THAT IS NOT A KILL REASON: "uncontained" (#14). It means the timed-out
     worker outlived `abandon` and may still be running, so nothing measured after it is
@@ -7189,9 +7564,11 @@ def _run_test_with_timeout(
     result_box: list[str | None] = [None]  # None = survived
 
     def _target() -> None:
+        arm = _StepArm(step_codes, step_cap)
         try:
             call_args = () if patched else _test_call_args(test_fn, mutated_func)
-            test_fn(*call_args)
+            with arm:
+                test_fn(*call_args)
         except StepBudgetExceeded:
             result_box[0] = "diverged"
         except AssertionError:
@@ -7215,6 +7592,13 @@ def _run_test_with_timeout(
                 result_box[0] = "diverged"
             else:
                 result_box[0] = "exception" if _is_declared_failure(exc) else "crash"
+        finally:
+            # A stop the test or target swallowed still perturbed the run it stopped: whatever
+            # outcome followed is budget-relative, never a kill or a pass (W#27).
+            if arm.stopped:
+                result_box[0] = "diverged"
+            if step_sink is not None and arm.counted:
+                step_sink.append(arm.iterations)
 
     # A `JoinedWorker`, not a bare Thread: it records that THIS thread started it and is about to
     # join it, which is the edge a nested acquire inside the test checks before it waits (#28).
@@ -7379,6 +7763,9 @@ def run_function_sampling(
     # func_key = 'rel/path.py::Qualname' — the (project-relative) source path callers know but do not
     # pass to evaluate_mutant (original_func is stubbed by some callers, so its co_filename is useless).
     source_path = func_key.split("::", 1)[0] if "::" in func_key else None
+    # One loop budget per pass (W#27): each test's original count is measured once and reused by
+    # every mutant of this function.
+    step_plan = step_plan_from_env()
 
     for mutant in mutants:
         if _elapsed(start) > budget_ms:
@@ -7392,6 +7779,8 @@ def run_function_sampling(
             timeout_ms=per_mutant_timeout_ms,
             qualname=qualname,
             source_path=source_path,
+            step_plan=step_plan,
+            liveness_ceiling_ms=budget_ms - _elapsed(start),
         )
         all_results.append(result)
 
@@ -7505,6 +7894,19 @@ def _isolated_result(
             contained=run.contained,
             elapsed_ms=elapsed_ms,
         )
+    if run.diverged and not run.killed_by:
+        # W#27: a node's loop budget stopped the mutant and no node killed it. pytest's exit code
+        # reads the stopped node as a failure; the budget makes it the named non-kill `diverged`.
+        return MutantResult(
+            mutant=mutant,
+            killed=False,
+            killed_by="diverged",
+            test_name=run.test_name,
+            contained=run.contained,
+            installed=run.installed,
+            entered=entered,
+            elapsed_ms=elapsed_ms,
+        )
     if verdict == "killed":
         return MutantResult(
             mutant=mutant,
@@ -7526,12 +7928,60 @@ def _isolated_result(
     )
 
 
+def _isolated_step_caps(
+    step_plan: StepPlan | None,
+    selected: list[tuple[Callable[..., None], str]],
+    original_func: Any,
+    root: str,
+    per_mutant_timeout_ms: float,
+) -> tuple[dict[str, int], float]:
+    """The per-node loop budgets an isolated worker gets, and what reaching them costs (W#27).
+
+    The ORIGINAL is counted HERE, in the parent, through `_run_test_with_timeout` — the same regime
+    the session baseline already runs these tests in — once per pass per test. Counting inside the
+    worker would either run nodes a mutant's first value kill short-circuits (an upfront pass,
+    inside the request's own timeout) or share one node's fixtures between the original's run and
+    the mutant's (a count inside the call phase), which could manufacture a kill. Calibration mode
+    (``enforce=False``) sends no budgets: it is measured in-process.
+    """
+    if step_plan is None or not step_plan.enforce or original_func is None:
+        return {}, 0.0
+    original_codes = _step_codes_of(original_func)
+    if not original_codes:
+        return {}, 0.0
+    from Wesker.ci import callable_test_id
+    from Wesker.isolation import isolated_selector_key
+    from Wesker.monitoring import STEP_ITERATION_US, mutant_step_cap
+
+    _measure_original_steps(
+        step_plan,
+        [call for call, _selector in selected],
+        original_func,
+        original_codes,
+        max(per_mutant_timeout_ms, _ORIGINAL_COUNT_FLOOR_MS),
+    )
+    caps: dict[str, int] = {}
+    cost_ms = 0.0
+    for call, selector in selected:
+        key = callable_test_id(call)
+        state, count = step_plan.originals.get(key, ("unmeasured", 0))
+        code, cap = mutant_step_cap(state, count, step_plan.factor, step_plan.floor)
+        if code == "armed" and cap is not None:
+            caps[isolated_selector_key(root, selector)] = cap
+            cost_ms += (
+                step_plan.original_ms.get(key, 0.0) + cap * STEP_ITERATION_US / 1000.0
+            )
+    return caps, cost_ms
+
+
 def _evaluate_isolated(
     worker: IsolatedMutantWorker | None,
     mutant: Mutant,
     scoped_tests: list[Callable[..., None]],
     iso_ctx: tuple[str, str, str, int, int | None],
     per_mutant_timeout_ms: float,
+    step_plan: StepPlan | None = None,
+    original_func: Any = None,
 ) -> tuple[MutantResult, IsolatedMutantWorker | None, IsolatedRun | None]:
     """Evaluate one mutant in a killable isolated worker, recycling the worker when spent (#19).
 
@@ -7549,19 +7999,18 @@ def _evaluate_isolated(
     the hang bound instead; `select` returns the instant the worker answers, so the generous floor
     costs a normal mutant nothing and only bounds a true runaway.
     """
-    import os
     from dataclasses import replace
 
     from Wesker.ci import callable_node_id, callable_origin, callable_test_id
-    from Wesker.isolation import isolated_test_selection
+    from Wesker.isolation import isolated_selector_key, isolated_test_selection
 
     root, target, qualname, recycle_cap, mem_limit = iso_ctx
     node_ids = []
     identities = {}
+    selected: list[tuple[Callable[..., None], str]] = []
 
     def selector_key(selector):
-        path, separator, case = selector.partition("::")
-        return os.path.realpath(os.path.join(root, path)) + separator + case
+        return isolated_selector_key(root, selector)
 
     for call in scoped_tests:
         raw = callable_node_id(call)
@@ -7578,8 +8027,12 @@ def _evaluate_isolated(
         selector = f"{origin}::{raw}" if selection == "collect_plain" else raw
         node_ids.append(selector)
         identities[selector_key(selector)] = callable_test_id(call)
+        selected.append((call, selector))
     if not node_ids:
         return MutantResult(mutant=mutant, killed=False, elapsed_ms=0.0), worker, None
+    step_caps, armed_cost_ms = _isolated_step_caps(
+        step_plan, selected, original_func, root, per_mutant_timeout_ms
+    )
     if (
         worker is None
         or not worker.alive
@@ -7596,9 +8049,15 @@ def _evaluate_isolated(
     except Exception:  # noqa: BLE001
         return MutantResult(mutant=mutant, killed=False, elapsed_ms=0.0), worker, None
     timeout_s = max(per_mutant_timeout_ms / 1000.0, _ISOLATED_MIN_TIMEOUT_S)
+    if armed_cost_ms:
+        # The hang bound must not decide what a loop budget decides (W#27): cover reaching every
+        # armed node's cap on top of the floor that already covers pytest startup.
+        timeout_s = max(timeout_s, _ISOLATED_MIN_TIMEOUT_S + armed_cost_ms / 1000.0)
     t0 = time.monotonic()
     try:
-        run = worker.evaluate(source, timeout_s, node_ids=node_ids)
+        run = worker.evaluate(
+            source, timeout_s, node_ids=node_ids, step_caps=step_caps or None
+        )
     except BaseException:
         worker.close()
         raise
@@ -7961,6 +8420,9 @@ def run_function_profiling(
             # MemoryError instead of taking the box down — a hard budget only where the OS accepts it.
             worker_mem_limit_mb * 1024 * 1024 if worker_mem_limit_mb else None,
         )
+    # One loop budget for this function's pass (W#27), shared by the main loop and the widen below:
+    # each test's original count is measured once and reused by every mutant.
+    step_plan = step_plan_from_env()
 
     try:
         for count, mutant in enumerate(mutants):
@@ -7994,7 +8456,13 @@ def run_function_profiling(
             if isolated:
                 assert _iso_ctx is not None
                 result, _iso_worker, _iso_run = _evaluate_isolated(
-                    _iso_worker, mutant, _scoped, _iso_ctx, per_mutant_timeout_ms
+                    _iso_worker,
+                    mutant,
+                    _scoped,
+                    _iso_ctx,
+                    per_mutant_timeout_ms,
+                    step_plan,
+                    original_func,
                 )
                 if _iso_run is not None:
                     _mem_cut = _mem_cut or _iso_run.memory_cut
@@ -8008,6 +8476,8 @@ def run_function_profiling(
                         timeout_ms=allowance_ms,
                         qualname=qualname,
                         source_path=source_path,
+                        step_plan=step_plan,
+                        liveness_ceiling_ms=remaining_ms,
                     )
             except Exception as exc:
                 # ONE EXCEPTION to "one bad mutant must never abort the run", and it is not a mutant
@@ -8284,6 +8754,8 @@ def run_function_profiling(
                 ),
                 qualname=qualname,
                 source_path=source_path,
+                step_plan=step_plan,
+                liveness_ceiling_ms=_remaining_ms,
             )
             if not _res.contained:
                 all_contained = False
@@ -8771,17 +9243,45 @@ def _check_equivalent_wrapper(
             return False
         wrapped = mutant.wrapper_factory(orig_fn)
         outcomes: list[str] = []
+        from Wesker.monitoring import (
+            STEP_BUDGET_FACTOR,
+            STEP_BUDGET_FLOOR,
+            STEP_PROBE_CAP,
+            StepBudgetExceeded,
+            step_cap,
+        )
+
+        # W#27: the generator body runs during materialization, on this thread, with no wall bound;
+        # a loop budget keeps an invented input from hanging the run. A stopped run is NO codomain
+        # evidence ("raised") — never "differ", which would score a budget stop as a μ⁻ kill.
+        orig_codes = _step_codes_of(orig_fn)
         for args in _generate_boundary_inputs(func_node):
+            orig_arm = _StepArm(orig_codes, STEP_PROBE_CAP)
+            pert_arm = _StepArm((), None)
             try:
-                orig_items = list(
-                    itertools.islice(orig_fn(*args), _GENERATOR_MATERIALIZE_CAP)
+                with orig_arm:
+                    orig_items = list(
+                        itertools.islice(orig_fn(*args), _GENERATOR_MATERIALIZE_CAP)
+                    )
+                pert_arm = _StepArm(
+                    orig_codes,
+                    step_cap(orig_arm.iterations, STEP_BUDGET_FACTOR, STEP_BUDGET_FLOOR)
+                    if orig_arm.counted
+                    else STEP_PROBE_CAP,
                 )
-                # +2 so a duplicate-last perturbation's extra element is observed, not clipped by the cap.
-                pert_items = list(
-                    itertools.islice(wrapped(*args), _GENERATOR_MATERIALIZE_CAP + 2)
-                )
+                with pert_arm:
+                    # +2 so a duplicate-last perturbation's extra element is observed, not clipped by the cap.
+                    pert_items = list(
+                        itertools.islice(wrapped(*args), _GENERATOR_MATERIALIZE_CAP + 2)
+                    )
+            except StepBudgetExceeded:
+                outcomes.append("raised")
+                continue
             # BLE001: the original raised on this input; no codomain evidence
             except Exception:  # noqa: BLE001
+                outcomes.append("raised")
+                continue
+            if orig_arm.stopped or pert_arm.stopped:
                 outcomes.append("raised")
                 continue
             outcomes.append("match" if pert_items == orig_items else "differ")
@@ -8832,23 +9332,57 @@ def check_equivalent(
         if orig_fn is None or mut_fn is None:
             return False
 
+        from Wesker.monitoring import (
+            STEP_BUDGET_FACTOR,
+            STEP_BUDGET_FLOOR,
+            STEP_PROBE_CAP,
+            StepBudgetExceeded,
+            step_cap,
+        )
+
         boundary_inputs = _generate_boundary_inputs(func_node)
         successful_comparisons = 0
+        # W#27: both calls run under a loop budget. These inputs are synthesized, so nothing
+        # guarantees either function terminates on them, and these calls run on the caller's own
+        # thread with no wall bound at all — an unbudgeted runaway here hung the whole run.
+        orig_codes = _step_codes_of(orig_fn)
+        mut_codes = _step_codes_of(mut_fn)
 
         for args in boundary_inputs:
             orig_exc = mut_exc = None
             orig_result = mut_result = None
+            orig_arm = _StepArm(orig_codes, STEP_PROBE_CAP)
             try:
-                orig_result = orig_fn(*args)
+                with orig_arm:
+                    orig_result = orig_fn(*args)
+            except StepBudgetExceeded:
+                pass
             # BLE001: the compared functions raise whatever they raise; the exception is
             # the observation being compared
             except Exception as e:  # noqa: BLE001
                 orig_exc = e
+            if orig_arm.stopped:
+                # The original did not finish this invented input inside the probe budget: the
+                # input says nothing either way, exactly like an input both functions reject.
+                continue
+            mut_arm = _StepArm(
+                mut_codes,
+                step_cap(orig_arm.iterations, STEP_BUDGET_FACTOR, STEP_BUDGET_FLOOR)
+                if orig_arm.counted
+                else STEP_PROBE_CAP,
+            )
             try:
-                mut_result = mut_fn(*args)
+                with mut_arm:
+                    mut_result = mut_fn(*args)
+            except StepBudgetExceeded:
+                pass
             # BLE001: the same observation, on the mutant
             except Exception as e:  # noqa: BLE001
                 mut_exc = e
+            if mut_arm.stopped:
+                # Where the original finished, the mutant ran past its budget. Budget-relative —
+                # not a proof of nontermination — and therefore never evidence of equivalence.
+                return False
 
             # One raises and the other doesn't → NOT equivalent
             if (orig_exc is None) != (mut_exc is None):
@@ -9082,6 +9616,9 @@ def run_function_converged(
             _ISOLATED_WORKER_RECYCLE,
             worker_mem_limit_mb * 1024 * 1024 if worker_mem_limit_mb else None,
         )
+    # One loop budget for this function across every pass and the widen (W#27): each test's
+    # original count is measured once and reused by every mutant.
+    step_plan = step_plan_from_env()
 
     try:
         for pass_idx in range(passes):
@@ -9122,7 +9659,13 @@ def run_function_converged(
                 if isolated:
                     assert _iso_ctx is not None
                     result, _iso_worker, _iso_run = _evaluate_isolated(
-                        _iso_worker, mutant, scoped, _iso_ctx, _cap_ms
+                        _iso_worker,
+                        mutant,
+                        scoped,
+                        _iso_ctx,
+                        _cap_ms,
+                        step_plan,
+                        original_func,
                     )
                     if _iso_run is not None:
                         _mem_cut = _mem_cut or _iso_run.memory_cut
@@ -9136,6 +9679,8 @@ def run_function_converged(
                         qualname=qualname,
                         record_all_killers=full_matrix,
                         source_path=source_path,
+                        step_plan=step_plan,
+                        liveness_ceiling_ms=_remaining_ms,
                     )
                 if result.entered is False:
                     # Kept for the cause (#18): which tests RAN is a prefix of THIS list, and the widen
@@ -9324,7 +9869,13 @@ def run_function_converged(
                 if isolated:
                     assert _iso_ctx is not None
                     _res, _iso_worker, _iso_run = _evaluate_isolated(
-                        _iso_worker, _mutant, _scoped, _iso_ctx, _cap_ms
+                        _iso_worker,
+                        _mutant,
+                        _scoped,
+                        _iso_ctx,
+                        _cap_ms,
+                        step_plan,
+                        original_func,
                     )
                     if _iso_run is not None:
                         _mem_cut = _mem_cut or _iso_run.memory_cut
@@ -9338,6 +9889,8 @@ def run_function_converged(
                         qualname=qualname,
                         record_all_killers=full_matrix,
                         source_path=source_path,
+                        step_plan=step_plan,
+                        liveness_ceiling_ms=_remaining_ms,
                     )
                 if not _res.contained:
                     seen[_mid] = _res

@@ -120,6 +120,9 @@ class IsolatedRun:
     #: capability rather than claiming a guarantee the platform did not keep.
     memory_cut: bool = False
     mem_enforced: bool = False
+    #: W#27 — a node's loop budget stopped the mutant: the named non-kill `diverged`. pytest's exit
+    #: code reads the stopped node as a failure, so the engine checks this before the verdict.
+    diverged: bool = False
 
     @property
     def outcome(self) -> str:
@@ -202,6 +205,17 @@ def run_pytest_node_isolated(
         return IsolatedRun(-9, True, contained, out or "")
     finally:
         _close_pipes(proc)
+
+
+def isolated_selector_key(root: str, selector: str) -> str:
+    """One canonical spelling for a node selector, so the parent and the worker agree on it.
+
+    ``path::case`` with the path resolved against ``root`` through symlinks. The parent maps a
+    worker's failing node back to its test through this, and the loop budget it sends per node
+    (W#27) is keyed by it, so both sides must spell a node the same way.
+    """
+    path, separator, case = selector.partition("::")
+    return os.path.realpath(os.path.join(root, path)) + separator + case
 
 
 def mutant_verdict(outcome: str) -> str:
@@ -699,6 +713,7 @@ class IsolatedMutantWorker:
         mutant_source: str,
         timeout_s: float,
         node_ids: Sequence[str] | None = None,
+        step_caps: dict[str, int] | None = None,
     ) -> IsolatedRun:
         """Evaluate ONE mutant on the reused worker. A hang kills the group and retires the worker.
 
@@ -711,6 +726,9 @@ class IsolatedMutantWorker:
         spec: dict[str, Any] = {"mutant_source": mutant_source}
         if node_ids is not None:
             spec["node_ids"] = list(node_ids)
+        if step_caps:
+            # W#27: per-node loop budgets, keyed by `isolated_selector_key`.
+            spec["step_caps"] = dict(step_caps)
         try:
             # Explicit checks, not `assert`s (see `open`): an assert vanishes under `python -O`.
             if self._proc.stdin is None or self._proc.stdout is None:
@@ -753,6 +771,7 @@ class IsolatedMutantWorker:
             entered_probe=bool(data.get("entered", False)),
             memory_cut=bool(data.get("memory_cut", False)),
             mem_enforced=bool(data.get("enforced", False)),
+            diverged=bool(data.get("diverged", False)),
         )
 
     def _reap(self) -> bool:

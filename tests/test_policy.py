@@ -46,7 +46,10 @@ from Wesker.policy import (
 # W#47: the same policy-8 universe, with single-invocation observation semantics.
 # Policy 9: an existing `return None` is no longer a STATE return_none target (the rewrite was the
 # original program); the corpus gained fp_return_none.
-GOLDEN_POLICY_ID = "9.a75e42829200"
+# W#27: the same policy-9 universe; each mutant observation is bounded by the calibrated loop
+# budget (32x the original's count on that test, plus 10,000), whose time is never charged to the
+# mutant's allowance, and the equivalence probes are budgeted too.
+GOLDEN_POLICY_ID = "9.4f6177eb02c9"
 
 # The same fact, readable: the engine's target counts over the fingerprint
 # corpus. A failure here names the category and function that moved.

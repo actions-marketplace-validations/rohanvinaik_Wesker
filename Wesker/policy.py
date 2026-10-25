@@ -49,6 +49,7 @@ from .engine import (
     _ValueMutator,
     estimate_universe_size,
 )
+from .monitoring import STEP_BUDGET_FACTOR, STEP_BUDGET_FLOOR, STEP_PROBE_CAP
 from .swap_plan import SWAP_PAIR_BUDGET
 
 # 2: DATAFLOW landed (issue #10) — reference substitution enters the universe,
@@ -425,13 +426,23 @@ def mutation_policy(two_sign: bool = False) -> MutationPolicy:
                 "precedence over a crash kill for the same mutant"
             ),
             (
-                "wall-clock bounds yield undetermined, never kills or survival evidence; "
-                "an explicit deterministic step-budget exhaustion is budget-relative, "
-                "not proof of nontermination, and remains unscored and unresolved"
+                "each mutant observation of a test is bounded by a loop budget of "
+                f"{STEP_BUDGET_FACTOR}x the original's backward-jump count on that same "
+                f"test plus {STEP_BUDGET_FLOOR}, armed only where the original passed the "
+                "test under the identical count; exceeding it is the unscored outcome "
+                "diverged — budget-relative, never a kill, survival evidence or proof of "
+                "nontermination; a budgeted observation's wall bound covers reaching its "
+                "cap inside the aggregate deadline and its time is never charged to the "
+                "mutant's allowance, so wall-clock bounds bound liveness only and yield "
+                "undetermined, never kills or survival evidence"
             ),
             (
-                "survivors probe synthesized boundary inputs for likely "
-                "equivalence; equivalence is reported, never silently claimed"
+                "survivors probe synthesized boundary inputs for likely equivalence "
+                f"under a loop budget (the original's {STEP_PROBE_CAP} iterations, the "
+                "mutant's the cap above); an input the original cannot finish inside its "
+                "budget is no evidence, a mutant that exceeds its budget where the "
+                "original finished is never equivalent, and equivalence is reported, "
+                "never silently claimed"
             ),
             (
                 "covering-test scoping and categorical exclusion are "

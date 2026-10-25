@@ -107,9 +107,15 @@ class _MutantPlugin:
         func_qualname: str,
         target_file: str = "",
         mutant_source: str = "",
+        step_caps: dict[str, int] | None = None,
+        project_root: str = "",
     ) -> None:
         self._target_file = target_file
         self._mutant_source = mutant_source
+        #: The loop budget per node, keyed by canonical selector (W#27). The parent counted the
+        #: ORIGINAL on each node in its own process and sends the cap; an absent node is unbudgeted.
+        self._step_caps = step_caps or {}
+        self._project_root = project_root
         self._mutated = mutated_obj
         self._qualname = func_qualname
         self._func_name = func_qualname.split(".")[-1]
@@ -124,13 +130,31 @@ class _MutantPlugin:
         #: True when a node hit `MemoryError` under the worker's address-space cap (W#21) — a budget
         #: CUT, not a kill: the measurement could not complete, so the engine marks it non-gateable.
         self.memory_cut = False
+        #: Nodes whose loop budget stopped the mutant (W#27): the named non-kill `diverged`, never a
+        #: kill reason, whatever pytest's exit code says about the stopped node.
+        self.diverged_nodes: list[str] = []
+        self._mutant_codes: tuple[Any, ...] = ()
 
     def pytest_collection_finish(self, session: Any) -> None:
         """Compile after pytest establishes the actual package/import regime."""
+        from Wesker.engine import _step_codes_of
+
         if self._mutant_source:
             self._mutated = _build_mutant(
                 self._target_file, self._func_name, self._mutant_source
             )
+        self._mutant_codes = (
+            _step_codes_of(self._mutated) if self._mutated is not None else ()
+        )
+
+    def _step_arm_for(self, nodeid: str) -> tuple[tuple[Any, ...], int | None]:
+        """The codes and cap one node's mutant observation runs under (W#27)."""
+        from Wesker.isolation import isolated_selector_key
+
+        cap = self._step_caps.get(isolated_selector_key(self._project_root, nodeid))
+        if cap is None or not self._mutant_codes:
+            return (), None
+        return self._mutant_codes, cap
 
     @pytest.hookimpl(hookwrapper=True)
     def pytest_runtest_call(self, item: Any) -> Any:
@@ -139,6 +163,7 @@ class _MutantPlugin:
             _is_declared_failure,
             _patch_module_qualified,
             _patch_mutant_into_test,
+            _StepArm,
             _unpatch_mutant,
         )
 
@@ -146,6 +171,7 @@ class _MutantPlugin:
         if test_fn is None or self._mutated is None:
             yield
             return
+        arm = _StepArm(*self._step_arm_for(getattr(item, "nodeid", "")))
         with _execution_guard() as proof:
             module_saved = _patch_module_qualified(
                 proof, self._func_name, self._mutated, self._target_file, self._qualname
@@ -157,11 +183,16 @@ class _MutantPlugin:
                 self.installed = True
             self.ran += 1
             try:
-                outcome = yield
+                with arm:
+                    outcome = yield
             finally:
                 _unpatch_mutant(proof, patched, saved, target, self._func_name)
                 for owner, original in reversed(module_saved):
                     setattr(owner, self._func_name, original)
+        if arm.stopped:
+            # Budget-relative, never a kill (W#27): whatever pytest made of the stopped node.
+            self.diverged_nodes.append(getattr(item, "nodeid", ""))
+            return
         self._record(item, outcome, _is_declared_failure)
 
     def _record(self, item: Any, outcome: Any, is_declared_failure: Any) -> None:
@@ -232,7 +263,12 @@ def _resolve_target(root: str, target_file: str) -> str:
 
 
 def _evaluate_full(
-    target_abspath: str, func_qualname: str, node_ids: list[str], mutant_source: str
+    target_abspath: str,
+    func_qualname: str,
+    node_ids: list[str],
+    mutant_source: str,
+    step_caps: dict[str, int] | None = None,
+    project_root: str = "",
 ) -> dict[str, Any]:
     """Run the node IDs against ONE mutant; return its verdict payload.
 
@@ -243,7 +279,12 @@ def _evaluate_full(
     server mode, it cannot land in the JSON-line protocol on stdout; ``--capture=sys`` keeps the same
     isolation at the Python level without touching descriptor 1, the protocol channel.
     """
-    plugin = _MutantPlugin(None, func_qualname, target_abspath, mutant_source)
+    # W#27: per-node loop budgets arrive from the parent, which counted the ORIGINAL on each node in
+    # its own process — never here, where a count pass would run nodes this mutant's first value
+    # kill short-circuits, inside this request's own timeout.
+    plugin = _MutantPlugin(
+        None, func_qualname, target_abspath, mutant_source, step_caps, project_root
+    )
     with (
         contextlib.redirect_stdout(io.StringIO()),
         contextlib.redirect_stderr(io.StringIO()),
@@ -253,6 +294,9 @@ def _evaluate_full(
             plugins=[plugin, _CheapFailureRepr()],
         )
     return {
+        # W#27: a node whose loop budget stopped the mutant — the named non-kill `diverged`, read
+        # by the engine BEFORE pytest's exit code (the stopped node reads as a failure there).
+        "diverged": bool(plugin.diverged_nodes),
         "rc": int(rc),
         "killed_by": aggregate_kill_reason(plugin.reasons) or None,
         "constructed": plugin._mutated is not None,
@@ -379,7 +423,14 @@ def _serve() -> int:
             continue
         spec = json.loads(line)
         nodes = spec.get("node_ids") or session_nodes
-        payload = _evaluate_full(target, qualname, nodes, spec["mutant_source"])
+        payload = _evaluate_full(
+            target,
+            qualname,
+            nodes,
+            spec["mutant_source"],
+            spec.get("step_caps"),
+            session["project_root"],
+        )
         payload["enforced"] = enforced
         real_stdout.write(json.dumps(payload) + "\n")
         real_stdout.flush()
