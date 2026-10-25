@@ -206,6 +206,13 @@ _discovered_for_code: dict[CodeType, set[int]] = {}
 # File normalization & selector matching caches
 _norm_file_cache: dict[str, tuple[str, tuple[int, int] | None]] = {}
 _selector_match_cache: dict[tuple[int, str], bool] = {}
+# Discovery's negative cache (W#29): a file no live selector names, mapped to the selector
+# generation it was checked under. Every selector subscribe and close bumps the generation and
+# clears the map, so an entry written by a decision that raced a change carries the old number
+# and can only cause a re-check, never a missed discovery. Keyed by file, not code, so it never
+# keeps a code object (a mutant's included) alive, and stays bounded by the files that ran.
+_selector_generation = 0
+_unselected_files: dict[str, int] = {}
 
 
 def _file_info(filename: str) -> tuple[str, tuple[int, int] | None]:
@@ -383,46 +390,94 @@ def _dispatch_jump(
     return None
 
 
-def _dispatch_py_start(code: CodeType, offset: int) -> None:
-    cur_thread = threading.get_ident()
+def _discovery_pending(code: CodeType, thread_id: int) -> list[Subscription]:
+    """The selector subscriptions that should attach to ``code`` now, decided WITHOUT the lock.
 
-    # Dynamic discovery for subscriptions with path selectors
-    if _subscriptions_with_selectors:
-        attached_sub_ids = _discovered_for_code.get(code)
-        if attached_sub_ids is None or not set(_subscriptions_with_selectors).issubset(
-            attached_sub_ids
+    Before W#29 this decision ran under the broker lock for every code no selector had attached,
+    and a code whose file no selector names is never attached. So every PY_START of every
+    unselected function in the process took the lock while a trace was live: about 2.4 us of
+    overhead per call, measured with line_coverage's three subscriptions. That was also the
+    contention that put an abandoned runaway in the lock's wait. It is read-only over the registry:
+    the selector match is cached per (subscription, file) and the attached set is only read. A
+    subscription closed after this read is dropped under the lock by :func:`_attach_discovered`.
+
+    A file that no live selector names is recorded in ``_unselected_files`` under the generation
+    read BEFORE deciding, so the dispatcher skips this whole decision for it with one lookup.
+    Thread ownership is never cached: a selected file started on a thread the subscription does
+    not own is decided again on its next start.
+    """
+    generation = _selector_generation
+    attached = _discovered_for_code.get(code, ())
+    pending: list[Subscription] = []
+    named = False
+    for sub in list(_subscriptions_with_selectors.values()):
+        if sub.sub_id in attached:
+            named = True
+            continue
+        if not sub.selector_descriptors or not _matches_selectors(
+            sub.sub_id, code.co_filename, sub.selector_descriptors
         ):
-            acquire_unstranded(_subscriptions_lock)
-            try:
-                for sub in list(_subscriptions_with_selectors.values()):
-                    if not _thread_matches(sub, cur_thread):
-                        continue
-                    if sub.run_token is not None and not is_run_token_active(
-                        sub.run_token
-                    ):
-                        continue
-                    if sub.selector_descriptors and _matches_selectors(
-                        sub.sub_id, code.co_filename, sub.selector_descriptors
-                    ):
-                        nested_codes = _extract_nested_codes(code)
-                        for c in nested_codes:
-                            subs_for_c = _subscriptions_by_code.setdefault(c, [])
-                            if sub not in subs_for_c:
-                                subs_for_c.append(sub)
-                                _discovered_codes_by_sub.setdefault(
-                                    sub.sub_id, set()
-                                ).add(c)
-                                _discovered_for_code.setdefault(c, set()).add(
-                                    sub.sub_id
-                                )
-                                if _tool is not None:
-                                    _recompute_mask(_tool, c)
-            finally:
-                _subscriptions_lock.release()
+            continue
+        named = True
+        if not _thread_matches(sub, thread_id):
+            continue
+        if sub.run_token is not None and not is_run_token_active(sub.run_token):
+            continue
+        pending.append(sub)
+    if not named:
+        _unselected_files[code.co_filename] = generation
+    return pending
+
+
+def _selectors_changed() -> None:
+    """Invalidate discovery's negative cache; called under the broker lock AFTER the set of live
+    selector subscriptions changes. A decision reads the generation before it snapshots the
+    subscriptions, so one tagged with the new generation has seen the change."""
+    global _selector_generation
+    _selector_generation += 1
+    _unselected_files.clear()
+
+
+def _attach_discovered(code: CodeType, pending: list[Subscription]) -> None:
+    """Attach ``pending`` to ``code`` and every code nested in it, under the broker lock.
+
+    The lock is taken only here, and only through :func:`acquire_unstranded` (W#29). A
+    subscription closed since :func:`_discovery_pending` read it is skipped, so discovery never
+    re-attaches what ``close`` has already detached.
+    """
+    nested_codes = _extract_nested_codes(code)
+    acquire_unstranded(_subscriptions_lock)
+    try:
+        for sub in pending:
+            if _active_subscriptions.get(sub.sub_id) is not sub:
+                continue
+            for c in nested_codes:
+                subs_for_c = _subscriptions_by_code.setdefault(c, [])
+                if sub not in subs_for_c:
+                    subs_for_c.append(sub)
+                    _discovered_codes_by_sub.setdefault(sub.sub_id, set()).add(c)
+                    _discovered_for_code.setdefault(c, set()).add(sub.sub_id)
+                    if _tool is not None:
+                        _recompute_mask(_tool, c)
+    finally:
+        _subscriptions_lock.release()
+
+
+def _dispatch_py_start(code: CodeType, offset: int) -> None:
+    # Dynamic discovery for subscriptions with path selectors: decided without the lock, which
+    # only an actual attachment takes, and skipped outright for a file no live selector names.
+    if (
+        _subscriptions_with_selectors
+        and _unselected_files.get(code.co_filename) != _selector_generation
+    ):
+        pending = _discovery_pending(code, threading.get_ident())
+        if pending:
+            _attach_discovered(code, pending)
 
     subs = _subscriptions_by_code.get(code)
     if not subs:
         return
+    cur_thread = threading.get_ident()
     matching_subs = []
     for sub in subs:
         if sub.event != sys.monitoring.events.PY_START or sub.observation.failure:
@@ -649,6 +704,7 @@ def subscribe(
             _active_subscriptions[sub_id] = sub
             if descriptors:
                 _subscriptions_with_selectors[sub_id] = sub
+                _selectors_changed()
             # Install discovery before local instrumentation. With a foreign
             # PY_START callback returning DISABLE, reversing this order loses
             # INSTRUCTION events on the code's first invocation (3.12–3.14).
@@ -673,7 +729,8 @@ def subscribe(
                         _discovered_for_code.pop(c, None)
                 _recompute_mask(tool, c)
             _active_subscriptions.pop(sub_id, None)
-            _subscriptions_with_selectors.pop(sub_id, None)
+            if _subscriptions_with_selectors.pop(sub_id, None) is not None:
+                _selectors_changed()
             _recompute_global_events(tool)
             raise
 
@@ -681,7 +738,8 @@ def subscribe(
             acquire_unstranded(_subscriptions_lock)
             try:
                 _active_subscriptions.pop(sub_id, None)
-                _subscriptions_with_selectors.pop(sub_id, None)
+                if _subscriptions_with_selectors.pop(sub_id, None) is not None:
+                    _selectors_changed()
                 discovered = _discovered_codes_by_sub.pop(sub_id, set())
                 all_codes = expanded_tuple + tuple(discovered)
                 for c in all_codes:
@@ -696,8 +754,12 @@ def subscribe(
                         if not sub_set:
                             _discovered_for_code.pop(c, None)
                     _recompute_mask(tool, c)
-                # Purge match cache for this subscription
-                keys_to_remove = [k for k in _selector_match_cache if k[0] == sub_id]
+                # Purge match cache for this subscription. Snapshot the keys in one C call:
+                # discovery fills this cache without the lock, and a Python-level walk of the
+                # live dict would raise "changed size during iteration" mid-close.
+                keys_to_remove = [
+                    k for k in list(_selector_match_cache) if k[0] == sub_id
+                ]
                 for k in keys_to_remove:
                     _selector_match_cache.pop(k, None)
                 _recompute_global_events(tool)
