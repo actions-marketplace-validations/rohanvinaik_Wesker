@@ -321,28 +321,35 @@ def _effect_standing(
     )
 
 
+def _judge(
+    event: str, args: tuple, window: tuple[list[str], tuple[str, ...], str] | None
+) -> None:
+    """Settle each effect of one audited operation: record a fresh temporary entry, or, while armed,
+    record and prevent a write outside the authority (by raising before the operation runs)."""
+    blocked, roots, protected = window if window is not None else (None, (), "")
+    for effect, raw, dir_fd, follow in _effects(event, args):
+        if blocked is None and effect != "create":
+            continue
+        code, path = _effect_standing(effect, raw, dir_fd, follow, roots, protected)
+        if code == "fresh_temp_entry" and path is not None:
+            _CREATED.add(path)
+        elif blocked is not None and code in ("outside_authority", "unplaceable"):
+            blocked.append(path if path is not None else repr(raw))
+            raise WriteOutsideAuthority(f"{event}: {path or raw!r}")
+        if event in _RENAMES and code == "no_effect":
+            return  # a rename whose source is missing fails; its destination is untouched
+
+
 def _hook(event: str, args: tuple) -> None:
     if event not in _EVENTS:
         return
     window = _ACTIVE
-    if not _concerns(event, args, window):
+    # The second test is this hook's own resolution (a descriptor lookup), never a test's effect.
+    if not _concerns(event, args, window) or getattr(_LOCAL, "busy", False):
         return
-    if getattr(_LOCAL, "busy", False):
-        return  # this hook's own resolution (a descriptor lookup) is not a test's effect
     _LOCAL.busy = True
     try:
-        blocked, roots, protected = window if window is not None else (None, (), "")
-        for effect, raw, dir_fd, follow in _effects(event, args):
-            if blocked is None and effect != "create":
-                continue
-            code, path = _effect_standing(effect, raw, dir_fd, follow, roots, protected)
-            if code == "fresh_temp_entry" and path is not None:
-                _CREATED.add(path)
-            elif blocked is not None and code in ("outside_authority", "unplaceable"):
-                blocked.append(path if path is not None else repr(raw))
-                raise WriteOutsideAuthority(f"{event}: {path or raw!r}")
-            if event in _RENAMES and code == "no_effect":
-                return  # a rename whose source is missing fails; its destination is untouched
+        _judge(event, args, window)
     finally:
         _LOCAL.busy = False
 
