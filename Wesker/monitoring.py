@@ -523,6 +523,25 @@ def _discovery_pending(code: CodeType, thread_id: int) -> list[Subscription]:
     return pending
 
 
+def _discovery_failed(exc: Exception) -> None:
+    """Record that discovery itself failed on every live selector subscription (W#29).
+
+    Discovery runs inside a PY_START callback, on every thread, for every function that starts while
+    a selector subscription is live. An exception it let escape was raised into whatever code had just
+    started. That could be a test, where it read as a crash kill, or the measuring engine itself, where
+    it ended the run: measured 2026-10-25, Wesker's local self-measurement died 27 minutes in with
+    `ValueError: too many values to unpack` out of `_matches_selectors`, raised into the engine's own
+    `inspect.getmodule`. `_notify` and `_dispatch_instruction` already hold the rule this applies
+    here: an observer failure is never the observed code's failure. Every selector subscription could
+    have missed a code here, so each is marked; `SubscriptionHandle.check` then refuses its evidence
+    as `discovery_failed:<type>` at the owning boundary. A BaseException (an `Abandoned` injection, a
+    budget stop) is not caught, and still unwinds the thread as it must.
+    """
+    reason = f"discovery_failed:{type(exc).__name__}"
+    for sub in list(_subscriptions_with_selectors.values()):
+        sub.observation.failure = sub.observation.failure or reason
+
+
 def _selectors_changed() -> None:
     """Invalidate discovery's negative cache; called under the broker lock AFTER the set of live
     selector subscriptions changes. A decision reads the generation before it snapshots the
@@ -564,9 +583,14 @@ def _dispatch_py_start(code: CodeType, offset: int) -> None:
         _subscriptions_with_selectors
         and _unselected_files.get(code.co_filename) != _selector_generation
     ):
-        pending = _discovery_pending(code, threading.get_ident())
-        if pending:
-            _attach_discovered(code, pending)
+        try:
+            pending = _discovery_pending(code, threading.get_ident())
+            if pending:
+                _attach_discovered(code, pending)
+        # BLE001: an observer failure is never the observed code's failure; it is recorded on the
+        # observations that relied on discovery, and the owning boundary refuses them by name
+        except Exception as exc:  # noqa: BLE001
+            _discovery_failed(exc)
 
     subs = _subscriptions_by_code.get(code)
     if not subs:
