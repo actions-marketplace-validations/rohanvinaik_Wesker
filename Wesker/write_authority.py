@@ -119,6 +119,50 @@ class WriteOutsideAuthority(BaseException):
     """
 
 
+class SpeculativeEffectRefused(BaseException):
+    """Code the pair ran on an input it INVENTED tried an effect the measuring process cannot undo (W#29).
+
+    Raised INSIDE the audit hook, before the operation, so it never happens. It is a ``BaseException``
+    for the reason :class:`WriteOutsideAuthority` is one. The window's record is the signal, and
+    swallowing the exception cannot erase it: :class:`contain_speculation` hands the record back.
+    """
+
+
+# The audited operations a SPECULATIVE call may never make (W#29). A speculative call is code the pair
+# runs on inputs it invented, to compare an original with a mutant: Wesker's equivalence check, and the
+# witness searches of its consumers. Each of these acts on the measuring process itself, or on the world
+# outside it, and none can be taken back:
+# - a lowered hard limit cannot be raised again by a non-root process;
+# - a spawned process has already run;
+# - a delivered signal has already been delivered.
+# `os.chdir`, `os.putenv` and `os.unsetenv` change process-wide state that every later relative path or
+# environment read depends on.
+# Measured: the equivalence check ran `_isolated_worker._apply_mem_limit` on invented inputs, and the
+# ORIGINAL set `RLIMIT_AS=(1, 1)` on the measuring process. Seconds later no thread could start
+# (`Thread.start()` waited forever).
+# Only a speculative window refuses these. A real test run keeps them, and a test's own
+# `monkeypatch.chdir(tmp_path)` stays the remedy the write authority prescribes.
+_PROCESS_EFFECTS = frozenset(
+    {
+        "resource.setrlimit",
+        "resource.prlimit",
+        "os.system",
+        "os.exec",
+        "os.posix_spawn",
+        "os.spawn",
+        "os.fork",
+        "os.forkpty",
+        "subprocess.Popen",
+        "os.kill",
+        "os.killpg",
+        "signal.pthread_kill",
+        "os.chdir",
+        "os.putenv",
+        "os.unsetenv",
+    }
+)
+
+
 # The audited operations that change the filesystem. `os.replace` raises "os.rename", and
 # `os.unlink` raises "os.remove"; both spellings are listed so neither depends on that.
 _MKDIR = "os.mkdir"
@@ -254,6 +298,10 @@ _DECLARED: tuple[str, ...] = ()
 # together in one load so a thread racing the window's close sees one window or none — or None while
 # no test runs against a mutant.
 _ACTIVE: tuple[list[str], tuple[str, ...], str] | None = None
+# The armed SPECULATIVE window's record of refused effects (`contain_speculation`, W#29) in its one slot,
+# or None there while nothing runs on an invented input. One load, like `_ACTIVE`, and set by subscript,
+# so arming takes no `global` statement.
+_SPECULATIVE: list[list[str] | None] = [None]
 _LOCAL = threading.local()
 _INSTALL_LOCK = threading.Lock()
 _installed = False
@@ -355,6 +403,11 @@ def _judge(
 
 
 def _hook(event: str, args: tuple) -> None:
+    speculative = _SPECULATIVE[0]
+    if speculative is not None and event in _PROCESS_EFFECTS:
+        # W#29: refused before the operation runs, and recorded where the caller reads it.
+        speculative.append(event)
+        raise SpeculativeEffectRefused(event)
     if event not in _EVENTS:
         return
     window = _ACTIVE
@@ -462,6 +515,39 @@ class contain_writes:
         global _ACTIVE
         if self._previous is not None:
             _ACTIVE, sys.dont_write_bytecode = self._previous
+        return False
+
+
+class contain_speculation:
+    """Refuse the process effects in `_PROCESS_EFFECTS` while code the pair runs on inputs it INVENTED
+    executes; yield the record of what was refused (W#29).
+
+    Resource limits, spawned processes, signals, the working directory and the environment are refused
+    outright. A speculative call is no test the regime set up, and nothing it does to this process can
+    be taken back. Writes are not this window's business: stack it with :class:`contain_writes`, as
+    Wesker's equivalence check does. A caller with its own write guard composes this one alone, as
+    Detective's ContextVar-scoped guard does with its own outcome codes.
+
+    The record is the signal, read after the call: a call that swallowed a refusal still left it there.
+
+    Process-wide while armed, like :class:`contain_writes`, and armed the same way: `__enter__` arms
+    with plain assignments only (W#29's stranded-window case). THE BOUNDARY is the audit hook's. An
+    effect CPython does not audit is outside it: a C extension's own system calls, `os.setuid`, a
+    handler installed with `signal.signal`.
+    """
+
+    def __init__(self) -> None:
+        install()
+        self._refused: list[str] = []
+        self._previous: list[str] | None = None
+
+    def __enter__(self) -> list[str]:
+        self._previous = _SPECULATIVE[0]
+        _SPECULATIVE[0] = self._refused
+        return self._refused
+
+    def __exit__(self, *exc: object) -> bool:
+        _SPECULATIVE[0] = self._previous
         return False
 
 

@@ -67,7 +67,13 @@ from .subsumption import redundancy_groups
 from .swap_plan import SWAP_PAIR_BUDGET, swap_label, swap_plan
 from .tce import WARRANT_BYTECODE, nodes_equivalent
 from .trace_evidence import TraceEvidence, baseline_outcome, build_trace_ledger
-from .write_authority import WRITE_OUTSIDE_AUTHORITY, contain_writes
+from .write_authority import (
+    WRITE_OUTSIDE_AUTHORITY,
+    SpeculativeEffectRefused,
+    WriteOutsideAuthority,
+    contain_speculation,
+    contain_writes,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator
@@ -9675,6 +9681,37 @@ def form_b_equivalence(outcomes: list[str]) -> str:
     return "equivalent"
 
 
+def _speculative_call(
+    fn: Callable[..., Any],
+    args: tuple,
+    arm: _StepArm,
+    records: tuple[list[str], ...],
+) -> tuple[Any, Exception | None, bool]:
+    """One call of an equivalence check on an invented input: ``(result, exception, refused)`` (W#29).
+
+    The call runs under its loop budget (W#27) inside the caller's armed windows: `contain_writes` and
+    `contain_speculation`, whose records are ``records``. ``refused`` is True when either refused an
+    effect during THIS call, whether the refusal propagated or the call swallowed it: a record grew. A
+    budget stop is neither a result nor an exception; the caller reads it from ``arm``.
+    """
+    from Wesker.monitoring import StepBudgetExceeded
+
+    before = sum(len(record) for record in records)
+    result: Any = None
+    exc: Exception | None = None
+    try:
+        with arm:
+            result = fn(*args)
+    except StepBudgetExceeded:
+        pass
+    except (SpeculativeEffectRefused, WriteOutsideAuthority):
+        return None, None, True
+    # BLE001: the compared functions raise whatever they raise; the exception is the observation
+    except Exception as e:  # noqa: BLE001
+        exc = e
+    return result, exc, sum(len(record) for record in records) > before
+
+
 def _check_equivalent_wrapper(
     func_node: ast.FunctionDef | ast.AsyncFunctionDef,
     mutant: Mutant,
@@ -9713,36 +9750,47 @@ def _check_equivalent_wrapper(
         # a loop budget keeps an invented input from hanging the run. A stopped run is NO codomain
         # evidence ("raised") — never "differ", which would score a budget stop as a μ⁻ kill.
         orig_codes = _step_codes_of(orig_fn)
-        for args in _generate_boundary_inputs(func_node):
-            orig_arm = _StepArm(orig_codes, STEP_PROBE_CAP)
-            pert_arm = _StepArm((), None)
-            try:
-                with orig_arm:
-                    orig_items = list(
-                        itertools.islice(orig_fn(*args), _GENERATOR_MATERIALIZE_CAP)
+        # W#29: invented inputs, run in the measuring process. A refused effect, raised or swallowed,
+        # is no evidence of equivalence (see `check_equivalent`).
+        with contain_writes() as blocked, contain_speculation() as refused:
+            for args in _generate_boundary_inputs(func_node):
+                orig_arm = _StepArm(orig_codes, STEP_PROBE_CAP)
+                pert_arm = _StepArm((), None)
+                try:
+                    with orig_arm:
+                        orig_items = list(
+                            itertools.islice(orig_fn(*args), _GENERATOR_MATERIALIZE_CAP)
+                        )
+                    pert_arm = _StepArm(
+                        orig_codes,
+                        step_cap(
+                            orig_arm.iterations, STEP_BUDGET_FACTOR, STEP_BUDGET_FLOOR
+                        )
+                        if orig_arm.counted
+                        else STEP_PROBE_CAP,
                     )
-                pert_arm = _StepArm(
-                    orig_codes,
-                    step_cap(orig_arm.iterations, STEP_BUDGET_FACTOR, STEP_BUDGET_FLOOR)
-                    if orig_arm.counted
-                    else STEP_PROBE_CAP,
-                )
-                with pert_arm:
-                    # +2 so a duplicate-last perturbation's extra element is observed, not clipped by the cap.
-                    pert_items = list(
-                        itertools.islice(wrapped(*args), _GENERATOR_MATERIALIZE_CAP + 2)
-                    )
-            except StepBudgetExceeded:
-                outcomes.append("raised")
-                continue
-            # BLE001: the original raised on this input; no codomain evidence
-            except Exception:  # noqa: BLE001
-                outcomes.append("raised")
-                continue
-            if orig_arm.stopped or pert_arm.stopped:
-                outcomes.append("raised")
-                continue
-            outcomes.append("match" if pert_items == orig_items else "differ")
+                    with pert_arm:
+                        # +2 so a duplicate-last perturbation's extra element is observed, not clipped by the cap.
+                        pert_items = list(
+                            itertools.islice(
+                                wrapped(*args), _GENERATOR_MATERIALIZE_CAP + 2
+                            )
+                        )
+                except StepBudgetExceeded:
+                    outcomes.append("raised")
+                    continue
+                except (SpeculativeEffectRefused, WriteOutsideAuthority):
+                    return False
+                # BLE001: the original raised on this input; no codomain evidence
+                except Exception:  # noqa: BLE001
+                    outcomes.append("raised")
+                    continue
+                if orig_arm.stopped or pert_arm.stopped:
+                    outcomes.append("raised")
+                    continue
+                outcomes.append("match" if pert_items == orig_items else "differ")
+        if blocked or refused:
+            return False
         return form_b_equivalence(outcomes) == "equivalent"
     # BLE001: a non-generator or un-compilable original is conservatively NOT equivalent
     except Exception:  # noqa: BLE001
@@ -9794,7 +9842,6 @@ def check_equivalent(
             STEP_BUDGET_FACTOR,
             STEP_BUDGET_FLOOR,
             STEP_PROBE_CAP,
-            StepBudgetExceeded,
             step_cap,
         )
 
@@ -9806,53 +9853,49 @@ def check_equivalent(
         orig_codes = _step_codes_of(orig_fn)
         mut_codes = _step_codes_of(mut_fn)
 
-        for args in boundary_inputs:
-            orig_exc = mut_exc = None
-            orig_result = mut_result = None
-            orig_arm = _StepArm(orig_codes, STEP_PROBE_CAP)
-            try:
-                with orig_arm:
-                    orig_result = orig_fn(*args)
-            except StepBudgetExceeded:
-                pass
-            # BLE001: the compared functions raise whatever they raise; the exception is
-            # the observation being compared
-            except Exception as e:  # noqa: BLE001
-                orig_exc = e
-            if orig_arm.stopped:
-                # The original did not finish this invented input inside the probe budget: the
-                # input says nothing either way, exactly like an input both functions reject.
-                continue
-            mut_arm = _StepArm(
-                mut_codes,
-                step_cap(orig_arm.iterations, STEP_BUDGET_FACTOR, STEP_BUDGET_FLOOR)
-                if orig_arm.counted
-                else STEP_PROBE_CAP,
-            )
-            try:
-                with mut_arm:
-                    mut_result = mut_fn(*args)
-            except StepBudgetExceeded:
-                pass
-            # BLE001: the same observation, on the mutant
-            except Exception as e:  # noqa: BLE001
-                mut_exc = e
-            if mut_arm.stopped:
-                # Where the original finished, the mutant ran past its budget. Budget-relative —
-                # not a proof of nontermination — and therefore never evidence of equivalence.
-                return False
-
-            # One raises and the other doesn't → NOT equivalent
-            if (orig_exc is None) != (mut_exc is None):
-                return False
-            # Both returned values → compare
-            if orig_exc is None:
-                if orig_result != mut_result:
+        # W#29: these calls run on inputs this engine INVENTED, in the measuring process, so nothing
+        # they do to it may land: `_apply_mem_limit`'s original set RLIMIT_AS=(1, 1) here, and no
+        # thread could start afterwards. A refused effect, raised or swallowed, is no evidence of
+        # equivalence: an effectful function is not one to compare by running it.
+        with contain_writes() as blocked, contain_speculation() as refused:
+            records = (blocked, refused)
+            for args in boundary_inputs:
+                orig_arm = _StepArm(orig_codes, STEP_PROBE_CAP)
+                orig_result, orig_exc, orig_refused = _speculative_call(
+                    orig_fn, args, orig_arm, records
+                )
+                if orig_refused:
                     return False
-                successful_comparisons += 1
-            # Both raised → check exception type matches
-            elif type(orig_exc) is not type(mut_exc):
-                return False
+                if orig_arm.stopped:
+                    # The original did not finish this invented input inside the probe budget: the
+                    # input says nothing either way, exactly like an input both functions reject.
+                    continue
+                mut_arm = _StepArm(
+                    mut_codes,
+                    step_cap(orig_arm.iterations, STEP_BUDGET_FACTOR, STEP_BUDGET_FLOOR)
+                    if orig_arm.counted
+                    else STEP_PROBE_CAP,
+                )
+                mut_result, mut_exc, mut_refused = _speculative_call(
+                    mut_fn, args, mut_arm, records
+                )
+                if mut_refused or mut_arm.stopped:
+                    # Where the original finished, the mutant ran past its budget (budget-relative,
+                    # not a proof of nontermination) or tried an effect the original did not: never
+                    # evidence of equivalence.
+                    return False
+
+                # One raises and the other doesn't → NOT equivalent
+                if (orig_exc is None) != (mut_exc is None):
+                    return False
+                # Both returned values → compare
+                if orig_exc is None:
+                    if orig_result != mut_result:
+                        return False
+                    successful_comparisons += 1
+                # Both raised → check exception type matches
+                elif type(orig_exc) is not type(mut_exc):
+                    return False
 
         # Only declare equivalent if we got at least one real comparison.
         # If ALL inputs raised, we have no evidence of equivalence.
