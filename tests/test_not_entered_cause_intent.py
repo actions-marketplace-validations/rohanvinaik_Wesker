@@ -114,6 +114,19 @@ def run_direct(x):
 _MODULES = ("nemod", "nedeco", "nehelper")
 
 
+@pytest.fixture(autouse=True)
+def _scan_budget_beyond_the_session(monkeypatch):
+    """The holder scan's budget counts values across EVERY module the process has loaded, and these
+    tests assert its logic: a scan that read every module says ``complete``. The full suite under
+    coverage, CI's own run, loads about 720 modules holding just over 500,000 values, the shipped
+    budget's size, so the same assertions read the session's size instead. Measured 2026-10-25:
+    500,550 values at fc661d0, 503,056 once two test modules were added, and a ``budget_cut`` on six
+    of these tests. A budget ten times the shipped one keeps them about the scan."""
+    from Wesker import engine
+
+    monkeypatch.setattr(engine, "_HOLDER_SCAN_BUDGET", 10 * engine._HOLDER_SCAN_BUDGET)
+
+
 @pytest.fixture
 def project(tmp_path, monkeypatch):
     """Three real modules on disk, imported under their own names, as a consumer repo has them."""
