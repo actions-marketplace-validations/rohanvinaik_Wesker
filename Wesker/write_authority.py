@@ -375,23 +375,27 @@ def declared_roots(roots: Iterable[str]) -> Iterator[None]:
 
 
 @contextlib.contextmanager
-def contain_writes() -> Iterator[list[str]]:
+def contain_writes(project_root: str | None = None) -> Iterator[list[str]]:
     """Arm the write authority for ONE test run against a mutant; yield the record of what it prevented.
 
     Process-wide while armed, so a thread the test or the code under test starts is held to the same
     authority as the test's own worker. The record is the measurement's signal, not the exception:
     read it after the run.
 
-    The working directory when the window arms is the project root, and a root that CONTAINS it is
-    no authority at all: the project tree is never a test's room, wherever it happens to be checked
-    out — inside the temporary directory, or inside pytest's own scratch root as the pair's own
-    end-to-end tests put theirs. A root inside the project (a project-local ``--basetemp``) stands.
+    A root that CONTAINS the project tree is no authority at all: the project is never a test's
+    room, wherever it happens to be checked out — inside the temporary directory, or inside pytest's
+    own scratch root as the pair's own end-to-end tests put theirs. A root inside the project (a
+    project-local ``--basetemp``) stands. ``project_root`` names the tree; without it, the working
+    directory when the window arms is taken, which is the project root wherever the window arms
+    BEFORE the test's own setup. The isolated worker arms at the call phase, after a fixture may have
+    changed directory (``monkeypatch.chdir(tmp_path)``, the remedy the refusal itself prescribes), so
+    it passes the root it was started in.
     """
     global _ACTIVE
     install()
     blocked: list[str] = []
     try:
-        protected = os.path.realpath(os.getcwd())
+        protected = os.path.realpath(project_root or os.getcwd())
     except OSError:
         protected = ""
     previous, previous_bytecode = _ACTIVE, sys.dont_write_bytecode

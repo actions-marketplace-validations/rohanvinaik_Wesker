@@ -704,3 +704,65 @@ def test_a_live_session_contains_the_mutant_and_names_it(tmp_path, isolated):
         "the OUTPUT mutants are killed as before: tmp_path writes land"
     )
     assert all(r["mutant_id"] != named[0]["mutant_id"] for r in res.killed_records)
+
+
+@pytest.mark.parametrize("isolated", [False, True], ids=["in_process", "isolated"])
+def test_the_prescribed_remedy_measures_the_mutant_in_both_modes(tmp_path, isolated):
+    """The refusal's own remedy — resolve relative paths inside `tmp_path` (`monkeypatch.chdir`) —
+    must work in both execution modes. The isolated worker arms at the CALL phase, after a fixture has
+    changed directory, so the protected project tree must be the project root, never the working
+    directory at arm time: read that way, `tmp_path` became the protected tree, and the test's own
+    writes into it were refused under the very remedy the refusal prescribes."""
+    from Wesker.ci import _PROJECT_ROOT
+    from Wesker.pytest_runner import run_in_session
+
+    root = tmp_path / "proj"
+    (root / "tests").mkdir(parents=True)
+    (root / "pyproject.toml").write_text(
+        "[project]\nname = 'real'\n\n[tool.pytest.ini_options]\npythonpath = ['.']\n"
+    )
+    (root / "wa_remedy_store.py").write_text(_STORE)
+    (root / "tests" / "test_wa_remedy_store.py").write_text(
+        "import pytest\nfrom wa_remedy_store import save\n\n\n"
+        "@pytest.fixture(autouse=True)\n"
+        "def _inside_tmp(tmp_path, monkeypatch):\n"
+        "    monkeypatch.chdir(tmp_path)\n\n\n"
+        "def test_save_relative():\n"
+        "    assert save('store.json', 'v') == 'store.json'\n"
+        "    with open('store.json') as fh:\n"
+        "        assert fh.read() == 'v'\n"
+    )
+    before = _project_entries(root)
+    node = next(n for n in ast.parse(_STORE).body if getattr(n, "name", "") == "save")
+    names = ("wa_remedy_store", "test_wa_remedy_store", "tests.test_wa_remedy_store")
+
+    def body(calls, session):
+        import wa_remedy_store
+
+        return run_function_profiling(
+            node,
+            "wa_remedy_store.py::save",
+            {MutationCategory.SWAP, MutationCategory.OUTPUT},
+            calls,
+            wa_remedy_store.save,
+            max_per_category=0,
+            isolated=isolated,
+        )
+
+    token = _PROJECT_ROOT.set(str(root))
+    cwd = os.getcwd()
+    try:
+        res = run_in_session(str(root), body)
+    finally:
+        os.chdir(cwd)
+        _PROJECT_ROOT.reset(token)
+        for name in names:
+            sys.modules.pop(name, None)
+    assert res is not None
+    refused = [
+        r for r in res.unscored_records if r["disposition"] == WRITE_OUTSIDE_AUTHORITY
+    ]
+    assert refused == [], [(r["mutant_id"], r.get("blocked_writes")) for r in refused]
+    assert res.total_killed == res.total_mutants >= 3, res.to_dict()
+    after = {e for e in _project_entries(root) if e not in ("__pycache__", ".wesker")}
+    assert after == before

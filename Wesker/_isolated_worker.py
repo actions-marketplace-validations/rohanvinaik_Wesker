@@ -206,7 +206,11 @@ class _MutantPlugin:
                 *session_write_roots(getattr(item, "config", None), create=False),
             )
             try:
-                with arm, declared_roots(roots), contain_writes() as blocked:
+                with (
+                    arm,
+                    declared_roots(roots),
+                    contain_writes(_PROJECT_TREE or None) as blocked,
+                ):
                     outcome = yield
             finally:
                 _unpatch_mutant(proof, patched, saved, target, self._func_name)
@@ -434,10 +438,17 @@ def _trace_baseline_run(target_abspath: str, node_ids: list[str]) -> dict[str, A
     return {"lines": sorted(covered), "outcome": isolated_test_outcome(int(rc), False)}
 
 
+# The project tree this worker measures, recorded at setup (#105): the write authority protects it
+# even after a fixture has changed directory, because the window arms only at the call phase.
+_PROJECT_TREE = ""
+
+
 def _setup(spec: dict[str, Any]) -> None:
+    global _PROJECT_TREE
     # Before collection, so a temporary directory a test module or fixture creates is known (#105).
     install()
     root = spec["project_root"]
+    _PROJECT_TREE = os.path.realpath(root)
     os.chdir(root)
     if root not in sys.path:
         sys.path.insert(0, root)
