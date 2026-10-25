@@ -24,7 +24,7 @@ import sys
 import pytest
 
 from Wesker.action import _completeness_refusal, gate_unresolved
-from Wesker.ci import describe_unresolved, truncation_cause, unresolved_cause
+from Wesker.ci import describe_unresolved, truncation_cause, unresolved_causes
 from Wesker.engine import (
     converged_coverage_depth,
     run_function_converged,
@@ -68,20 +68,21 @@ def test_only_a_run_that_stopped_short_is_cut(
 
 
 @pytest.mark.parametrize(
-    ("unscored_by", "cause"),
+    ("unscored_by", "causes"),
     [
-        ({}, "resolved"),
-        ({"not_entered": 2, "nested_measurement": 1}, "resolved"),
-        ({"diverged": 1}, "diverged"),
-        ({"undetermined": 1}, "undetermined"),
-        ({"undetermined": 1, "diverged": 3}, "undetermined"),
-        ({"undetermined": 0, "diverged": 0}, "resolved"),
+        ({}, ()),
+        ({"not_entered": 2, "nested_measurement": 1}, ()),
+        ({"diverged": 1}, ("diverged",)),
+        ({"undetermined": 1}, ("undetermined",)),
+        # W#51: every cause the function holds, the one with no evidence first.
+        ({"undetermined": 1, "diverged": 3}, ("undetermined", "diverged")),
+        ({"undetermined": 0, "diverged": 0}, ()),
     ],
 )
-def test_the_unresolved_cause_names_the_outcome_with_no_evidence_first(
-    unscored_by, cause
+def test_the_unresolved_causes_name_the_outcome_with_no_evidence_first(
+    unscored_by, causes
 ):
-    assert unresolved_cause(unscored_by) == cause
+    assert unresolved_causes(unscored_by) == causes
 
 
 def test_the_unresolved_functions_are_rendered_under_their_own_remedy():
@@ -198,7 +199,7 @@ def test_the_profiling_path_never_calls_a_no_verdict_mutant_a_cut(loop_target):
     assert truncation_cause(
         record["coverage_depth"], record["budget_exhausted"], record["memory_standing"]
     ) == ("not_truncated")
-    assert unresolved_cause(record["unscored_by"]) in ("undetermined", "diverged")
+    assert set(unresolved_causes(record["unscored_by"])) & {"undetermined", "diverged"}
 
 
 def test_the_converged_path_counts_a_no_verdict_mutant_as_evaluated(loop_target):

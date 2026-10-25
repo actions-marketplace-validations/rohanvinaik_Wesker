@@ -33,7 +33,7 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 
-from Wesker.ci import describe_truncation, describe_unresolved, profile_codebase
+from Wesker.ci import completeness_warnings, profile_codebase
 from Wesker.self_profile import profiler_for_targets
 
 # ---------------------------------------------------------------------------
@@ -526,40 +526,11 @@ def main():
         )
     mutation["execution_mode"] = execution_mode
     print(f"  Execution: {execution_mode}")
-    truncated = mutation.get("total_truncated", 0)
-    if truncated:
-        # A truncated run's unevaluated mutants are missing from BOTH sides of the
-        # ratio, so the percentage below is a sample of whatever was cheap to reach —
-        # not a mutation score. Say so where the number is produced, and name each cut
-        # function under the remedy its cause needs, in the Action refusal's own words.
-        print(
-            f"  !! WARNING: {truncated} function(s) were only PARTIALLY evaluated — the\n"
-            f"     kill rate below is a partial result, not a mutation score.",
-            file=sys.stderr,
-        )
-        detail = describe_truncation(mutation.get("truncated_functions") or [])
-        if detail:
-            print(
-                "\n".join("     " + ln for ln in detail.splitlines()), file=sys.stderr
-            )
-    unresolved = mutation.get("total_unresolved", 0)
-    if unresolved:
-        # Evaluated in full, but with mutants that reached no verdict: missing from both sides of
-        # the ratio like a truncated run's, and named under their own remedy (#27).
-        print(
-            f"  !! WARNING: {unresolved} function(s) hold mutants with no verdict — the kill\n"
-            f"     rate below leaves those questions out of both sides of the ratio.",
-            file=sys.stderr,
-        )
-        print(
-            "\n".join(
-                "     " + ln
-                for ln in describe_unresolved(
-                    mutation.get("unresolved_functions") or []
-                ).splitlines()
-            ),
-            file=sys.stderr,
-        )
+    # A cut or no-verdict function's mutants are missing from both sides of the ratio below; the
+    # one renderer every text surface shares names each under its remedy (W#51).
+    warnings = completeness_warnings(mutation)
+    if warnings:
+        print(warnings, file=sys.stderr)
     equiv = mutation.get("total_equivalent", 0)
     universe = mutation.get("total_universe", 0)
     equiv_note = f" ({equiv} equivalent)" if equiv else ""

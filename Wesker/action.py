@@ -192,7 +192,8 @@ def gate_unresolved(report: dict) -> str | None:
     """Refuse to call a run with no-verdict mutants a completeness measurement (#27).
 
     The sibling of `gate_truncation` for a run that was NOT cut: every mutant was evaluated, but
-    some reached no verdict (a wall-clock bound fired, or a deterministic step budget was exceeded).
+    some reached no verdict (a wall-clock bound fired, a deterministic step budget was exceeded, or
+    a test's write outside its write authority was prevented; `ci.UNSCORED_ROLLUP` holds the list).
     Those questions are missing from both sides of the ratio, exactly as a truncated run's are, so
     the badge refuses — under their own remedy, never the "PARTIALLY evaluated" one, which is false
     of a run that measured everything. ``--allow-truncation`` covers it as it did when these mutants

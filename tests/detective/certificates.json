@@ -41,6 +41,12 @@
     "refusal": "",
     "standing": "complete"
   },
+  "Wesker/ci.py::unresolved_causes": {
+    "cut_reasons": [],
+    "function_digest": "8bdefd32020b222c",
+    "refusal": "",
+    "standing": "complete"
+  },
   "Wesker/engine.py::_baseline_failures": {
     "cut_reasons": [],
     "function_digest": "9ed39ddb1a438d8f",

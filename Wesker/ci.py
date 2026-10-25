@@ -36,6 +36,7 @@ from Wesker.engine import (
     run_function_converged,
 )
 from Wesker.filter import filter_categories, prioritize_categories
+from Wesker.write_authority import WRITE_OUTSIDE_AUTHORITY
 
 # ── ANSI colors for terminal output ──────────────────────────────
 
@@ -1916,8 +1917,35 @@ def truncation_cause(
     return "uncontained"
 
 
-def unresolved_cause(unscored_by: dict) -> str:
-    """Whether a function evaluated in FULL still holds mutants with no verdict (#27, pure — pinned).
+# Every disposition `engine.mutant_disposition` can return outside `SCORED_DISPOSITIONS`, with the part
+# of the rollup that owns it (W#51). The rollup used to read two dispositions by name. So a third,
+# Detective #105's `write_outside_authority`, left the denominator and was named nowhere: a function
+# whose test's write was prevented reported `total_unresolved: 0`. Totality is tested against
+# `mutant_disposition` itself, and `unresolved_causes` reads a disposition this table does not know as
+# unresolved under its own name: a new one can refuse the badge, but it can no longer vanish.
+#
+#   "unresolved"  evaluated in full, but no verdict, so it is missing from both sides of the ratio.
+#                 Counted in `total_unresolved`, named per function in `unresolved_functions`, and
+#                 refused by the badge under its own remedy (`_UNRESOLVED_REMEDIES`).
+#   "truncated"   the run itself stopped short; `truncation_cause` owns it at the function level.
+#   "harness"     the outcome measures the harness, not the suite: the mutant was never built, never
+#                 installed, never entered, or the test it needed runs the engine and was refused
+#                 before it could wait for itself. It leaves the ratio, as it always has.
+UNSCORED_ROLLUP: tuple[tuple[str, str], ...] = (
+    ("undetermined", "unresolved"),
+    ("diverged", "unresolved"),
+    (WRITE_OUTSIDE_AUTHORITY, "unresolved"),
+    ("cut", "truncated"),
+    ("harness_error", "harness"),
+    ("not_installed", "harness"),
+    ("not_entered", "harness"),
+    ("nested_measurement", "harness"),
+)
+
+
+def unresolved_causes(unscored_by: dict) -> tuple[str, ...]:
+    """Every no-verdict cause a function evaluated in FULL still holds, in table order (#27, W#51; pure
+    — pinned).
 
     Truncation answers whether the RUN stopped short. This answers the other question a completeness
     number depends on: whether every evaluated mutant reached a verdict. The two used to share one
@@ -1925,22 +1953,31 @@ def unresolved_cause(unscored_by: dict) -> str:
     was evaluated was refused as "only PARTIALLY evaluated" under the remedy for a test that could
     not be stopped, which is false of both. They are separate facts with separate remedies:
 
-      "undetermined"  a mutant reached the wall-clock bound without a verdict: no kill, no survival,
-                      nothing established. Named first, because it is the one with no evidence at all.
-      "diverged"      a mutant exceeded a deterministic step budget relative to the original's
-                      iterations: budget-relative evidence, never a kill and never proof of
-                      nontermination.
-      "resolved"      every evaluated mutant reached a verdict (other unscored outcomes have their own
-                      owners and are not this decision's business).
+      "undetermined"             a mutant reached the wall-clock bound without a verdict: no kill, no
+                                 survival, nothing established. First, because it has no evidence at all.
+      "diverged"                 a mutant exceeded a deterministic step budget relative to the
+                                 original's iterations: budget-relative evidence, never a kill and
+                                 never proof of nontermination.
+      "write_outside_authority"  a test run against the mutant tried to write outside its write
+                                 authority and the write was prevented before it landed, so the test
+                                 was never observed to pass or fail (W#51).
+      a disposition `UNSCORED_ROLLUP` does not know, under its own name, after the known ones: an
+                                 unmapped outcome is never read as a verdict.
+      ()                         every evaluated mutant reached a verdict (the "truncated" and
+                                 "harness" dispositions are owned elsewhere in the table).
+
+    ALL present causes, not the first. A function holding both undetermined and write-refused mutants
+    used to be listed under one cause with that cause's mutants only, so the others were named nowhere.
 
     Read off ``unscored_by``, the per-disposition counts `ProfilingResult.to_dict` emits, so the
     rollup consumes the engine's record instead of re-deriving it.
     """
-    if unscored_by.get("undetermined", 0):
-        return "undetermined"
-    if unscored_by.get("diverged", 0):
-        return "diverged"
-    return "resolved"
+    owners = dict(UNSCORED_ROLLUP)
+    present = {disposition for disposition, count in unscored_by.items() if count}
+    known = [
+        d for d, owner in UNSCORED_ROLLUP if owner == "unresolved" and d in present
+    ]
+    return (*known, *sorted(present - owners.keys()))
 
 
 # The remedy each cause needs, in the order a reader should act on them: a worker that could not be
@@ -2033,8 +2070,41 @@ def describe_truncation(truncated: list[dict], limit: int = 20) -> str:
     return "\n".join(blocks)
 
 
-# The remedy each unresolved cause needs. Neither is a budget problem by default: a larger budget
-# helps an undetermined mutant only when it was merely slow, and never a diverged one.
+def completeness_warnings(mutation: dict) -> str:
+    """The warnings a codebase rollup's ratio must carry beside it, or "" when it needs none (W#51, pure).
+
+    One renderer for every text surface that prints the rollup: `python -m Wesker` and
+    `Wesker.metrics`. A cut function's unevaluated mutants and an unresolved function's no-verdict
+    mutants are missing from BOTH sides of the ratio. Before W#51 only `Wesker.metrics` said so, and
+    `python -m Wesker` printed the bare kill rate and exited 0 with the cause named nowhere.
+    """
+    lines: list[str] = []
+    truncated = mutation.get("total_truncated", 0)
+    if truncated:
+        # The percentage is a sample of whatever was cheap to reach, not a mutation score. Each
+        # cut function is named under the remedy its cause needs, in the Action refusal's words.
+        lines += [
+            f"  !! WARNING: {truncated} function(s) were only PARTIALLY evaluated — the",
+            "     kill rate below is a partial result, not a mutation score.",
+        ]
+        detail = describe_truncation(mutation.get("truncated_functions") or [])
+        lines += ["     " + ln for ln in detail.splitlines()]
+    unresolved = mutation.get("total_unresolved", 0)
+    if unresolved:
+        # Evaluated in full, but with mutants that reached no verdict: missing from both sides of
+        # the ratio like a truncated run's, and named under their own remedy (#27).
+        lines += [
+            f"  !! WARNING: {unresolved} function(s) hold mutants with no verdict — the kill",
+            "     rate below leaves those questions out of both sides of the ratio.",
+        ]
+        detail = describe_unresolved(mutation.get("unresolved_functions") or [])
+        lines += ["     " + ln for ln in detail.splitlines()]
+    return "\n".join(lines)
+
+
+# The remedy each unresolved cause in `UNSCORED_ROLLUP` needs. None is a budget problem by default: a
+# larger budget helps an undetermined mutant only when it was merely slow, never a diverged one, and
+# never a prevented write, whose repair is in the test.
 _UNRESOLVED_REMEDIES = (
     (
         "undetermined",
@@ -2051,6 +2121,17 @@ _UNRESOLVED_REMEDIES = (
             "A mutant exceeded the deterministic step budget relative to the original's iterations "
             "— budget-relative evidence, never a kill and never proof of nontermination, so its "
             "question is missing from both sides of the ratio."
+        ),
+    ),
+    (
+        WRITE_OUTSIDE_AUTHORITY,
+        (
+            "A test run against the mutant tried to write outside its write authority (the "
+            "session's pytest temporary directory, or a temporary entry the test created). The "
+            "write was prevented before it landed, so the test was never observed to pass or fail "
+            "and the mutant's question is missing from both sides of the ratio. Keep the test's "
+            "writes inside its temporary directory (resolve relative paths there, e.g. "
+            "monkeypatch.chdir(tmp_path)) to measure it."
         ),
     ),
 )
@@ -2210,8 +2291,8 @@ def profile_codebase(
             # A run that was NOT cut can still hold mutants with no verdict (#27). Before the depth
             # stopped calling them a cut, they reached this gate as "truncated", named under the
             # wrong remedy (a test that could not be stopped); now they reach it under their own.
-            unresolved = unresolved_cause(dict(r.get("unscored_by") or {}))
-            if unresolved != "resolved":
+            # One entry per cause the function holds (W#51), each naming that cause's own mutants.
+            for unresolved in unresolved_causes(dict(r.get("unscored_by") or {})):
                 unresolved_functions.append(
                     {
                         "function_key": r.get("function_key", ""),
@@ -2329,10 +2410,11 @@ def profile_codebase(
         # remedy instead of a count.
         "truncated_functions": truncated_functions,
         # Functions evaluated in full whose universe still holds a mutant with no verdict
-        # (`unresolved_cause`): those mutants are missing from both sides of the ratio, so a
+        # (`unresolved_causes`): those mutants are missing from both sides of the ratio, so a
         # non-zero count means the number is not a completeness measurement either — but nothing
-        # was cut, so it is reported apart from truncation, with its own remedy.
-        "total_unresolved": len(unresolved_functions),
+        # was cut, so it is reported apart from truncation, with its own remedy. A FUNCTION count:
+        # a function holding two causes has an entry under each (W#51) and is counted once.
+        "total_unresolved": len({u["function_key"] for u in unresolved_functions}),
         "unresolved_functions": unresolved_functions,
         "passes": passes,
         "elapsed_ms": round(elapsed),

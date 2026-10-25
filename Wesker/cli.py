@@ -188,6 +188,14 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps(output, indent=2))
     else:
         if not args.quiet:
+            # A cut or no-verdict function's mutants are missing from both sides of the ratio
+            # below. Say so before the number, in the renderer `Wesker.metrics` shares (W#51):
+            # this summary used to print the bare kill rate and exit 0 with the cause unnamed.
+            from Wesker.ci import completeness_warnings
+
+            warnings = completeness_warnings(result)
+            if warnings:
+                print(warnings, file=sys.stderr)
             print(f"\n{'─' * 50}")
             print(
                 f"Kill rate: {result['kill_pct']}% ({result['total_killed']}/{result['total_mutants']})"
