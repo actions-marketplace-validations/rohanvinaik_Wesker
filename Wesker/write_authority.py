@@ -374,8 +374,8 @@ def declared_roots(roots: Iterable[str]) -> Iterator[None]:
         _DECLARED = previous
 
 
-@contextlib.contextmanager
-def contain_writes(project_root: str | None = None) -> Iterator[list[str]]:
+# Lower-case on purpose: every call site still reads as the verb, `with contain_writes() as blocked:`.
+class contain_writes:
     """Arm the write authority for ONE test run against a mutant; yield the record of what it prevented.
 
     Process-wide while armed, so a thread the test or the code under test starts is held to the same
@@ -390,26 +390,48 @@ def contain_writes(project_root: str | None = None) -> Iterator[list[str]]:
     BEFORE the test's own setup. The isolated worker arms at the call phase, after a fixture may have
     changed directory (``monkeypatch.chdir(tmp_path)``, the remedy the refusal itself prescribes), so
     it passes the root it was started in.
+
+    A CLASS, not a ``@contextmanager`` (W#29). The window is process-wide state, and a generator that
+    arms before its ``yield`` leaves a check, the one after ``next()`` returns inside ``__enter__``,
+    where an ``interrupt.abandon`` injection lands with the window already armed, before any
+    ``finally`` can disarm it. The engine arms this inside abandonable workers on the dogfood path.
+    Here everything that can raise or yield the GIL runs before arming, and ``__enter__`` arms with
+    plain assignments and returns, so no eval-breaker check lies between arming and the protected
+    ``with`` body.
     """
-    global _ACTIVE
-    install()
-    blocked: list[str] = []
-    try:
-        protected = os.path.realpath(project_root or os.getcwd())
-    except OSError:
-        protected = ""
-    previous, previous_bytecode = _ACTIVE, sys.dont_write_bytecode
-    roots = tuple(
-        root
-        for root in (*_DECLARED, *_device_roots())
-        if not (protected and _contains(root, protected))
-    )
-    _ACTIVE = (blocked, roots, protected)
-    sys.dont_write_bytecode = True
-    try:
-        yield blocked
-    finally:
-        _ACTIVE, sys.dont_write_bytecode = previous, previous_bytecode
+
+    def __init__(self, project_root: str | None = None) -> None:
+        install()
+        self._blocked: list[str] = []
+        try:
+            protected = os.path.realpath(project_root or os.getcwd())
+        except OSError:
+            protected = ""
+        self._window = (
+            self._blocked,
+            tuple(
+                root
+                for root in (*_DECLARED, *_device_roots())
+                if not (protected and _contains(root, protected))
+            ),
+            protected,
+        )
+        self._previous: (
+            tuple[tuple[list[str], tuple[str, ...], str] | None, bool] | None
+        ) = None
+
+    def __enter__(self) -> list[str]:
+        global _ACTIVE
+        self._previous = (_ACTIVE, sys.dont_write_bytecode)
+        _ACTIVE = self._window
+        sys.dont_write_bytecode = True
+        return self._blocked
+
+    def __exit__(self, *exc: object) -> bool:
+        global _ACTIVE
+        if self._previous is not None:
+            _ACTIVE, sys.dont_write_bytecode = self._previous
+        return False
 
 
 def session_write_roots(config: object, create: bool = True) -> tuple[str, ...]:

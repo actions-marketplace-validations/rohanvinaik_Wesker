@@ -774,3 +774,26 @@ def test_the_prescribed_remedy_measures_the_mutant_in_both_modes(tmp_path, isola
     assert swap and swap[0]["killed"] == swap[0]["total"] >= 1, swap
     after = {e for e in _project_entries(root) if e not in ("__pycache__", ".wesker")}
     assert after == before
+
+
+def test_arming_the_window_leaves_no_check_before_the_with_protects_it():
+    """W#29's window, closed by construction for the process-wide write guard.
+
+    An `interrupt.abandon` injection lands at the next eval-breaker check, and a call's return is one.
+    Armed by a `@contextmanager`, the window stood open at the check after `next()` returned inside
+    `__enter__`, with no `finally` able to disarm it. `contain_writes` is a class so that, once
+    `_ACTIVE` is stored, `__enter__` makes no call before it returns. A later edit that adds one fails
+    here, by name, instead of reopening the window.
+    """
+    import dis
+
+    from Wesker.write_authority import contain_writes as cw
+
+    ops = list(dis.get_instructions(cw.__enter__))
+    armed = next(
+        i
+        for i, op in enumerate(ops)
+        if op.opname == "STORE_GLOBAL" and op.argval == "_ACTIVE"
+    )
+    after = [op.opname for op in ops[armed + 1 :]]
+    assert not [name for name in after if name.startswith("CALL")], after
