@@ -5770,8 +5770,19 @@ def _patch_mutant_into_test(
         test_globals, closure_bindings, test_module, qualname
     )
     if owner is not None and hasattr(owner, func_name):
+        # W#38: the owner was resolved, so the owner is the only correct binding site. When it
+        # cannot take the binding the mutant is NOT INSTALLED — never a crash that ends the whole
+        # file's profile, and never a fall-through to the bare-name strategies below, which for a
+        # name like `__name__` would rebind the TEST module's own `__name__` global.
+        if _metaclass_owns_name(owner, func_name):
+            return False, None, None
         saved = _get_raw_attr(owner, func_name)
-        setattr(owner, func_name, _preserve_descriptor_shape(saved, mutated_obj))
+        try:
+            setattr(owner, func_name, _preserve_descriptor_shape(saved, mutated_obj))
+        except (TypeError, AttributeError):
+            # An immutable type, a slot or read-only attribute, a descriptor that validates its
+            # value: the original stays bound, so nothing must be restored either.
+            return False, None, None
         return True, saved, owner
 
     closure_cell = _find_closure_cell(closure_bindings, func_name)
@@ -5891,6 +5902,27 @@ def _find_closure_cell(
         if name == func_name:
             return cell
     return None
+
+
+def _metaclass_owns_name(owner: Any, name: str) -> bool:
+    """Whether assigning ``name`` on the class ``owner`` lands on its METACLASS, not the class (W#38).
+
+    ``setattr(cls, name, value)`` consults ``type(cls)``'s MRO first, and a DATA descriptor found
+    there (one whose type defines ``__set__``) takes the assignment instead of ``cls.__dict__``.
+    ``type`` owns ``__name__``, ``__qualname__``, ``__doc__``, ``__module__`` and ``__bases__`` that
+    way, so a class body that defines a property named ``__name__`` (toolz's ``Compose``) can never
+    have that entry rebound: the assignment reaches ``type.__name__``'s setter, which accepts only a
+    str (measured: "can only assign string to Compose.__name__, not 'function'"), and the same lookup
+    is why ``Compose.__name__`` reads the class's own name rather than the property. Ordinary method
+    names (``__call__``, ``__init__``) are non-data slots on ``type`` and stay rebindable.
+    """
+    if not isinstance(owner, type):
+        return False
+    for klass in type(owner).__mro__:
+        attr = klass.__dict__.get(name)
+        if attr is not None and hasattr(type(attr), "__set__"):
+            return True
+    return False
 
 
 def _get_raw_attr(owner: Any, attr_name: str) -> Any:
