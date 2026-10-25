@@ -23,6 +23,19 @@ until that call returns on its own. `abandon` returns False there rather than cl
 did not make. Bounding that for real needs process isolation, which is a different engine than an
 in-process one.
 
+THE STRANDED LOCK (W#29). The injection lands at the target's next eval-breaker check, and the
+check right after a call returns is one of them. A thread parked in a CONTENDED acquire releases
+the GIL, so the injection is made while it waits; the lock is then handed to it, the acquire
+returns, and the exception is raised at that call's own check, with the lock held and before any
+``try`` or ``with`` that would release it. The thread unwinds and exits owning a lock nobody can
+release, and every later acquirer in every thread waits forever. ``with lock:`` is exposed on
+3.14, which compiles the statement to ``LOAD_SPECIAL __enter__; CALL 0`` and only then begins
+the protected range (3.11–3.13's single ``BEFORE_WITH`` opcode had no check there). A
+``@contextmanager`` wrapper, or a bare ``acquire()`` written before its ``try``, is exposed on
+every supported version: the acquire is its own call. Code that abandonment can reach takes its
+locks through :func:`acquire_unstranded` and releases them in the very next ``try``'s
+``finally``.
+
 THE START/JOIN EDGE (#28). One blocking call that boundary covers is ENTIRELY the pair's own: the
 execution lock. A test that runs the engine, measured inside a held evaluation, parks its worker in
 the lock's C-level acquire while the lock's owner — the very thread that started the worker and is
@@ -205,3 +218,37 @@ def bounded_join(
                 thread.join(timeout=unwind_s)
                 contained = not thread.is_alive()
     return timed_out, contained
+
+
+def acquire_unstranded(lock: Any, timeout: float = -1) -> bool:
+    """Take an RLock so that an injected :class:`Abandoned` cannot strand it (W#29). The caller
+    writes ``try: … finally: lock.release()`` on the next line, never ``with lock:``.
+
+    MEASURED 2026-10-25: Wesker's whole-codebase CI run sat silent for six hours on 10 pushes of
+    10. Its all-thread dump showed exactly two threads, both parked acquiring the monitoring
+    broker's lock. An RLock never blocks its own owner, so neither thread held it: the owner was
+    a test's runaway thread, abandoned while it was taking that lock, and by then dead (the
+    module docstring's STRANDED LOCK). On a deterministic harness (lock contended, injection made
+    while the taker waits, lock then handed over), ``with lock:`` strands 50/50 on 3.14 and 0/50
+    on 3.12 and 3.13. A ``@contextmanager`` strands 40/40 on all three. This function strands
+    0/40 on all three.
+
+    THE CLOSE: the acquire runs INSIDE the ``try``, so an exception raised at the check after it
+    returns lands in the handler, which undoes exactly this acquire. The test is the recursion
+    DEPTH, not ``_is_owned``: a re-entrant entry already owns the lock, so only the depth says
+    whether this acquire took (``_recursion_count`` is on the C RLock in every supported version;
+    ``test_rlock_recursion_count_still_reports_depth`` fails loudly if CPython drops it).
+    Returning here and then entering the caller's ``try`` passes no eval-breaker check, so
+    nothing can land between the two.
+
+    One injection per thread is the model ``abandon`` provides. A second asynchronous exception
+    arriving inside the handler itself could still strand the lock; nothing in the pair sends
+    one.
+    """
+    depth = lock._recursion_count()
+    try:
+        return lock.acquire(timeout=timeout)
+    except BaseException:
+        if lock._recursion_count() > depth:
+            lock.release()
+        raise

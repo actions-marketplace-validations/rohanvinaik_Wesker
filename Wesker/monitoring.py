@@ -30,6 +30,8 @@ from dataclasses import dataclass, field
 from types import CodeType
 from typing import Any, Self
 
+from .interrupt import acquire_unstranded
+
 TOOL_NAME = "wesker"
 # Ids 3 and 4 have no assigned role (0 debugger, 1 coverage, 2 profiler, 5 optimizer): tried first.
 _PREFERRED_IDS = (3, 4, 2, 5, 0, 1)
@@ -124,10 +126,12 @@ def registered_thread(thread_id: int) -> threading.Thread | None:
     return registry.get(thread_id)
 
 
-# Callbacks run in workers that may receive an asynchronous Abandoned exception.
-# They must never own a Python lock: abandonment can strand it after the worker
-# exits. For integer tokens these CPython built-ins finish before the next Python
-# bytecode boundary; no user-defined hash/equality or observer runs inside them.
+# Callbacks run in workers that may receive an asynchronous Abandoned exception,
+# and abandonment can strand a lock taken with `with` (interrupt's STRANDED LOCK).
+# Run tokens therefore take no lock at all: for integer tokens these CPython
+# built-ins finish before the next Python bytecode boundary, and no user-defined
+# hash/equality or observer runs inside them. The broker's one lock is taken only
+# through `acquire_unstranded`, released in the next `try`'s `finally` (W#29).
 _token_seq = itertools.count(1)
 _active_run_tokens: set[int] = set()
 
@@ -183,6 +187,10 @@ class Subscription:
 
 _sub_id_seq = 0
 _delivery_seq = itertools.count(1)
+# Never `with _subscriptions_lock:`. PY_START discovery takes it inside a callback, on every
+# thread, including a test's runaway that a bounded join is abandoning; under `with`, 3.14
+# stranded it there and deadlocked Wesker's own whole-codebase run (W#29). Every site uses
+# `acquire_unstranded(_subscriptions_lock)` followed at once by `try: ... finally: release()`.
 _subscriptions_lock = threading.RLock()
 # Maps CodeType -> list of active subscriptions on that code
 _subscriptions_by_code: dict[CodeType, list[Subscription]] = {}
@@ -384,7 +392,8 @@ def _dispatch_py_start(code: CodeType, offset: int) -> None:
         if attached_sub_ids is None or not set(_subscriptions_with_selectors).issubset(
             attached_sub_ids
         ):
-            with _subscriptions_lock:
+            acquire_unstranded(_subscriptions_lock)
+            try:
                 for sub in list(_subscriptions_with_selectors.values()):
                     if not _thread_matches(sub, cur_thread):
                         continue
@@ -408,6 +417,8 @@ def _dispatch_py_start(code: CodeType, offset: int) -> None:
                                 )
                                 if _tool is not None:
                                     _recompute_mask(_tool, c)
+            finally:
+                _subscriptions_lock.release()
 
     subs = _subscriptions_by_code.get(code)
     if not subs:
@@ -599,7 +610,8 @@ def subscribe(
             desc_list.append((real_path, dev_ino, os.path.isdir(real_path)))
         descriptors = tuple(desc_list)
 
-    with _subscriptions_lock:
+    acquire_unstranded(_subscriptions_lock)
+    try:
         # Check compatibility across all requested code objects
         for c in expanded_tuple:
             existing = _subscriptions_by_code.get(c, [])
@@ -666,7 +678,8 @@ def subscribe(
             raise
 
         def _do_close() -> None:
-            with _subscriptions_lock:
+            acquire_unstranded(_subscriptions_lock)
+            try:
                 _active_subscriptions.pop(sub_id, None)
                 _subscriptions_with_selectors.pop(sub_id, None)
                 discovered = _discovered_codes_by_sub.pop(sub_id, set())
@@ -688,8 +701,12 @@ def subscribe(
                 for k in keys_to_remove:
                     _selector_match_cache.pop(k, None)
                 _recompute_global_events(tool)
+            finally:
+                _subscriptions_lock.release()
 
         return SubscriptionHandle(sub, _do_close)
+    finally:
+        _subscriptions_lock.release()
 
 
 def release_monitoring_tool() -> None:
@@ -700,7 +717,8 @@ def release_monitoring_tool() -> None:
     leak-free teardown on Python 3.12 where ``free_tool_id`` does not auto-clear).
     """
     global _tool
-    with _subscriptions_lock:
+    acquire_unstranded(_subscriptions_lock)
+    try:
         if _active_subscriptions or _subscriptions_by_code:
             raise ActiveSubscriptionsError(
                 f"cannot release monitoring tool: {len(_active_subscriptions)} active subscriptions"
@@ -722,6 +740,8 @@ def release_monitoring_tool() -> None:
             mon.set_events(tid, 0)
             mon.free_tool_id(tid)
             _tool = None
+    finally:
+        _subscriptions_lock.release()
 
 
 # ── Step budget implementation on top of owned subscriptions ──────────────────
