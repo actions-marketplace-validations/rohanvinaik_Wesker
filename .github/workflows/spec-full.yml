@@ -1,14 +1,21 @@
 # THE BADGE RUN — whole codebase, uncompromised.
 #
 # Nothing waits on this. No human is watching a spinner and no merge is blocked, so it has no
-# latency budget at all: it runs on a schedule and writes an SVG that the README serves all
-# week. On a public repo GitHub's standard runners are free, so even a long run costs nothing
-# that matters.
+# latency budget at all: it runs weekly and on every push to main, and writes an SVG to the
+# `badges` branch (README.archive.md and docs/usage.md show how to serve it). On a public repo
+# GitHub's standard runners are free, so even a long run costs nothing that matters.
 #
 # That is why it does NOT pass --allow-truncation. The one place a completeness measurement
 # should refuse to compromise is the place with no deadline: a truncated run is a sample of
 # whatever was cheap to reach, and a sample must never be badged as completeness. If this
 # fails on a budget, raise the budget — do not lower the claim.
+#
+# No latency budget is not no bound. `timeout-minutes` bounds LIVENESS, never the measurement
+# (the per-function budget below is the measurement's bound): 180 minutes is over four times the
+# slowest run this job has completed (39 min, 2026-09-21). A run that stalls must end with
+# evidence of where it stalled, so WESKER_STACK_DUMP_S dumps every thread's stack every 15 minutes
+# to a private copy of stderr — every push of 2026-10-24 sat silent for six hours and left none.
+# A newer push supersedes a running measurement of older code (`concurrency`).
 #
 # Actions are pinned to full commit SHAs (the release in the trailing comment): a tag can be moved
 # to point at different code, a commit cannot.
@@ -26,10 +33,17 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: spec-full-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   spec_full:
     name: Specification completeness
     runs-on: ubuntu-latest
+    timeout-minutes: 180
+    env:
+      WESKER_STACK_DUMP_S: "900"
     permissions:
       contents: write
       security-events: write

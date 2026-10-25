@@ -383,6 +383,75 @@ def _fail(reason: str) -> int:
     return 1
 
 
+def stack_dump_setting(raw: str) -> tuple[str, int]:
+    """Whether the run arms a periodic all-thread stack dump, and how often (pure — pinned).
+
+    A whole-codebase run that stalls prints nothing until the CI job's own limit kills it, and
+    that leaves no evidence of WHERE it stalled: every push of 2026-10-24 sat silent for six hours
+    after "Whole codebase — 22 file(s)." ``WESKER_STACK_DUMP_S`` asks for a dump of every thread's
+    stack at a fixed interval instead. Three codes, because absent and malformed are different
+    facts and a typo must not read as "off":
+
+    * ``off``     — unset or blank: nothing is armed, the default for every caller.
+    * ``armed``   — a positive whole number of seconds: dump every that many seconds.
+    * ``invalid`` — anything else (zero, a sign, a fraction, text): nothing is armed, and the run
+      says so.
+    """
+    text = raw.strip()
+    if not text:
+        return "off", 0
+    if not text.isdecimal():
+        return "invalid", 0
+    seconds = int(text)
+    if seconds <= 0:
+        return "invalid", 0
+    return "armed", seconds
+
+
+def _arm_stack_dump(seconds: int) -> Callable[[], None]:
+    """Arm a periodic all-thread stack dump on a PRIVATE copy of stderr; return its cancel.
+
+    The copy is the point. The live pytest session captures at the descriptor level, and
+    self-profiling runs mutants of that capture machinery, so fd 2 can point at a capture file —
+    or be closed — for long stretches of the run (see ``_stream_reentry``). A dump written to fd 2
+    there vanishes with the capture. A descriptor duplicated before profiling starts still reaches
+    the CI log. ``repeat=True`` and no exit: the job's own time limit ends the run, and successive
+    dumps show whether a stall moves. A diagnostic must never break the run it observes, so a
+    failure to arm degrades to a cancel that does nothing.
+    """
+    import faulthandler
+
+    try:
+        stream = os.fdopen(os.dup(sys.stderr.fileno()), "w")
+    # BLE001: a diagnostic degrades silently; it never fails the run it observes
+    except Exception:  # noqa: BLE001
+        return lambda: None
+    try:
+        faulthandler.dump_traceback_later(seconds, repeat=True, file=stream)
+    # BLE001: a diagnostic degrades silently; it never fails the run it observes
+    except Exception:  # noqa: BLE001
+        stream.close()
+        return lambda: None
+
+    def cancel() -> None:
+        faulthandler.cancel_dump_traceback_later()
+        stream.close()
+
+    return cancel
+
+
+def _stack_dump_from_env() -> Callable[[], None]:
+    """Arm the dump ``WESKER_STACK_DUMP_S`` asks for and return its cancel (a no-op when off)."""
+    code, seconds = stack_dump_setting(os.environ.get("WESKER_STACK_DUMP_S", ""))
+    if code == "invalid":
+        print(
+            "WARNING: WESKER_STACK_DUMP_S must be a positive whole number of seconds; "
+            "no stack dump is armed",
+            file=sys.stderr,
+        )
+    return _arm_stack_dump(seconds) if code == "armed" else (lambda: None)
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="python -m Wesker.action",
@@ -448,6 +517,7 @@ def main(argv: list[str] | None = None) -> int:
     # engine here, exactly as before.
     profile_codebase_live = profiler_for_targets(targets)
     reenter_streams = _stream_reentry()
+    cancel_stack_dump = _stack_dump_from_env()
     try:
         report = profile_codebase_live(
             ".",
@@ -458,6 +528,7 @@ def main(argv: list[str] | None = None) -> int:
             verbose=True,
         )
     finally:
+        cancel_stack_dump()
         # Everything from here down is the REPORT — gates, SARIF, annotations,
         # outputs, summary, banner — and must not inherit a corpse fd from a
         # hostile mutant of the capture machinery.
