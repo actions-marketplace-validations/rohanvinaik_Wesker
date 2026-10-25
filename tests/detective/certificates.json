@@ -112,6 +112,24 @@
     "refusal": "",
     "standing": "complete"
   },
+  "Wesker/monitoring.py::armed_wall_ms": {
+    "cut_reasons": [],
+    "function_digest": "0ca1ab470c6af077",
+    "refusal": "",
+    "standing": "complete"
+  },
+  "Wesker/monitoring.py::mutant_step_cap": {
+    "cut_reasons": [],
+    "function_digest": "c980617f8669da44",
+    "refusal": "",
+    "standing": "complete"
+  },
+  "Wesker/monitoring.py::original_step_observation": {
+    "cut_reasons": [],
+    "function_digest": "a524a0ff758823f3",
+    "refusal": "",
+    "standing": "complete"
+  },
   "Wesker/monitoring.py::step_budget_verdict": {
     "cut_reasons": [],
     "function_digest": "d8eca6039415c200",

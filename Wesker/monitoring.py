@@ -87,6 +87,100 @@ def step_cap(original_iterations: int, factor: int, floor: int) -> int:
     return max(0, original_iterations) * factor + floor
 
 
+#: The factor and floor every mutant observation's loop budget is built from (W#27): a mutant may
+#: make STEP_BUDGET_FACTOR times the loop iterations its ORIGINAL made on the same test, plus
+#: STEP_BUDGET_FLOOR. Chosen from measurement, not taste — see
+#: docs/STEP_BUDGET_CALIBRATION_2026-10-25.md for the corpus, the distribution of terminating
+#: mutants' ratios, and the margin rule. In short: the furthest any of 3,176 terminating mutant
+#: observations went was 4.44x a large original (3,272 -> 14,523) and 1,075 iterations from an
+#: original of 3 (a ``//`` -> ``/`` halving loop running the float-underflow tail). 32 is the
+#: smallest power of two that keeps 5x headroom over the first, and 10,000 the smallest 1-2-5 step
+#: that keeps it over the second. Both values are part of the mutation policy's observation clause,
+#: so changing either moves the policy id.
+STEP_BUDGET_FACTOR = 32
+STEP_BUDGET_FLOOR = 10_000
+#: The loop budget an ORIGINAL gets on a SYNTHESIZED probe input (W#27), where no test fixes a
+#: reference count: the survivor-equivalence probes run original and mutant on boundary inputs the
+#: engine invented, and a function that does not terminate on one (``collatz(0)``) used to hang the
+#: whole run. An input the original cannot finish inside this budget is no evidence either way.
+#: About 26 times the largest count any calibration original made on a whole test (7,723).
+STEP_PROBE_CAP = 200_000
+
+
+#: An upper bound on what one COUNTED loop iteration costs, in microseconds (W#27). Measured on the
+#: calibration corpus, per counted iteration on an M1 Max: p90 0.92 µs on its performance cores and
+#: 3.81 µs on its efficiency cores (``taskpolicy -b``, W#27's slow-machine simulation); this allows
+#: about four times the slower p90. It sizes the wall a budgeted observation gets, so the
+#: deterministic budget decides before the wall can; a body slower than this (exponential bignum
+#: growth measured 11-33 µs) may still meet the wall first — `undetermined`.
+STEP_ITERATION_US = 16.0
+
+
+def armed_wall_ms(
+    cap: int, original_ms: float, wall_ms: float, ceiling_ms: float | None
+) -> float:
+    """The wall bound a step-budgeted observation runs under (W#27, pure — pinned).
+
+    The wall clock bounds LIVENESS and must never decide what the deterministic budget decides.
+    So a budgeted observation's wall covers what reaching its cap costs — the ORIGINAL's own
+    counted run plus ``cap`` iterations at :data:`STEP_ITERATION_US` — and is:
+
+    * never less than the wall it already had (``wall_ms``);
+    * never past ``ceiling_ms``, the aggregate deadline that bounds the whole run (#13);
+    * not extended at all when no ceiling is known: without one there is nothing to stay inside.
+    """
+    if ceiling_ms is None:
+        return wall_ms
+    need = original_ms + cap * STEP_ITERATION_US / 1000.0
+    return max(wall_ms, min(need, ceiling_ms))
+
+
+def mutant_step_cap(
+    original_outcome: str, original_iterations: int, factor: int, floor: int
+) -> tuple[str, int | None]:
+    """Whether one mutant observation of a test is step-budgeted, and its cap (W#27, pure — pinned).
+
+    The cap rests on the ORIGINAL's loop count on the SAME test, counted under the SAME
+    instrumentation the mutant will run under. Only an original that PASSED that test under the
+    count is a basis; every other state leaves the observation bounded by the wall clock alone,
+    exactly as before the budget existed:
+
+    * ``armed`` — the original passed with ``original_iterations`` counted: the cap is
+      ``step_cap(original_iterations, factor, floor)``.
+    * ``original_failed`` — the original failed or crashed under the count: a baseline failure,
+      or a test whose own instrumentation cannot run beside ours (a step budget the test opens
+      itself does not nest). A cap there would turn our instrumentation into a verdict.
+    * ``original_undetermined`` — the original's own counted run reached its wall bound.
+    * ``original_uncounted`` — the original passed but no count was taken (every monitoring tool
+      id held, or a budget already open), so there is no number to scale.
+    * ``unmeasured`` — no original observation exists for this test.
+    """
+    if original_outcome == "passed":
+        return "armed", step_cap(original_iterations, factor, floor)
+    if original_outcome == "failed":
+        return "original_failed", None
+    if original_outcome == "undetermined":
+        return "original_undetermined", None
+    if original_outcome == "uncounted":
+        return "original_uncounted", None
+    return "unmeasured", None
+
+
+def original_step_observation(outcome: str, counted: bool) -> str:
+    """Name what the ORIGINAL's counted run of one test established (W#27, pure — pinned).
+
+    ``outcome`` is ``_run_test_with_timeout``'s return spelled as a string (``"passed"`` for its
+    None). A pass is a basis only if the count was actually taken; a wall-bound or uncontained run
+    established nothing; anything else — a kill reason, a declared failure, a refused nested
+    measurement, an exceeded budget — is a run the original did not pass under the count.
+    """
+    if outcome == "passed":
+        return "passed" if counted else "uncounted"
+    if outcome in ("undetermined", "uncontained"):
+        return "undetermined"
+    return "failed"
+
+
 def step_budget_verdict(iterations: int, cap: int | None) -> str:
     """What a finished count says against its budget (pure — pinned).
 
