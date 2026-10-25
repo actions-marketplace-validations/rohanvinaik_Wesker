@@ -61,6 +61,7 @@ from .memory_guard import over_budget as _over_budget
 from .memory_guard import reclaim as _reclaim
 from .memory_guard import resolve_budget as _resolve_budget
 from .memory_guard import run_baseline_bytes as _mem_baseline
+from .mu_minus import GENERATOR_MATERIALIZE_CAP, YIELD_MODES, form_b
 from .subsumption import distinct_obligations as _distinct_obligations
 from .subsumption import redundancy_groups
 from .swap_plan import SWAP_PAIR_BUDGET, swap_label, swap_plan
@@ -2853,9 +2854,8 @@ def _count_targets(
                 _count_output_targets(func_node, mode)
                 for mode, _desc in _output_sub_modes(observed)
             )
-            + _count_output_wrapper_targets(
-                func_node
-            )  # Form B: generator yield perturbations
+            # Form B: a generator's yields, or any other function's stale return and raise.
+            + _count_output_wrapper_targets(func_node)
         )
     # Single-transformer categories: run the mutator in record mode and count
     # its notes. VALUE additionally needs docstring positions so documentation
@@ -3394,9 +3394,9 @@ def _output_sub_modes(
     return tuple(modes)
 
 
-# μ⁻ Form B — runtime-wrapper perturbations of the NON-RETURN codomain. First sibling: generators,
-# whose codomain is the yielded SEQUENCE (the return-site rewrite of Form A cannot reach it). One
-# wrapper mutant per sub-mode; the perturbation is a pure iterator transform, so it never raises.
+# μ⁻ Form B — perturbations of an output the return-site rewrite cannot reach (Def. 11.6), delivered
+# by the runtime in `Wesker.mu_minus`. Generators: the yielded SEQUENCE. One mutant per sub-mode; the
+# perturbation is a pure iterator transform, so it never raises.
 _OUTPUT_YIELD_SUB_MODES = (
     (
         "yield_truncate",
@@ -3416,9 +3416,26 @@ _OUTPUT_YIELD_SUB_MODES = (
     ),
 )
 
-# Bounds an INFINITE generator so a wrapper can never hang the evaluator; high enough not to bite a
-# real finite sequence. A wrapper materializes at most this many items before perturbing.
-_GENERATOR_MATERIALIZE_CAP = 10_000
+# Every other function: its return across CALLS (stale), and its raise (swallow). Neither is a
+# property of one return site, which is why Form A cannot express them (Def. 11.8 (i), (viii)).
+_OUTPUT_CALL_SUB_MODES = (
+    (
+        "return_stale",
+        "return value -> the previous call's return (is the output a pure function of this call?)",
+    ),
+    (
+        "raise_swallow",
+        "a raise -> swallowed, returning None (is the raise-versus-return contract pinned?)",
+    ),
+)
+
+_GENERATOR_MATERIALIZE_CAP = GENERATOR_MATERIALIZE_CAP
+
+# The Form B decorator a mutant applies innermost. Reached through `__import__` with a fromlist, which
+# returns the submodule itself, so no name the target binds can redirect it.
+_FORM_B_DECORATOR = (
+    '__import__("Wesker.mu_minus", fromlist=["form_b"]).form_b({mode!r})'
+)
 
 
 def _has_own_yield(func_node: ast.FunctionDef | ast.AsyncFunctionDef) -> bool:
@@ -3436,35 +3453,76 @@ def _has_own_yield(func_node: ast.FunctionDef | ast.AsyncFunctionDef) -> bool:
     return False
 
 
-def _perturb_yields(items: list, mode: str) -> list:
-    """The yielded-sequence perturbation for one Form-B sub-mode. Pure list transform; a no-op on
-    some inputs (e.g. truncate/drop on an empty sequence) simply yields a runtime candidate-equivalent."""
-    if mode == "yield_truncate":
-        return items[:-1]
-    if mode == "yield_drop_first":
-        return items[1:]
-    if mode == "yield_duplicate_last":
-        return items + items[-1:]
-    if mode == "yield_empty":
-        return []
-    return items
+def _has_own_raise(func_node: ast.FunctionDef | ast.AsyncFunctionDef) -> bool:
+    """True when the function's OWN body contains a ``raise``, re-raises included. A raise in a
+    nested def, lambda or class body belongs to that scope's contract, not this function's."""
+    stack: list[ast.AST] = list(func_node.body)
+    while stack:
+        n = stack.pop()
+        if isinstance(n, ast.Raise):
+            return True
+        if isinstance(
+            n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.ClassDef)
+        ):
+            continue
+        stack.extend(ast.iter_child_nodes(n))
+    return False
+
+
+def form_b_output_modes(is_generator: bool, has_own_raise: bool) -> tuple[str, ...]:
+    """Which μ⁻ Form B perturbations a target's codomain admits (#44, pure — pinned).
+
+    Split out because the answer is read off two facts of the function's OWN body, and generation and
+    the census must read the same answer, or count == generation (#9) breaks for Form B alone:
+
+    * a generator delivers its output as a yielded sequence, so it gets the four yield modes. Its
+      return value is the generator object, about which stale and swallow ask nothing;
+    * any other function delivers a return value, so it gets ``return_stale`` (is the output a pure
+      function of THIS call, with no leaked state?) and, when its own body raises, ``raise_swallow``
+      (is the raise-versus-return contract pinned?). A function that never raises has no such
+      contract to swallow; a raise reaching it from a callee is that callee's contract.
+    """
+    if is_generator:
+        return tuple(mode for mode, _desc in _OUTPUT_YIELD_SUB_MODES)
+    if has_own_raise:
+        return ("return_stale", "raise_swallow")
+    return ("return_stale",)
+
+
+def _form_b_node(
+    func_node: ast.FunctionDef | ast.AsyncFunctionDef, mode: str
+) -> ast.FunctionDef | ast.AsyncFunctionDef:
+    """A copy of the target's own definition carrying the Form B decorator INNERMOST.
+
+    Innermost, so the target's own decorators wrap the perturbed function exactly as they wrap the
+    real one: ``classmethod`` binds ``cls`` once, and ``property`` and ``lru_cache`` see the
+    perturbation. The decorator takes the ``def`` line's position, which is the mutant's line."""
+    node = copy.deepcopy(func_node)
+    deco = ast.parse(_FORM_B_DECORATOR.format(mode=mode), mode="eval").body
+    for n in ast.walk(deco):
+        if "lineno" in n._attributes:
+            n.lineno = n.end_lineno = func_node.lineno
+            n.col_offset = n.end_col_offset = func_node.col_offset
+    node.decorator_list = [*node.decorator_list, deco]
+    return node
+
+
+def _wrapper_callee(original: Callable[..., Any]) -> Callable[..., Any]:
+    """The function a runtime wrapper must call. A classmethod reached through its class arrives
+    BOUND; calling it with the ``cls`` the installed wrapper is handed would bind ``cls`` twice and
+    raise a TypeError that reads as a crash kill. Peeled to the function, it is bound once."""
+    return original.__func__ if isinstance(original, types.MethodType) else original
 
 
 def _make_generator_wrapper(
     mode: str,
 ) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
-    """A factory ``original -> wrapped``: the wrapped generator materializes the original's yields
-    (bounded by :data:`_GENERATOR_MATERIALIZE_CAP`), perturbs the sequence, and re-yields. Returned
-    from generation and CALLED by ``evaluate_mutant`` on the live original — never compiled."""
+    """A factory ``original -> wrapped`` for one yield mode: ``Wesker.mu_minus.form_b`` applied to
+    the live original. Returned from generation and CALLED by ``evaluate_mutant`` in process; an
+    isolated worker builds the same perturbation from :func:`isolated_mutant_node` instead."""
 
     def factory(original: Callable[..., Any]) -> Callable[..., Any]:
-        def wrapped(*args: Any, **kwargs: Any) -> Any:
-            items = list(
-                itertools.islice(original(*args, **kwargs), _GENERATOR_MATERIALIZE_CAP)
-            )
-            yield from _perturb_yields(items, mode)
-
-        return wrapped
+        return form_b(mode)(_wrapper_callee(original))
 
     return factory
 
@@ -3472,31 +3530,40 @@ def _make_generator_wrapper(
 def _generate_output_wrappers(
     func_node: ast.FunctionDef | ast.AsyncFunctionDef,
 ) -> list[Mutant]:
-    """μ⁻ Form B wrapper mutants for a generator target — one per yield sub-mode, or none if the
-    function does not yield. Each is a :class:`Mutant` carrying a ``wrapper_factory`` (so
-    ``evaluate_mutant`` builds the object by wrapping the original) and a per-mode SYNTHETIC marker
-    node, present only so the content-addressed id and diff stay distinct — it is never compiled."""
-    if not _has_own_yield(func_node):
-        return []
+    """μ⁻ Form B mutants: one per mode :func:`form_b_output_modes` admits.
+
+    A yield mode keeps the representation its ids were minted under: a per-mode SYNTHETIC marker
+    (never compiled; it makes the content id and diff distinct) and a ``wrapper_factory`` that
+    ``evaluate_mutant`` calls on the live original. Its isolated twin is :func:`isolated_mutant_node`.
+    A call mode (stale, swallow) is the target's own definition with the Form B decorator applied
+    (:func:`_form_b_node`): ordinary source, which every evaluator builds the same way."""
     cat = MutationCategory.OUTPUT
     lineno = getattr(func_node, "lineno", 0)
+    is_generator = _has_own_yield(func_node)
+    descriptions = dict(_OUTPUT_YIELD_SUB_MODES + _OUTPUT_CALL_SUB_MODES)
     mutants: list[Mutant] = []
-    for mode, desc in _OUTPUT_YIELD_SUB_MODES:
-        marker = ast.Expr(value=ast.Constant(value=f"WRAPPER:{mode}:{lineno}"))
-        ast.fix_missing_locations(marker)
-        mid = _content_mutant_id(cat, marker)
+    for mode in form_b_output_modes(is_generator, _has_own_raise(func_node)):
+        if is_generator:
+            node: ast.AST = ast.Expr(
+                value=ast.Constant(value=f"WRAPPER:{mode}:{lineno}")
+            )
+            ast.fix_missing_locations(node)
+            factory = _make_generator_wrapper(mode)
+        else:
+            node, factory = _form_b_node(func_node, mode), None
+        mid = _content_mutant_id(cat, node)
         mutants.append(
             Mutant(
                 category=cat,
                 original_node=func_node,
-                mutated_node=marker,
-                description=f"{mid}: {desc}",
+                mutated_node=node,
+                description=f"{mid}: {descriptions[mode]}",
                 location=lineno,
                 mutant_id=mid,
                 target_index=0,
                 mutated_line=lineno,
                 dimension=f"OUTPUT:{mode}:{lineno}",
-                wrapper_factory=_make_generator_wrapper(mode),
+                wrapper_factory=factory,
             )
         )
     return mutants
@@ -3505,9 +3572,29 @@ def _generate_output_wrappers(
 def _count_output_wrapper_targets(
     func_node: ast.FunctionDef | ast.AsyncFunctionDef,
 ) -> int:
-    """Wrapper (Form B) OUTPUT targets — one per yield sub-mode for a generator, else zero. Derived
-    from the same generator test the generator uses, so count == generation."""
-    return len(_OUTPUT_YIELD_SUB_MODES) if _has_own_yield(func_node) else 0
+    """Form B OUTPUT targets: the modes :func:`form_b_output_modes` admits, read off the same two
+    facts generation reads, so count == generation."""
+    return len(
+        form_b_output_modes(_has_own_yield(func_node), _has_own_raise(func_node))
+    )
+
+
+def isolated_mutant_node(mutant: Mutant) -> ast.AST:
+    """The node an isolated worker compiles for ``mutant``: its ``mutated_node``, except for a yield
+    wrapper.
+
+    A yield wrapper's node is a marker string that defines nothing. The worker compiles source alone,
+    finds no definition, and installs the ORIGINAL function from the module namespace as the
+    "mutant". Measured: all four yield mutants of a three-test generator survived under
+    ``--isolated`` while the in-process run killed them. Every isolated verdict on them was a false
+    survivor. Its isolated twin is the decorated definition, the same ``form_b`` perturbation the
+    in-process factory builds, so the two observations measure one mutant."""
+    mode = mutant.dimension.split(":")[1] if mutant.dimension.count(":") >= 2 else ""
+    if mutant.wrapper_factory is not None and mode in YIELD_MODES:
+        original = mutant.original_node
+        if isinstance(original, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            return _form_b_node(original, mode)
+    return mutant.mutated_node
 
 
 def _record_output_dimensions(
@@ -5319,7 +5406,7 @@ def generate_mutants(
                     observed=observed_return_types,
                 )
             )
-            # Form B: runtime-wrapper perturbations of the non-return codomain (generators).
+            # Form B: the yields of a generator; the stale return and the raise of anything else.
             mutants.extend(_generate_output_wrappers(func_node))
             continue
 
@@ -8368,7 +8455,8 @@ def _evaluate_isolated(
             root, [], target, qualname, mem_limit_bytes=mem_limit
         )
     try:
-        source = ast.unparse(mutant.mutated_node)
+        # A yield wrapper's own node is a marker that defines nothing (see isolated_mutant_node).
+        source = ast.unparse(isolated_mutant_node(mutant))
     # BLE001: an un-unparseable mutant is un-evaluable: conservative survivor
     except Exception:  # noqa: BLE001
         return MutantResult(mutant=mutant, killed=False, elapsed_ms=0.0), worker, None

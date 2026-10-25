@@ -39,8 +39,10 @@ from typing import Any
 from .engine import (
     _DATAFLOW_SUB_MODES,
     _EXCEPTION_SUB_MODES,
+    _OUTPUT_CALL_SUB_MODES,
     _OUTPUT_SUB_MODES,
     _OUTPUT_TYPE_CONDITIONAL,
+    _OUTPUT_YIELD_SUB_MODES,
     _STATE_SUB_MODES,
     MutationCategory,
     _ArithmeticMutator,
@@ -51,6 +53,7 @@ from .engine import (
     estimate_universe_size,
 )
 from .monitoring import STEP_BUDGET_FACTOR, STEP_BUDGET_FLOOR, STEP_PROBE_CAP
+from .mu_minus import MU_MINUS_CATALOG
 from .swap_plan import SWAP_PAIR_BUDGET
 
 # 2: DATAFLOW landed (issue #10) — reference substitution enters the universe,
@@ -362,7 +365,7 @@ def _categories(two_sign: bool = False) -> dict[str, dict[str, Any]]:
     if two_sign:
         cats[MutationCategory.OUTPUT.value] = {
             "question": (
-                "is the output's existence and input-dependence pinned? (μ⁻ Form A)"
+                "is each output invariant Def. 11.8 names pinned? (μ⁻, Forms A and B)"
             ),
             "sub_modes": {mode: desc for mode, desc in _OUTPUT_SUB_MODES},
             # Fork 2 (Def. 11.10): which of these a run measures is decided by its observed
@@ -371,11 +374,24 @@ def _categories(two_sign: bool = False) -> dict[str, dict[str, Any]]:
                 mode: {"question": desc, "types": sorted(types)}
                 for mode, desc, types in _OUTPUT_TYPE_CONDITIONAL
             },
+            # Form B (Def. 11.6): what the return-site rewrite cannot reach. Static (no observed
+            # type decides it), so it is in the census and the fingerprint.
+            "form_b": {
+                "yield": {mode: desc for mode, desc in _OUTPUT_YIELD_SUB_MODES},
+                "call": {mode: desc for mode, desc in _OUTPUT_CALL_SUB_MODES},
+                "rule": (
+                    "a generator gets the yield modes; any other function gets "
+                    "return_stale, and raise_swallow when its own body raises "
+                    "(form_b_output_modes)"
+                ),
+            },
             "form": (
                 "A — return-site rewrite. sub_modes apply to every return (Fork 1); a "
                 "type_conditional mode applies only where every observed return type is "
                 "in its types (Fork 2, output_mode_applies), and never raises there. "
-                "Form B is out of this policy."
+                "B — the target's own definition with Wesker.mu_minus.form_b(<mode>) "
+                "applied innermost, so every evaluator, the isolated worker included, "
+                "builds it from source."
             ),
         }
     return cats
@@ -526,11 +542,21 @@ def mutation_policy(two_sign: bool = False) -> MutationPolicy:
         # Only the two-sign manifest carries this key, so the default digest is unchanged.
         manifest["negative_policy"] = {
             "operator": "mu-minus",
-            "form": "A",
+            "form": "A+B",
             "sub_modes": [mode for mode, _desc in _OUTPUT_SUB_MODES],
             "type_conditional": [
                 mode for mode, _desc, _types in _OUTPUT_TYPE_CONDITIONAL
             ],
+            "form_b": [
+                mode for mode, _desc in _OUTPUT_YIELD_SUB_MODES + _OUTPUT_CALL_SUB_MODES
+            ],
+            # What a two-sign certificate does NOT measure, named with its reason, so a
+            # receipt cannot be read as covering the whole of Def. 11.8 (Wesker.mu_minus).
+            "unbuilt": {
+                op.key: f"{op.status}: {op.note}"
+                for op in MU_MINUS_CATALOG
+                if op.status in ("partial", "unsupported")
+            },
         }
     canonical = json.dumps(manifest, sort_keys=True, separators=(",", ":"))
     digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:12]

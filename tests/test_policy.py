@@ -17,14 +17,17 @@ from dataclasses import asdict
 
 from Wesker.engine import (
     _EXCEPTION_SUB_MODES,
+    _OUTPUT_CALL_SUB_MODES,
     _OUTPUT_SUB_MODES,
     _OUTPUT_TYPE_CONDITIONAL,
+    _OUTPUT_YIELD_SUB_MODES,
     _STATE_SUB_MODES,
     MutationCategory,
     _SwapMutator,
     estimate_universe_size,
     generate_mutants,
 )
+from Wesker.mu_minus import MU_MINUS_CATALOG
 from Wesker.policy import (
     _FINGERPRINT_CORPUS,
     POLICY_VERSION,
@@ -92,6 +95,33 @@ GOLDEN_FINGERPRINT = {
 }
 
 
+# The TWO-SIGN fingerprint's OUTPUT column, readable (no hash golden: the two-sign id also moves
+# with every observation-text repair the one-sign golden above records). Fork 1 per return site
+# (none, const, identity; identity needs a parameter, and a no-op is not a target), plus Form B
+# (#44): return_stale on every non-generator, and raise_swallow where the function's own body
+# raises (fp_state_type_exc). The corpus holds no generator, so no yield mode appears here.
+# #44 on policy 9: each row is one more than before (two more for fp_state_type_exc), and the
+# one-sign id is unchanged. Two-sign id: 9+neg.aaff90df3dbf -> 9+neg.e273b30c9a36 (Form A's Fork 2
+# table enters the manifest) -> 9+neg.8144c37b1638 (Form B and the unbuilt catalog).
+GOLDEN_TWO_SIGN_OUTPUT = {
+    "fp_annotations": 4,
+    "fp_value": 3,
+    "fp_boundary": 4,
+    "fp_arith_logic": 4,
+    "fp_bitwise": 4,
+    "fp_swap": 4,
+    "fp_swap_wide": 4,
+    "fp_state_type_exc": 5,
+    "fp_stmt": 4,
+    "fp_async": 4,
+    "fp_dataflow": 4,
+    "fp_str_arith": 4,
+    "fp_state_spellings": 1,
+    # `return None` -> const, identity; `return x` -> none, const (identity is a no-op); + stale.
+    "fp_return_none": 5,
+}
+
+
 def test_policy_id_is_the_golden():
     assert mutation_policy().policy_id == GOLDEN_POLICY_ID, (
         "The mutation-policy fingerprint moved. Intentional universe change → "
@@ -117,6 +147,17 @@ def test_fingerprint_counts_are_the_goldens():
         for fn, by_cat in GOLDEN_FINGERPRINT.items()
     }
     assert got == want
+
+
+def test_two_sign_output_column_is_the_golden():
+    two = mutation_policy(two_sign=True).fingerprint_counts
+    assert {fn: cats["OUTPUT"] for fn, cats in two.items()} == GOLDEN_TWO_SIGN_OUTPUT
+    # Every other column is the one-sign fingerprint's: μ⁻ adds questions, it moves none.
+    one = mutation_policy().fingerprint_counts
+    assert all(
+        {cat: n for cat, n in two[fn].items() if cat != "OUTPUT"} == one[fn]
+        for fn in one
+    )
 
 
 def test_policy_id_embeds_the_version():
@@ -171,6 +212,20 @@ def test_two_sign_manifest_declares_the_type_conditional_table():
     }
     # The id before #44 (Wesker 204a760, policy 9). Its universe lacked the new operators.
     assert two.policy_id != "9+neg.aaff90df3dbf"
+
+
+def test_two_sign_manifest_declares_form_b_and_what_it_does_not_measure():
+    # Form B is static (no observed type decides it), so it is in the census; the manifest names
+    # its modes from the engine tables and, from the catalog, every Def. 11.8 operator a two-sign
+    # certificate does NOT measure, so a receipt cannot be read as covering the whole family.
+    two = mutation_policy(two_sign=True)
+    form_b = two.categories["OUTPUT"]["form_b"]
+    assert form_b["yield"] == dict(_OUTPUT_YIELD_SUB_MODES)
+    assert form_b["call"] == dict(_OUTPUT_CALL_SUB_MODES)
+    unbuilt = {
+        op.key for op in MU_MINUS_CATALOG if op.status in ("partial", "unsupported")
+    }
+    assert unbuilt == {"dict", "field", "class", "clamp", "raise", "state-extra"}
 
 
 def test_manifest_duals_are_the_engine_table():

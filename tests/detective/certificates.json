@@ -83,6 +83,12 @@
     "refusal": "",
     "standing": "complete"
   },
+  "Wesker/engine.py::form_b_output_modes": {
+    "cut_reasons": [],
+    "function_digest": "9e4ee52bb7aa38eb",
+    "refusal": "",
+    "standing": "complete"
+  },
   "Wesker/engine.py::measurement_entry_disposition": {
     "cut_reasons": [],
     "function_digest": "2d1810f67a67b460",
