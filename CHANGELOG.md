@@ -25,6 +25,37 @@ Policy id: `8.dcc355186875` → `8.68a525594c46` → `8.51a0c2a545b5`; two-sign
 `8+neg.671d835828bf` → `8+neg.40ae45e28e39` → `8+neg.8d34cddbefca`. Detective's verdict cache keys
 on the id, so rows recorded under an older observation rule are not reused.
 
+### The two-sign policy (μ⁻)
+
+- **The rest of Def. 11.8's output operators are generated.** A two-sign run generated nine of the 38
+  operators in Detective's negative-specification paper. It now generates 23 more Form A operators
+  under Fork 2, each where every observed return type admits it:
+  - universal: zero-of, type;
+  - boolean: not, true, false;
+  - numeric: ±1, ±ε, scale, round, inf;
+  - string: trunc, case, ws, rev;
+  - container: drop, dup, singleton, ctype, dict's drop-field and default-field;
+  - ordered: adj, sortbreak.
+
+  Two more come from Form B: `return_stale` on every non-generator, and `raise_swallow` where the
+  function's own body raises. Each rewrite evaluates the return expression exactly once, never
+  raises on an applicable type, and chooses deterministically across processes. The nine operators
+  already built keep their ids. (W#44; Detective #116–#123)
+- **Yield mutants reach the isolated worker.** That worker compiles source alone. A yield mutant's
+  node was a marker that defines nothing, so the worker installed the original function, and all four
+  yield mutants of a generator read as survivors under `--isolated`. Every Form B mutant is now
+  source: the definition with `Wesker.mu_minus.form_b(<mode>)` applied innermost. The in-process
+  yield factory binds a classmethod's `cls` once and keeps an async generator async. (W#44)
+- **The catalog.** `docs/MU_MINUS_CATALOG.md` lists every Def. 11.8 operator: 30 built, 2 partial, 2
+  realized by another operator, 4 unsupported, each with its reason and its evidence. A test checks
+  it against `Wesker.mu_minus.MU_MINUS_CATALOG` and the engine tables. The two-sign manifest declares
+  the Fork 2 table, the Form B modes and the unbuilt operators. (W#44)
+
+The one-sign universe and its id are unchanged by this. Two-sign id `9+neg.aaff90df3dbf` →
+`9+neg.8144c37b1638`, and the two-sign fingerprint's OUTPUT column rises on every corpus function.
+Still open: stale needs two calls with different results, and Detective's witness search reaches some
+functions with a single input, where stale reads as candidate-equivalent.
+
 ### The Action
 
 - **A stalled badge run leaves evidence of where it stalled.** `WESKER_STACK_DUMP_S`, a positive whole
