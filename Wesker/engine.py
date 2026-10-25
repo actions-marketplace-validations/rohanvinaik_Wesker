@@ -7489,6 +7489,14 @@ class _StepArm:
         # the run uncounted and wall-bounded; instrumentation failure is never a verdict
         except Exception:  # noqa: BLE001
             return self
+        except BaseException:
+            # An abandonment landed as the budget opened (W#29: the check after `next()` returns
+            # inside `__enter__`). Unwound from here, no `__exit__` would ever run, and the open
+            # budget would refuse every later one as "nested", leaving them silently wall-only.
+            # Close it now; a budget that never opened has nothing to close.
+            with contextlib.suppress(Exception):
+                cm.__exit__(None, None, None)
+            raise
         self._cm = cm
         return self
 
