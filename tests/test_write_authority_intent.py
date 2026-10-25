@@ -763,6 +763,14 @@ def test_the_prescribed_remedy_measures_the_mutant_in_both_modes(tmp_path, isola
         r for r in res.unscored_records if r["disposition"] == WRITE_OUTSIDE_AUTHORITY
     ]
     assert refused == [], [(r["mutant_id"], r.get("blocked_writes")) for r in refused]
-    assert res.total_killed == res.total_mutants >= 3, res.to_dict()
+    # Every mutant MEASURED: none refused, none unscored, so each one is killed or a survivor. Not
+    # "every mutant killed": μ⁻'s `return_stale` (Def. 11.8, the previous call's return) survives any
+    # single-call test by construction, and this test's subject is the write guard, not OUTPUT's. The
+    # mutant that writes, the SWAP, is the one that must be killed under the remedy.
+    measured = res.to_dict()
+    assert res.total_mutants >= 3 and measured["unscored"] == 0, measured
+    assert res.total_killed + res.total_survived == res.total_mutants, measured
+    swap = [r for r in measured["per_category"] if r["category"] == "SWAP"]
+    assert swap and swap[0]["killed"] == swap[0]["total"] >= 1, swap
     after = {e for e in _project_entries(root) if e not in ("__pycache__", ".wesker")}
     assert after == before

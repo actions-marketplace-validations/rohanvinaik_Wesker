@@ -464,6 +464,14 @@ def mutation_policy(two_sign: bool = False) -> MutationPolicy:
                 "undetermined, never kills or survival evidence"
             ),
             (
+                "each test run against a mutant writes only inside its write authority — "
+                "the session's pytest temporary roots and the entries this process created "
+                "in the system temporary directory, never a root that contains the project "
+                "tree; a write outside it is prevented, and the observation is the unscored "
+                "outcome write_outside_authority — the guard's, never a kill or survival "
+                "evidence, while another test's kill of the same mutant still stands"
+            ),
+            (
                 "survivors probe synthesized boundary inputs for likely equivalence "
                 f"under a loop budget (the original's {STEP_PROBE_CAP} iterations, the "
                 "mutant's the cap above); an input the original cannot finish inside its "

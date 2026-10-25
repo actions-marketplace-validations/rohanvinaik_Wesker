@@ -53,7 +53,10 @@ from Wesker.policy import (
 # W#27: the same policy-9 universe; each mutant observation is bounded by the calibrated loop
 # budget (32x the original's count on that test, plus 10,000), whose time is never charged to the
 # mutant's allowance, and the equivalence probes are budgeted too.
-GOLDEN_POLICY_ID = "9.4f6177eb02c9"
+# Detective #105: the same policy-9 universe; each test run against a mutant writes only inside its
+# write authority, and a prevented write is the unscored outcome write_outside_authority, never a kill
+# (categories and counts verified unchanged: GOLDEN_FINGERPRINT holds).
+GOLDEN_POLICY_ID = "9.261d14e34119"
 
 # The same fact, readable: the engine's target counts over the fingerprint
 # corpus. A failure here names the category and function that moved.
@@ -102,7 +105,9 @@ GOLDEN_FINGERPRINT = {
 # raises (fp_state_type_exc). The corpus holds no generator, so no yield mode appears here.
 # #44 on policy 9: each row is one more than before (two more for fp_state_type_exc), and the
 # one-sign id is unchanged. Two-sign id: 9+neg.aaff90df3dbf -> 9+neg.e273b30c9a36 (Form A's Fork 2
-# table enters the manifest) -> 9+neg.8144c37b1638 (Form B and the unbuilt catalog).
+# table enters the manifest) -> 9+neg.8144c37b1638 (Form B and the unbuilt catalog) ->
+# 9+neg.f5a15364c11d (integrated with W#27's loop budget and #105's write authority, both
+# observation texts the one-sign golden records).
 GOLDEN_TWO_SIGN_OUTPUT = {
     "fp_annotations": 4,
     "fp_value": 3,
