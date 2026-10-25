@@ -212,6 +212,10 @@ class _RecordingLock:
     def _is_owned(self):
         return self._inner._is_owned()
 
+    def _recursion_count(self):
+        # `acquire_unstranded` reads the depth around every acquire (W#29).
+        return self._inner._recursion_count()
+
     def __enter__(self):
         self.acquire()
         return self

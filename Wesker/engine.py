@@ -32,6 +32,7 @@ from typing import TYPE_CHECKING, Any, ClassVar, TypeGuard
 from .interrupt import (
     JoinedWorker,
     MeasurementRefused,
+    acquire_unstranded,
     bounded_join,
     mark_refusal,
     starter_chain,
@@ -6207,40 +6208,43 @@ def _execution_guard(timeout_s: float | None = None) -> Iterator[_PatchProof]:
     Re-entrant by construction (`_EXECUTION_LOCK` is an RLock), so a coarse holder such as
     `evaluate_mutant` and the fine-grained patch sites inside it nest without deadlock.
 
-    `timeout_s=None` -- the default, and every pre-existing caller -- is UNBOUNDED and keeps the
-    original `with` form exactly. The bound is OPT-IN for two reasons. One consumer is a pytest
-    HOOKWRAPPER (`_isolated_worker._MutantPlugin.pytest_runtest_call`) where raising before its
-    `yield` is a hard pluggy error rather than a refusal anyone can read -- and it runs in its own
-    process, where the acquire is uncontended and a bound would never fire. And the `with` form
-    arms its exit handler as part of the statement, so replacing it with an explicit
-    acquire/release pair would WIDEN the unrecorded window that creates the orphan below.
+    `timeout_s=None` -- the default, and every pre-existing caller -- is UNBOUNDED. The bound is
+    OPT-IN because one consumer is a pytest HOOKWRAPPER
+    (`_isolated_worker._MutantPlugin.pytest_runtest_call`), where raising before its `yield` is a
+    hard pluggy error rather than a refusal anyone can read -- and it runs in its own process,
+    where the acquire is uncontended and a bound would never fire.
 
-    WHERE A BOUND IS THE CURE rather than a courtesy: a worker parked here is exactly the thread
-    `interrupt`'s BOUNDARY describes -- blocked outside the interpreter, executing no bytecode, so
-    an `abandon` injection cannot land until the acquire returns ON ITS OWN. When it does return
-    the thread HOLDS the lock, and only then does the injection arrive, so it dies owning it and
-    nothing ever releases it. Giving up before that point is what stops the orphan being created
-    at all, which is why the in-process caller passes its own budget.
+    BOTH BRANCHES TAKE THE LOCK THROUGH `acquire_unstranded` AND RECORD ENTRY INSIDE THE `try`
+    THAT RELEASES IT (W#29). This branch once kept a bare `with _EXECUTION_LOCK:` on the belief
+    that `with` arms its exit handler as part of the statement. That held through 3.13 (one
+    BEFORE_WITH opcode) and is false on 3.14, which compiles the statement to
+    `LOAD_SPECIAL __enter__; CALL 0` and begins the protected range only after that call's own
+    eval-breaker check. That check is where an injection made while a worker waited here lands,
+    with the lock already held: the orphan below (interrupt's STRANDED LOCK, measured 50/50 on
+    3.14). The handler in `acquire_unstranded` gives that lock back.
+
+    WHERE A BOUND STILL MATTERS: a worker parked here is exactly the thread `interrupt`'s BOUNDARY
+    describes -- blocked outside the interpreter, executing no bytecode, so an `abandon` injection
+    cannot land until the acquire returns ON ITS OWN, and the abandoner must report it uncontained
+    meanwhile. Giving up on a budget is what lets such a worker unwind on time, which is why the
+    in-process caller passes its own.
 
     BOTH branches refuse a nested measurement first (#28, `_refuse_nested_measurement`): a bound
-    stops the orphan by losing the race, but a worker whose own measurement holds the lock cannot
-    win it at any length, and the unbounded `with` below would wait for it forever.
+    stops a hopeless wait by losing the race, but a worker whose own measurement holds the lock
+    cannot win it at any length, and the unbounded acquire would wait for it forever.
     """
     if timeout_s is None:
         _refuse_nested_measurement()
-        with _EXECUTION_LOCK:
-            _note_lock_entry()
-            try:
-                yield _PatchProof()
-            finally:
-                _note_lock_exit()
-        return
-    _acquire_execution_lock(probe_s=timeout_s, wait_s=0.0)
-    _note_lock_entry()
+        acquire_unstranded(_EXECUTION_LOCK)
+    else:
+        _acquire_execution_lock(probe_s=timeout_s, wait_s=0.0)
     try:
-        yield _PatchProof()
+        _note_lock_entry()
+        try:
+            yield _PatchProof()
+        finally:
+            _note_lock_exit()
     finally:
-        _note_lock_exit()
         _EXECUTION_LOCK.release()
 
 
@@ -6499,15 +6503,18 @@ def _acquire_execution_lock(
     and was merely related; the two measure different things, and the mismatch cost ~160x on a
     dogfood target before it was measured.
 
-    HONEST LIMIT: an async exception delivered between `acquire()` returning and `_note_lock_entry()`
-    leaves the lock held with no record, and CPython offers no way to close that window from
-    Python. It is not hypothetical -- it is precisely where the measured defect lands -- which is
-    why `execution_lock_disposition` does not rely on the record alone. #28 closes the ROUTE the
-    measured case took into that window: a worker whose own measurement holds the lock is refused
-    by `_refuse_nested_measurement` before it can wait at all.
+    THE WINDOW AFTER THE ACQUIRE, now closed (W#29). An async exception delivered as `acquire()`
+    returns -- at that call's own eval-breaker check -- used to leave the lock held with no
+    record, and this docstring called that window unclosable from Python. It is closable: the
+    acquire is `acquire_unstranded`, whose handler sees the recursion depth rise and gives the lock
+    back, and every caller records entry inside the `try` that releases. That window is where the
+    measured defect landed. `execution_lock_disposition` still reads all three channels, because a
+    lock stranded some other way (a second injection, or code under test) remains possible. #28
+    also closes the ROUTE the measured case took: a worker whose own measurement holds the lock is
+    refused by `_refuse_nested_measurement` before it can wait at all.
     """
     _refuse_nested_measurement()
-    if _EXECUTION_LOCK.acquire(timeout=probe_s):
+    if acquire_unstranded(_EXECUTION_LOCK, timeout=probe_s):
         return
     _self = threading.get_ident()
     disposition = execution_lock_disposition(
@@ -6517,7 +6524,7 @@ def _acquire_execution_lock(
         raise ExecutionLockUnavailable(
             disposition, _LOCK_OWNER_TID or _lock_owner_from_repr()
         )
-    if _EXECUTION_LOCK.acquire(timeout=wait_s):
+    if acquire_unstranded(_EXECUTION_LOCK, timeout=wait_s):
         return
     raise ExecutionLockUnavailable(
         execution_lock_disposition(
@@ -6567,16 +6574,21 @@ def _serialized(fn):
 
     The acquire is BOUNDED (`_acquire_execution_lock`) rather than a bare `with`. Serialization is
     unchanged; what changed is that failing to get in is now a named fact instead of silence.
+    Entry is recorded INSIDE the `try` that releases (W#29): recorded outside it, an injection
+    landing at `_note_lock_entry`'s first instruction would leave the lock held by a thread that
+    unwinds without releasing it.
     """
 
     @functools.wraps(fn)
     def _wrapped(*args, **kwargs):
         _acquire_execution_lock()
-        _note_lock_entry()
         try:
-            return fn(*args, **kwargs)
+            _note_lock_entry()
+            try:
+                return fn(*args, **kwargs)
+            finally:
+                _note_lock_exit()
         finally:
-            _note_lock_exit()
             _EXECUTION_LOCK.release()
 
     return _wrapped
@@ -7644,7 +7656,11 @@ def measurement_entry_disposition(active_owner: int | None) -> str:
 
 
 _MEASUREMENT_THREADS: set[int] = set()
-_MEASUREMENT_REGISTRY_LOCK = threading.Lock()
+# An RLock, taken only through `acquire_unstranded` (W#29): a measurement nested in an abandonable
+# worker enters here, and on 3.14 a `with` over a contended lock strands it at the call's check.
+# The depth test that undoes an interrupted acquire needs an RLock's recursion count; nothing
+# under this lock re-enters it, so re-entrancy changes no behaviour.
+_MEASUREMENT_REGISTRY_LOCK = threading.RLock()
 
 
 def _measurement_boundary(fn):
@@ -7657,7 +7673,8 @@ def _measurement_boundary(fn):
         tid = threading.get_ident()
         registered = False
         try:
-            with _MEASUREMENT_REGISTRY_LOCK:
+            acquire_unstranded(_MEASUREMENT_REGISTRY_LOCK)
+            try:
                 owner = next(
                     (t for t in (tid, *starter_chain()) if t in _MEASUREMENT_THREADS),
                     None,
@@ -7667,6 +7684,8 @@ def _measurement_boundary(fn):
                     # Cleanup covers cancellation during registration as well as the body.
                     registered = True
                     _MEASUREMENT_THREADS.add(tid)
+            finally:
+                _MEASUREMENT_REGISTRY_LOCK.release()
             if disposition == "nested_measurement":
                 assert owner is not None
                 mark_refusal(disposition, owner)
@@ -7674,8 +7693,11 @@ def _measurement_boundary(fn):
             return fn(*args, **kwargs)
         finally:
             if registered:
-                with _MEASUREMENT_REGISTRY_LOCK:
+                acquire_unstranded(_MEASUREMENT_REGISTRY_LOCK)
+                try:
                     _MEASUREMENT_THREADS.discard(tid)
+                finally:
+                    _MEASUREMENT_REGISTRY_LOCK.release()
 
     return _wrapped
 
