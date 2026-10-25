@@ -52,6 +52,7 @@ from __future__ import annotations
 
 import ctypes
 import threading
+import weakref
 from typing import Any
 
 
@@ -87,6 +88,63 @@ class MeasurementRefused(BaseException):
         self.owner_tid = owner_tid
 
 
+class WorkerLost(BaseException):
+    """A :class:`JoinedWorker`'s thread ended before it signalled its start (W#29).
+
+    ``Thread.start()`` waits on ``_started`` with no timeout. A bootstrap that ends before setting it,
+    because an exception was raised into it before its first line ran, leaves that wait unbounded. It
+    was measured on the whole-codebase CI run: two runs sat 180 minutes each at the same
+    ``_run_test_with_timeout`` start, with no other thread alive. It was then reproduced on Linux
+    CPython 3.14 under a diagnostic (2026-10-25). The thread is gone, so the test it was to run never
+    ran: no kill, no pass. And the process that ended it is not one to keep measuring in.
+    :meth:`JoinedWorker.start` raises this instead of waiting, so every starter names it.
+
+    A ``BaseException``, like :class:`Abandoned` and :class:`MeasurementRefused`, so that no broad
+    ``except Exception`` between a start and its handler can turn a lost worker into a result.
+    """
+
+    code = "worker_lost"
+
+    def __init__(self, thread: threading.Thread) -> None:
+        super().__init__(
+            f"worker_lost: {thread.name} ended before it signalled its start"
+        )
+        self.thread_name = thread.name
+
+
+# How often a start's wait re-checks whether the thread has already ended. A healthy start returns
+# the moment `_started` is set, so the slice costs nothing unless the bootstrap died.
+_START_SLICE_S = 0.05
+
+
+def _run_is_over(thread: threading.Thread, entry_released: list[object]) -> bool:
+    """Whether ``thread``'s OS-level run has ended (W#29).
+
+    On 3.13+ the thread's own handle says so: CPython's thread runner notifies it as the very last
+    thing it does, whatever ended the run. 3.12 has no handle, so there the signal is the release of
+    the entry callable CPython's bootstate held: a bound method, which no traceback frame references,
+    so a hook that keeps the dead bootstrap's exception (pytest's unraisable plugin does) cannot
+    withhold the release.
+    """
+    handle = getattr(thread, "_os_thread_handle", None) or getattr(
+        thread, "_handle", None
+    )
+    if handle is not None:
+        return bool(handle.is_done())
+    return bool(entry_released)
+
+
+def _forget_unstarted(thread: threading.Thread) -> None:
+    """Take a thread whose bootstrap died out of ``threading._limbo`` (W#29).
+
+    ``Thread.start()`` put it there, and only its bootstrap would have taken it out. Left behind,
+    ``threading.enumerate()`` would list a dead thread forever, and every later trace would read
+    ``incomplete_thread``. One ``dict.pop``, which completes before the next bytecode boundary, so
+    no lock is taken that an injected exception could strand (the module docstring's STRANDED LOCK).
+    """
+    vars(threading)["_limbo"].pop(thread, None)
+
+
 class JoinedWorker(threading.Thread):
     """A worker its starter waits on under a bounded join — the start/join edge, recorded (#28).
 
@@ -95,12 +153,58 @@ class JoinedWorker(threading.Thread):
     channel :func:`mark_refusal` writes: empty until something this worker ran was refused, then the
     refusal's code. The starter reads it after the join, where neither pytest's exception capture nor
     the worker's own ``except BaseException`` can have erased it.
+
+    :meth:`start` never waits forever on a bootstrap that died: it raises :class:`WorkerLost` (W#29).
     """
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
         self.starter = threading.current_thread()
         self.refusal = ""
+        self._boot_released: list[object] = []
+        self._boot_ref: weakref.ref | None = None
+
+    def start(self) -> None:
+        """``Thread.start()``, except that a bootstrap which ended before it signalled raises
+        :class:`WorkerLost` instead of leaving the start waiting forever (W#29).
+
+        The end is OBSERVED, not timed (`_run_is_over`). On 3.13+ it is the thread's own handle. On
+        3.12 it is the release of the entry callable, recorded by a weakref whose callback is the
+        C-level ``list.append``, so no Python code runs in the dying thread to record it.
+
+        The entry is the bound ``self._bootstrap`` that ``Thread.start()`` would read anyway, held on
+        the instance for that one read so its release can be watched. A bound method is C-level: it
+        leaves no frame in a dead bootstrap's traceback, so a hook that keeps that exception (pytest's
+        unraisable plugin does) keeps no reference to it. The instance's reference is dropped before
+        the wait polls, so CPython's bootstate is the only holder left.
+
+        ``Thread.start()`` ends in ``self._started.wait()``. Shadowing that one bound method on the
+        instance turns the unbounded wait into slices that check between them. Both shadows are removed
+        before this returns, and a start that succeeds returns exactly as ``Thread.start()`` does.
+        """
+        started = self._started
+        wait = started.wait
+        entry = self._bootstrap
+        self._boot_ref = weakref.ref(entry, self._boot_released.append)
+        vars(self)["_bootstrap"] = entry
+        del entry
+
+        def _wait(
+            *_unbounded: object,
+        ) -> bool:  # Thread.start() calls it with no timeout
+            vars(self).pop("_bootstrap", None)  # the C starter holds the entry now
+            while not wait(_START_SLICE_S):
+                if _run_is_over(self, self._boot_released) and not started.is_set():
+                    _forget_unstarted(self)
+                    raise WorkerLost(self)
+            return True
+
+        started.wait = _wait  # type: ignore[method-assign]
+        try:
+            super().start()
+        finally:
+            del started.wait
+            vars(self).pop("_bootstrap", None)
 
 
 def starter_chain() -> tuple[int, ...]:

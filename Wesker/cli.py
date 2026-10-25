@@ -135,16 +135,22 @@ def main(argv: list[str] | None = None) -> int:
 
     # Run mutation profiling — pytest judges every mutant (real fixtures, conftest,
     # parametrization), so the kill rate is a standards-compliant mutation score.
-    result = profile_codebase_live(
-        ".",
-        files,
-        budget_ms_per_file=args.budget,
-        max_per_category=args.max_per_category,
-        passes=args.passes,
-        verbose=not args.quiet and not args.json_output,
-        isolated=args.isolated,
-        worker_mem_limit_mb=args.mem_limit_mb,
-    )
+    from Wesker.action import worker_lost_reason, worker_lost_types
+
+    try:
+        result = profile_codebase_live(
+            ".",
+            files,
+            budget_ms_per_file=args.budget,
+            max_per_category=args.max_per_category,
+            passes=args.passes,
+            verbose=not args.quiet and not args.json_output,
+            isolated=args.isolated,
+            worker_mem_limit_mb=args.mem_limit_mb,
+        )
+    except worker_lost_types() as lost:  # W#29: named, never a traceback
+        print(f"WESKER REFUSED TO REPORT: {worker_lost_reason(lost)}", file=sys.stderr)
+        return 1
     execution_mode = "pytest-live"
     if result is None:
         # Degrade only OUT LOUD, and on stderr so it survives --json-output being

@@ -412,6 +412,68 @@ def _stream_reentry() -> Callable[[], None]:
     return reenter
 
 
+def _profile_live(
+    profile_codebase_live: Callable[..., dict | None],
+    targets: list[str],
+    budget: float,
+    config: dict,
+) -> tuple[dict | None, str]:
+    """Run the live profile between the stream re-entry and the stack dump; ``(report, refusal)``.
+
+    ``refusal`` is non-empty only for a lost worker (W#29), which ends the run with its own name. Every
+    other outcome is the report's, as before, including None for no live session.
+    """
+    lost_worker = worker_lost_types()
+    reenter_streams = _stream_reentry()
+    cancel_stack_dump = _stack_dump_from_env()
+    try:
+        return (
+            profile_codebase_live(
+                ".",
+                targets,
+                budget_ms_per_file=budget,
+                max_per_category=config.get("max_per_category"),
+                passes=config.get("convergence_passes", 1),
+                verbose=True,
+            ),
+            "",
+        )
+    except lost_worker as lost:
+        return None, worker_lost_reason(lost)
+    finally:
+        cancel_stack_dump()
+        # Everything from here down is the REPORT — gates, SARIF, annotations,
+        # outputs, summary, banner — and must not inherit a corpse fd from a
+        # hostile mutant of the capture machinery.
+        reenter_streams()
+
+
+def worker_lost_types() -> tuple[type[BaseException], ...]:
+    """`interrupt.WorkerLost` from every loaded copy of Wesker (W#29).
+
+    A self-profiling run measures through the private copy (`self_profile`), and that copy's exception
+    is not the public class, so a handler naming only one would let the other through as a traceback.
+    """
+    from Wesker.self_profile import PRIVATE_PREFIX
+
+    found: list[type[BaseException]] = []
+    for name in ("Wesker.interrupt", f"{PRIVATE_PREFIX}.interrupt"):
+        cls = getattr(sys.modules.get(name), "WorkerLost", None)
+        if isinstance(cls, type) and issubclass(cls, BaseException):
+            found.append(cls)
+    return tuple(found)
+
+
+def worker_lost_reason(lost: BaseException) -> str:
+    """The refusal a lost worker earns (W#29): named, never a traceback, and never a re-run in a loop."""
+    return (
+        f"{lost}.\nA measurement worker's thread ended before it signalled its start, so the test it was to "
+        "run never ran. Something raised into its bootstrap, or this process can no longer create a "
+        "thread (a resource limit the measured code lowered is one measured cause). Nothing measured "
+        "after it can be trusted. If it recurs, report it with this log."
+    )
+
+
 def _fail(reason: str) -> int:
     print("\n::error::Wesker could not produce a trustworthy number", file=sys.stderr)
     print(f"\nWESKER REFUSED TO REPORT: {reason}\n", file=sys.stderr)
@@ -614,24 +676,11 @@ def main(argv: list[str] | None = None) -> int:
     # Wesker profiling Wesker runs from a private copy of the package, so the modules being
     # mutated are not the ones executing the run. Any other project resolves to the public
     # engine here, exactly as before.
-    profile_codebase_live = profiler_for_targets(targets)
-    reenter_streams = _stream_reentry()
-    cancel_stack_dump = _stack_dump_from_env()
-    try:
-        report = profile_codebase_live(
-            ".",
-            targets,
-            budget_ms_per_file=args.budget,
-            max_per_category=config.get("max_per_category"),
-            passes=config.get("convergence_passes", 1),
-            verbose=True,
-        )
-    finally:
-        cancel_stack_dump()
-        # Everything from here down is the REPORT — gates, SARIF, annotations,
-        # outputs, summary, banner — and must not inherit a corpse fd from a
-        # hostile mutant of the capture machinery.
-        reenter_streams()
+    report, lost = _profile_live(
+        profiler_for_targets(targets), targets, args.budget, config
+    )
+    if lost:
+        return _fail(lost)
     if report is None:
         return _fail(
             gate_execution_mode({"execution_mode": "legacy-direct-call"}) or ""
