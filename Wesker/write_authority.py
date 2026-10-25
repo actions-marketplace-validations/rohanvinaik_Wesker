@@ -10,7 +10,9 @@ more mutated rename and the real file would have been replaced. Nothing containe
 THE AUTHORITY, and why it is not "the temporary directory". A test run may change:
 
 * the session's pytest temporary directory (``tmp_path``, ``tmpdir``, ``tmp_path_factory``) — the
-  regime's own declared root, wherever ``--basetemp`` or pytest's default puts it;
+  regime's own declared root, wherever ``--basetemp`` puts it, or, by default, pytest's per-user
+  scratch root (``pytest-of-<user>``) that holds every session's numbered directory, a nested
+  session's included;
 * any entry this process CREATED EXCLUSIVELY, directly in the system temporary directory, and
   everything beneath it — what ``mkdtemp``, ``mkstemp``, ``NamedTemporaryFile`` and
   ``TemporaryDirectory`` hand a test;
@@ -19,7 +21,8 @@ THE AUTHORITY, and why it is not "the temporary directory". A test run may chang
 The second grant is what keeps legitimate temporary writes working without permitting the whole
 temporary directory: an exclusive creation can never name an entry that already exists, so a test
 gains room only where nothing was. A file another process left in the temporary directory, or one
-this process wrote there non-exclusively, stays protected.
+this process wrote there non-exclusively, stays protected. And a root that contains the project
+tree (the working directory a window arms in) grants nothing, wherever the project is checked out.
 
 THE MECHANISM. One audit hook, installed once and armed only while a test runs against a mutant
 (:func:`contain_writes`). An effect outside the authority raises :class:`WriteOutsideAuthority`
@@ -256,12 +259,17 @@ def _device_roots() -> tuple[str, ...]:
 _CREATED: set[str] = set()
 # Roots the regime declares for the running session (`declared_roots`): its pytest basetemp.
 _DECLARED: tuple[str, ...] = ()
-# The armed window — its interception record and its roots, read together in one load so a thread
-# racing the window's close sees one window or none — or None while no test runs against a mutant.
-_ACTIVE: tuple[list[str], tuple[str, ...]] | None = None
+# The armed window — its interception record, its roots and the project tree it protects, read
+# together in one load so a thread racing the window's close sees one window or none — or None while
+# no test runs against a mutant.
+_ACTIVE: tuple[list[str], tuple[str, ...], str] | None = None
 _LOCAL = threading.local()
 _INSTALL_LOCK = threading.Lock()
 _installed = False
+
+
+def _contains(root: str, path: str) -> bool:
+    return path == root or path.startswith(root.rstrip(os.sep) + os.sep)
 
 
 def _created_ancestors(path: str) -> list[str]:
@@ -293,7 +301,7 @@ def _hook(event: str, args: tuple) -> None:
         return  # this hook's own resolution (a descriptor lookup) is not a test's effect
     _LOCAL.busy = True
     try:
-        blocked, roots = window if window is not None else (None, ())
+        blocked, roots, protected = window if window is not None else (None, (), "")
         for effect, raw, dir_fd, follow in _effects(event, args):
             if blocked is None and effect != "create":
                 continue
@@ -308,7 +316,14 @@ def _hook(event: str, args: tuple) -> None:
                     path,
                     os.path.lexists(path),
                     os.path.isdir(path),
-                    [*roots, *_created_ancestors(path)],
+                    [
+                        *roots,
+                        *(
+                            c
+                            for c in _created_ancestors(path)
+                            if not (protected and _contains(c, protected))
+                        ),
+                    ],
                     _temp_root(),
                 )
             if code == "fresh_temp_entry" and path is not None:
@@ -341,6 +356,11 @@ def install() -> None:
         _installed = True
 
 
+def current_roots() -> tuple[str, ...]:
+    """The roots declared right now — what an isolated worker this process spawns inherits."""
+    return _DECLARED
+
+
 @contextlib.contextmanager
 def declared_roots(roots: Iterable[str]) -> Iterator[None]:
     """Declare the running session's write roots — its pytest basetemp — for the duration."""
@@ -361,12 +381,26 @@ def contain_writes() -> Iterator[list[str]]:
     Process-wide while armed, so a thread the test or the code under test starts is held to the same
     authority as the test's own worker. The record is the measurement's signal, not the exception:
     read it after the run.
+
+    The working directory when the window arms is the project root, and a root that CONTAINS it is
+    no authority at all: the project tree is never a test's room, wherever it happens to be checked
+    out — inside the temporary directory, or inside pytest's own scratch root as the pair's own
+    end-to-end tests put theirs. A root inside the project (a project-local ``--basetemp``) stands.
     """
     global _ACTIVE
     install()
     blocked: list[str] = []
+    try:
+        protected = os.path.realpath(os.getcwd())
+    except OSError:
+        protected = ""
     previous, previous_bytecode = _ACTIVE, sys.dont_write_bytecode
-    _ACTIVE = (blocked, (*_DECLARED, *_device_roots()))
+    roots = tuple(
+        root
+        for root in (*_DECLARED, *_device_roots())
+        if not (protected and _contains(root, protected))
+    )
+    _ACTIVE = (blocked, roots, protected)
     sys.dont_write_bytecode = True
     try:
         yield blocked
@@ -374,21 +408,41 @@ def contain_writes() -> Iterator[list[str]]:
         _ACTIVE, sys.dont_write_bytecode = previous, previous_bytecode
 
 
-def session_write_roots(config: object) -> tuple[str, ...]:
-    """The write roots a pytest session's regime declares: its basetemp, resolved.
+def session_write_roots(config: object, create: bool = True) -> tuple[str, ...]:
+    """The write roots a pytest session's regime declares: its basetemp, resolved — and, when that is
+    pytest's DEFAULT numbered directory, the per-user root it sits in (``pytest-of-<user>``).
 
     Reading the basetemp CREATES it on first use, and creating it rotates pytest's numbered
     directories and repoints its ``pytest-current`` link — writes outside any test's authority. So it
     is read here, before a window is armed, never lazily inside one. A session without the factory (a
     pytest that does not provide it) declares nothing, and its tests' ``tmp_path`` writes are refused
     by name rather than silently allowed.
+
+    The per-user root is the regime's own scratch area, not the temporary directory: a test that
+    starts a NESTED pytest session in-process (a tool's live session, a raw ``pytest.main``) creates
+    that session's numbered basetemp there, inside the window, and refusing it refused every mutant
+    such a test reached for the harness's write (measured on Detective's own ``candidate_reach``). An
+    explicit ``--basetemp`` is the regime's choice of place and declares only itself.
+
+    ``create=False`` reads a basetemp only if the session already made one. The isolated worker runs a
+    fresh session per mutant, so forcing one there created a numbered directory per mutant for suites
+    that never use ``tmp_path`` (measured: +30% on a 29-mutant isolated profile, 90 directories); it
+    inherits the live session's roots instead, which name the per-user root its sessions share.
     """
     factory = getattr(config, "_tmp_path_factory", None)
     getbasetemp = getattr(factory, "getbasetemp", None)
-    if getbasetemp is None:
+    if getbasetemp is None or (
+        not create and getattr(factory, "_basetemp", None) is None
+    ):
         return ()
     try:
-        return (os.path.realpath(str(getbasetemp())),)
+        basetemp = os.path.realpath(str(getbasetemp()))
     # BLE001: describing the session's authority must not fail the session; none is declared
     except Exception:  # noqa: BLE001
         return ()
+    parent = os.path.dirname(basetemp)
+    return (
+        (basetemp, parent)
+        if os.path.basename(parent).startswith("pytest-of-")
+        else (basetemp,)
+    )

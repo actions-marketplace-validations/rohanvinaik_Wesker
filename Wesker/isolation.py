@@ -32,6 +32,8 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any
 
+from .write_authority import current_roots
+
 # Names whose presence in a test's OWN source marks a shape the in_process fast mode cannot contain
 # (#19). Matched against AST Name/Attribute identifiers, never raw text — a string literal or comment
 # that merely mentions "subprocess" must not refuse a hermetic test. Deliberately broad within each
@@ -314,6 +316,8 @@ def run_mutant_isolated(
             "target_file": target_file,
             "func_qualname": func_qualname,
             "mutant_source": mutant_source,
+            # Detective #105: the live session's declared write roots, which the worker inherits.
+            "write_roots": list(current_roots()),
         }
     )
     proc = subprocess.Popen(
@@ -693,6 +697,8 @@ class IsolatedMutantWorker:
                 "target_file": target_file,
                 "func_qualname": func_qualname,
                 "mem_limit_bytes": mem_limit_bytes,
+                # Detective #105: the live session's declared write roots, which the worker inherits.
+                "write_roots": list(current_roots()),
             }
         )
         try:

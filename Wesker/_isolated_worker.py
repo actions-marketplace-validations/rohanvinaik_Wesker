@@ -115,8 +115,12 @@ class _MutantPlugin:
         mutant_source: str = "",
         step_caps: dict[str, int] | None = None,
         project_root: str = "",
+        write_roots: tuple[str, ...] = (),
     ) -> None:
         self._target_file = target_file
+        #: The write roots the spawning live session declared (#105): its basetemp and pytest's
+        #: per-user root, which also holds this worker's own per-mutant session directories.
+        self._write_roots = tuple(write_roots)
         self._mutant_source = mutant_source
         #: The loop budget per node, keyed by canonical selector (W#27). The parent counted the
         #: ORIGINAL on each node in its own process and sends the cap; an absent node is unbudgeted.
@@ -194,9 +198,13 @@ class _MutantPlugin:
                 self.installed = True
             self.ran += 1
             # Armed only here, where the mutant is installed (#105) — never around `pytest.main`,
-            # whose collection and basetemp creation are the harness's writes. The basetemp is read
-            # before arming because the first read creates it.
-            roots = session_write_roots(getattr(item, "config", None))
+            # whose collection and basetemp creation are the harness's writes. This session's own
+            # basetemp is read only if a fixture already made it: forcing one per mutant session costs
+            # a numbered directory per mutant for a suite that never uses `tmp_path`.
+            roots = (
+                *self._write_roots,
+                *session_write_roots(getattr(item, "config", None), create=False),
+            )
             try:
                 with arm, declared_roots(roots), contain_writes() as blocked:
                     outcome = yield
@@ -290,6 +298,7 @@ def _evaluate_full(
     mutant_source: str,
     step_caps: dict[str, int] | None = None,
     project_root: str = "",
+    write_roots: tuple[str, ...] = (),
 ) -> dict[str, Any]:
     """Run the node IDs against ONE mutant; return its verdict payload.
 
@@ -304,7 +313,13 @@ def _evaluate_full(
     # its own process — never here, where a count pass would run nodes this mutant's first value
     # kill short-circuits, inside this request's own timeout.
     plugin = _MutantPlugin(
-        None, func_qualname, target_abspath, mutant_source, step_caps, project_root
+        None,
+        func_qualname,
+        target_abspath,
+        mutant_source,
+        step_caps,
+        project_root,
+        write_roots,
     )
     with (
         contextlib.redirect_stdout(io.StringIO()),
@@ -456,6 +471,7 @@ def _serve() -> int:
             spec["mutant_source"],
             spec.get("step_caps"),
             session["project_root"],
+            tuple(session.get("write_roots") or ()),
         )
         payload["enforced"] = enforced
         real_stdout.write(json.dumps(payload) + "\n")
@@ -484,7 +500,11 @@ def main() -> int:
     # One-shot's verdict IS its exit code (`run_mutant_isolated` reads `mutant_verdict` off it); the
     # richer killed_by/constructed payload travels only over the server protocol the engine uses.
     payload = _evaluate_full(
-        target, spec["func_qualname"], spec["node_ids"], spec["mutant_source"]
+        target,
+        spec["func_qualname"],
+        spec["node_ids"],
+        spec["mutant_source"],
+        tuple(spec.get("write_roots") or ()),
     )
     if payload["write_blocked"] and not payload["killed_by"]:
         # A prevented write is never a kill (#105). The exit code has no refusal to carry, so the

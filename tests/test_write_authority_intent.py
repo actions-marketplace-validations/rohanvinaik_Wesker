@@ -52,6 +52,7 @@ from Wesker.write_authority import (
     contain_writes,
     declared_roots,
     install,
+    session_write_roots,
     write_authority_disposition,
 )
 
@@ -328,6 +329,91 @@ def test_bytecode_is_suppressed_for_the_window_and_restored(layout):
     with contain_writes():
         assert sys.dont_write_bytecode is True
     assert sys.dont_write_bytecode is before
+
+
+def test_the_session_roots_name_the_per_user_root_only_for_pytests_default_basetemp(
+    tmp_path,
+):
+    """Pytest's default basetemp is a numbered directory under its per-user root; an explicit
+    `--basetemp` is the regime's own choice and declares only itself."""
+
+    class _Factory:
+        def __init__(self, basetemp):
+            self._basetemp = basetemp
+
+        def getbasetemp(self):
+            return self._basetemp
+
+    def _config(basetemp):
+        return type("C", (), {"_tmp_path_factory": _Factory(basetemp)})()
+
+    default = tmp_path / "pytest-of-someone" / "pytest-7"
+    given = tmp_path / "chosen-basetemp"
+    for path in (default, given):
+        path.mkdir(parents=True)
+    real = os.path.realpath
+    assert session_write_roots(_config(default)) == (
+        real(default),
+        real(default.parent),
+    )
+    assert session_write_roots(_config(given)) == (real(given),)
+    assert session_write_roots(object()) == (), "no factory, nothing declared"
+
+
+def test_a_nested_pytest_session_inside_the_window_is_not_refused(
+    tmp_path, monkeypatch, request
+):
+    """Measured dogfooding #105's reproduction: a test that starts a NESTED pytest session in-process
+    (a tool's live session; a raw `pytest.main`) creates that session's numbered basetemp beside the
+    outer one, under the same per-user root, inside the window. Refusing it refused every mutant such
+    a test reached — 13 of `audit.candidate_reach`'s — for the harness's write, not the mutant's.
+
+    The project sits outside pytest's scratch root, as a real checkout does; one inside it is the
+    next test's case."""
+    project = Path(tempfile.mkdtemp(prefix="wa-nested-"))
+    try:
+        (project / "test_inner.py").write_text(
+            "def test_inner(tmp_path):\n    (tmp_path / 'f').write_text('x')\n"
+        )
+        monkeypatch.chdir(project)
+        with (
+            declared_roots(session_write_roots(request.config)),
+            contain_writes() as blocked,
+        ):
+            rc = pytest.main([str(project), "-p", "no:cacheprovider", "-q"])
+        assert rc == 0
+        assert blocked == [], blocked
+    finally:
+        monkeypatch.undo()
+        shutil.rmtree(project)
+
+
+def test_a_root_that_contains_the_project_grants_nothing(tmp_path, monkeypatch):
+    """The project tree is never a test's room, wherever it is checked out: inside a declared root
+    (pytest's scratch root, where the pair's own end-to-end tests keep their projects) or inside a
+    temporary directory this process created. A root INSIDE the project (a project-local
+    `--basetemp`) still stands."""
+    project = tmp_path / "project"
+    local_basetemp = project / ".basetemp"
+    local_basetemp.mkdir(parents=True)
+    monkeypatch.chdir(project)
+    with declared_roots([str(tmp_path), str(local_basetemp)]):
+        with contain_writes() as blocked, pytest.raises(WriteOutsideAuthority):
+            Path("stray.txt").write_text("x")
+        assert blocked and not (project / "stray.txt").exists()
+        with contain_writes() as blocked:
+            (local_basetemp / "t0").mkdir()
+            (local_basetemp / "t0" / "f").write_text("x")
+        assert blocked == []
+    made = Path(tempfile.mkdtemp(prefix="wa-made-"))
+    try:
+        monkeypatch.chdir(made)
+        with contain_writes() as blocked, pytest.raises(WriteOutsideAuthority):
+            Path("stray.txt").write_text("x")
+        assert blocked and not (made / "stray.txt").exists()
+    finally:
+        monkeypatch.undo()
+        shutil.rmtree(made)
 
 
 def test_unarmed_the_hook_prevents_nothing(layout):
