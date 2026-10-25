@@ -797,3 +797,27 @@ def test_arming_the_window_leaves_no_check_before_the_with_protects_it():
     )
     after = [op.opname for op in ops[armed + 1 :]]
     assert not [name for name in after if name.startswith("CALL")], after
+
+
+def test_every_evaluate_full_call_names_its_optional_arguments():
+    """A merge regression, pinned structurally (found by Sonar S5655, 2026-10-25).
+
+    `_evaluate_full` gained two optional groups on two branches: W#27's `step_caps, project_root`
+    and #105's `write_roots`. The one-shot path passed its write roots as the FIFTH positional
+    argument, which after the merge bound them to `step_caps`. Write authority silently fell back to
+    defaults there, and nothing in either suite noticed. Every call now names what follows
+    `mutant_source`.
+    """
+    import Wesker._isolated_worker as worker_module
+
+    tree = ast.parse(Path(worker_module.__file__).read_text())
+    calls = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "_evaluate_full"
+    ]
+    assert calls, "the guard must see the call sites it guards"
+    for call in calls:
+        assert len(call.args) <= 4, ast.unparse(call)

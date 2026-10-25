@@ -480,9 +480,9 @@ def _serve() -> int:
             qualname,
             nodes,
             spec["mutant_source"],
-            spec.get("step_caps"),
-            session["project_root"],
-            tuple(session.get("write_roots") or ()),
+            step_caps=spec.get("step_caps"),
+            project_root=session["project_root"],
+            write_roots=tuple(session.get("write_roots") or ()),
         )
         payload["enforced"] = enforced
         real_stdout.write(json.dumps(payload) + "\n")
@@ -510,12 +510,16 @@ def main() -> int:
     target = _resolve_target(spec["project_root"], spec["target_file"])
     # One-shot's verdict IS its exit code (`run_mutant_isolated` reads `mutant_verdict` off it); the
     # richer killed_by/constructed payload travels only over the server protocol the engine uses.
+    # Past `mutant_source` every argument is named: W#27's budget and #105's write roots arrived as
+    # separate optional groups, and a positional fifth argument bound write roots to `step_caps`.
     payload = _evaluate_full(
         target,
         spec["func_qualname"],
         spec["node_ids"],
         spec["mutant_source"],
-        tuple(spec.get("write_roots") or ()),
+        step_caps=spec.get("step_caps"),
+        project_root=spec["project_root"],
+        write_roots=tuple(spec.get("write_roots") or ()),
     )
     if payload["write_blocked"] and not payload["killed_by"]:
         # A prevented write is never a kill (#105). The exit code has no refusal to carry, so the
