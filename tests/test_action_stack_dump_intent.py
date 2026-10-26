@@ -7,10 +7,11 @@ all-thread dump on a PRIVATE copy of stderr, because the live session captures (
 mutants of the capture machinery can close) fd 2 for long stretches of the run.
 
 The descriptor behaviour is process-global, so the wiring cases run in a subprocess. A dump is
-counted by its thread header, "(most recent call first)": these scripts run one Python thread,
-so one header is one dump. The first version counted faulthandler's "Timeout (" banner, which
-only its own timer prints; that timer is gone (pytest cancels it on every failing test, W#29),
-and the clock that replaced it signals a registered handler, which prints no banner.
+counted by its "Current thread" header, which faulthandler prints once per dump whatever the
+number of threads: an armed dump runs its own re-assertion thread (W#52), so counting every thread
+header would count each dump twice. The first version counted faulthandler's "Timeout (" banner,
+which only its own timer prints; that timer is gone (pytest cancels it on every failing test,
+W#29), and the clock that replaced it signals a registered handler, which prints no banner.
 """
 
 from __future__ import annotations
@@ -80,7 +81,7 @@ def test_the_dump_reaches_the_real_stderr_after_fd2_is_captured(tmp_path):
     assert proc.returncode == 0, proc.stderr
     assert "finished" in proc.stdout
     # One dump fired before the cancel, on the private descriptor, and none after it.
-    assert proc.stderr.count("most recent call first") == 1, proc.stderr
+    assert proc.stderr.count("Current thread") == 1, proc.stderr
 
 
 _MAIN_WITH_A_SLOW_PROFILE = """
@@ -100,7 +101,7 @@ _MAIN_WITH_A_SLOW_PROFILE = """
 def test_main_arms_the_dump_around_profiling_when_asked(tmp_path):
     proc = _run(_MAIN_WITH_A_SLOW_PROFILE, "1", tmp_path)
     assert proc.returncode == 1, proc.stderr
-    assert proc.stderr.count("most recent call first") == 1, proc.stderr
+    assert proc.stderr.count("Current thread") == 1, proc.stderr
     assert "WESKER REFUSED TO REPORT" in proc.stderr
 
 

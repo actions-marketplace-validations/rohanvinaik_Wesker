@@ -7,6 +7,12 @@
     "refusal": "",
     "standing": "ungateable"
   },
+  "Wesker/action.py::stack_dump_owner": {
+    "cut_reasons": [],
+    "function_digest": "4e082b208c38cfa2",
+    "refusal": "",
+    "standing": "complete"
+  },
   "Wesker/action.py::stack_dump_setting": {
     "cut_reasons": [],
     "function_digest": "9f411e3c8be339fd",

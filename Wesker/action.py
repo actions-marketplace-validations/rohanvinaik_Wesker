@@ -34,6 +34,7 @@ import os
 import re
 import subprocess
 import sys
+import threading
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -505,6 +506,30 @@ def stack_dump_setting(raw: str) -> tuple[str, int]:
     return "armed", seconds
 
 
+def stack_dump_owner(marker: str, pid: int) -> str:
+    """Whether THIS process already owns an armed stack dump (W#52, pure — pinned).
+
+    Under self-measurement, a test of the Action calls `main` inside the measuring process. Each such
+    call armed its own dump and, on the way out, unregistered faulthandler's SIGURG handler, which is
+    process-global. The run's own clock kept signalling a process with no handler, SIGURG is ignored
+    by default, and the dump went silent: spec-full 40237240506 dumped at 22:04 and never again, through
+    two and a half hours of silence. ``marker`` is ``WESKER_STACK_DUMP_OWNER``, which the arming process
+    sets to its own pid; every module copy in the process sees it, the measured one included.
+
+      "nested"  the marker names this process: an outer Action owns the dump, so arm nothing and cancel
+                nothing
+      "owner"   anything else (unset, or a marker inherited from another process): arm, and own it
+    """
+    return "nested" if marker == str(pid) else "owner"
+
+
+# The process-global marker an armed dump's owner sets (W#52): its pid.
+_DUMP_OWNER_ENV = "WESKER_STACK_DUMP_OWNER"
+# How often the owner re-asserts its SIGURG registration (W#52). A mutant of this very code, run by a test
+# in the measuring process, can unregister it; the owner restores it within this many seconds.
+_REASSERT_S = 30.0
+
+
 # The tick the dump clock sends. SIGURG is ignored by default, so if the code under measurement
 # ever replaces or removes the handler, a stray tick is dropped instead of ending the run.
 _DUMP_SIGNAL = "SIGURG"
@@ -588,7 +613,28 @@ def _arm_stack_dump(seconds: int) -> Callable[[], None]:
         stream.close()
         return lambda: None
 
+    stopped = threading.Event()
+
+    def reassert() -> None:
+        # W#52: a mutant of this code, run by a test in this process, can unregister the handler.
+        while not stopped.wait(_REASSERT_S):
+            try:
+                faulthandler.register(
+                    signum, file=stream, all_threads=True, chain=False
+                )
+            except (
+                OSError,
+                RuntimeError,
+                ValueError,
+            ):  # what register raises: the diagnostic stops
+                return
+
+    threading.Thread(
+        target=reassert, name="wesker-stack-dump-reassert", daemon=True
+    ).start()
+
     def cancel() -> None:
+        stopped.set()
         clock.terminate()
         try:
             clock.wait(timeout=5)
@@ -602,7 +648,10 @@ def _arm_stack_dump(seconds: int) -> Callable[[], None]:
 
 
 def _stack_dump_from_env() -> Callable[[], None]:
-    """Arm the dump ``WESKER_STACK_DUMP_S`` asks for and return its cancel (a no-op when off)."""
+    """Arm the dump ``WESKER_STACK_DUMP_S`` asks for and return its cancel (a no-op when off).
+
+    Once per process (W#52): a nested Action, a test calling `main` in the measuring process, finds the
+    owner's marker (`stack_dump_owner`) and neither arms nor cancels the process's dump."""
     code, seconds = stack_dump_setting(os.environ.get("WESKER_STACK_DUMP_S", ""))
     if code == "invalid":
         print(
@@ -610,7 +659,20 @@ def _stack_dump_from_env() -> Callable[[], None]:
             "no stack dump is armed",
             file=sys.stderr,
         )
-    return _arm_stack_dump(seconds) if code == "armed" else (lambda: None)
+    if (
+        code != "armed"
+        or stack_dump_owner(os.environ.get(_DUMP_OWNER_ENV, ""), os.getpid())
+        == "nested"
+    ):
+        return lambda: None
+    cancel = _arm_stack_dump(seconds)
+    os.environ[_DUMP_OWNER_ENV] = str(os.getpid())
+
+    def release() -> None:
+        cancel()
+        os.environ.pop(_DUMP_OWNER_ENV, None)
+
+    return release
 
 
 def main(argv: list[str] | None = None) -> int:
