@@ -33,9 +33,9 @@ import io
 import itertools
 import os
 import sys
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextvars import ContextVar
-from typing import TYPE_CHECKING, Any, Callable
+from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from Wesker.session_manifest import PytestSessionManifest
@@ -162,25 +162,59 @@ def _build_callables(items: list[Any]) -> list[Callable[..., Any]]:
         from Wesker.isolation import _SHAPE_KEYS, scan_source_hazards
 
         shape = dict.fromkeys(_SHAPE_KEYS, False)
+        provenance: dict[str, str] = {}
+        detected_hazards: dict[str, bool] = dict.fromkeys(_SHAPE_KEYS, False)
+        declared_hazards: dict[str, bool] = {}
+
         real = getattr(source_obj, "__wrapped__", source_obj)
         try:
             src: str | None = inspect.getsource(real)
         except (OSError, TypeError):
             src = None
-        detected = (
-            scan_source_hazards(src)
-            if src is not None
-            else ["signal_main_thread", "spawns_subprocess", "starts_background_thread"]
-        )
+        if src is not None:
+            detected = scan_source_hazards(src)
+            detected_p = "detected"
+        else:
+            detected = [
+                "signal_main_thread",
+                "spawns_subprocess",
+                "starts_background_thread",
+            ]
+            detected_p = "source_unavailable"
         for hazard in detected:
             shape[hazard] = True
+            detected_hazards[hazard] = True
+            provenance[hazard] = detected_p
+
         # A standard test item is `Function`; a unittest method `TestCaseFunction`. Anything else is
         # a custom collector whose lifecycle the in_process fast mode cannot assume it understands.
         if type(it).__name__ not in ("Function", "TestCaseFunction"):
             shape["custom_collector"] = True
+            detected_hazards["custom_collector"] = True
+            provenance["custom_collector"] = "detected"
+
+        # Check for explicit declared shape on source_obj or pytest item
+        decl = getattr(source_obj, "__wesker_declared_shape__", None) or getattr(
+            it, "__wesker_declared_shape__", None
+        )
+        if isinstance(decl, dict):
+            for k, v in decl.items():
+                if k in _SHAPE_KEYS:
+                    declared_val = bool(v)
+                    declared_hazards[k] = declared_val
+                    was_detected = detected_hazards.get(k, False)
+                    if was_detected != declared_val:
+                        provenance[k] = "declared_override"
+                    else:
+                        provenance[k] = "declared"
+                    shape[k] = declared_val
+
         with contextlib.suppress(Exception):
-            # Dynamic tag: valid Python, absent from FunctionType's stub.
+            # Dynamic tags: valid Python, absent from FunctionType's stub.
             runnable.__wesker_shape__ = shape  # type: ignore[attr-defined]  # ty: ignore[unresolved-attribute]
+            runnable.__wesker_shape_provenance__ = provenance  # type: ignore[attr-defined]  # ty: ignore[unresolved-attribute]
+            runnable.__wesker_detected_hazards__ = detected_hazards  # type: ignore[attr-defined]  # ty: ignore[unresolved-attribute]
+            runnable.__wesker_declared_hazards__ = declared_hazards  # type: ignore[attr-defined]  # ty: ignore[unresolved-attribute]
         return runnable
 
     callables: list[Callable[..., Any]] = []
@@ -289,7 +323,8 @@ def collect_pytest_callables(
                 from Wesker.session_manifest import capture_manifest
 
                 _LAST_MANIFEST.set(capture_manifest(session, config, items))
-            except Exception:  # noqa: BLE001 — a manifest that raises breaks a working run
+            # BLE001/S110: a manifest that raises breaks a working run
+            except Exception:  # noqa: BLE001, S110
                 pass
 
     # Evict already-imported test modules whose source lives under any collection
@@ -329,18 +364,19 @@ def collect_pytest_callables(
             contextlib.redirect_stderr(io.StringIO()),
         ):
             pytest.main(args, plugins=[plugin])
-    except Exception:
+    # BLE001: collection imports the target's conftests, plugins and test modules; a
+    # collection that raises returns None (could not collect)
+    except Exception:  # noqa: BLE001
         return None
     finally:
-        try:
+        with contextlib.suppress(OSError):
             os.chdir(cwd)
-        except Exception:
-            pass
 
     if not plugin.items:
         return None
     try:
         callables = _build_callables(plugin.items)
-    except Exception:
+    # BLE001: binding collected items touches arbitrary user objects; same None
+    except Exception:  # noqa: BLE001
         return None
     return callables or None

@@ -32,6 +32,8 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any
 
+from .write_authority import current_roots
+
 # Names whose presence in a test's OWN source marks a shape the in_process fast mode cannot contain
 # (#19). Matched against AST Name/Attribute identifiers, never raw text — a string literal or comment
 # that merely mentions "subprocess" must not refuse a hermetic test. Deliberately broad within each
@@ -49,6 +51,17 @@ _SUBPROCESS_NAMES = frozenset(
 )
 _THREAD_NAMES = frozenset({"threading", "_thread", "Thread", "start_new_thread"})
 _SIGNAL_NAMES = frozenset({"signal", "setitimer", "sigwait", "pthread_kill"})
+
+
+def isolated_test_selection(node_id: str, has_plain_source: bool) -> str:
+    """Select only test identities the isolated collector can verify (#B/#19, pure — pinned)."""
+    if node_id.startswith("legacy:"):
+        return "unavailable"
+    if "::" in node_id:
+        return "recorded"
+    if has_plain_source and node_id.isidentifier():
+        return "collect_plain"
+    return "unavailable"
 
 
 def isolated_test_outcome(returncode: int, timed_out: bool) -> str:
@@ -109,6 +122,14 @@ class IsolatedRun:
     #: capability rather than claiming a guarantee the platform did not keep.
     memory_cut: bool = False
     mem_enforced: bool = False
+    #: W#27 — a node's loop budget stopped the mutant: the named non-kill `diverged`. pytest's exit
+    #: code reads the stopped node as a failure, so the engine checks this before the verdict.
+    diverged: bool = False
+    #: Detective #105 — the first node whose run against the mutant tried to write outside its write
+    #: authority (None when none did), and the paths it was prevented from writing. That node's
+    #: failure is the guard's: it records no kill reason, so `killed_by` speaks for the other nodes.
+    write_blocked: str | None = None
+    blocked_writes: tuple[str, ...] = ()
 
     @property
     def outcome(self) -> str:
@@ -132,6 +153,20 @@ def _terminate_group(proc: subprocess.Popen[str]) -> bool:
         return True
     except subprocess.TimeoutExpired:
         return False  # not confirmed dead — the honest answer is uncontained
+
+
+def _close_pipes(proc: subprocess.Popen[str]) -> None:
+    """Close the parent's ends of a worker's pipes, whatever state the worker is in.
+
+    `communicate()` closes them on its normal path. A timeout path that kills the group, and a
+    persistent worker's `close()`, did not: the pipe objects then lived until garbage collection and
+    were finalized with a `ResourceWarning` (surfaced by running the suite under `-W error`). A pipe
+    that is already closed, or whose buffered write meets a dead reader, is not an error here.
+    """
+    for stream in (proc.stdin, proc.stdout, proc.stderr):
+        if stream is not None:
+            with contextlib.suppress(OSError, ValueError):
+                stream.close()
 
 
 def run_pytest_node_isolated(
@@ -175,6 +210,19 @@ def run_pytest_node_isolated(
         except (subprocess.TimeoutExpired, ValueError):
             out = ""
         return IsolatedRun(-9, True, contained, out or "")
+    finally:
+        _close_pipes(proc)
+
+
+def isolated_selector_key(root: str, selector: str) -> str:
+    """One canonical spelling for a node selector, so the parent and the worker agree on it.
+
+    ``path::case`` with the path resolved against ``root`` through symlinks. The parent maps a
+    worker's failing node back to its test through this, and the loop budget it sends per node
+    (W#27) is keyed by it, so both sides must spell a node the same way.
+    """
+    path, separator, case = selector.partition("::")
+    return os.path.realpath(os.path.join(root, path)) + separator + case
 
 
 def mutant_verdict(outcome: str) -> str:
@@ -268,6 +316,8 @@ def run_mutant_isolated(
             "target_file": target_file,
             "func_qualname": func_qualname,
             "mutant_source": mutant_source,
+            # Detective #105: the live session's declared write roots, which the worker inherits.
+            "write_roots": list(current_roots()),
         }
     )
     proc = subprocess.Popen(
@@ -289,6 +339,8 @@ def run_mutant_isolated(
         except (subprocess.TimeoutExpired, ValueError):
             out = ""
         return IsolatedRun(-9, True, contained, out or "")
+    finally:
+        _close_pipes(proc)
 
 
 def run_baseline_traced_isolated(
@@ -327,6 +379,8 @@ def run_baseline_traced_isolated(
     except subprocess.TimeoutExpired:
         contained = _terminate_group(proc)
         return [], "timeout", contained
+    finally:
+        _close_pipes(proc)
     lines = [ln for ln in (out or "").splitlines() if ln.strip()]
     if not lines:
         return [], "error", True
@@ -508,6 +562,40 @@ def callable_shape_hazards(call: Any) -> dict[str, bool]:
     return {k: bool(stamped.get(k, False)) for k in _SHAPE_KEYS}
 
 
+def callable_shape_records(call: Any, test_id: str = "") -> list[dict[str, Any]]:
+    """Preserve shape hazards, affected test ID, execution mode, and provenance (W#19/B01).
+
+    Distinguishes detected AST analysis, declared test markers/attributes, source unavailable,
+    or overrides, so downstream evidence preserves provenance rather than reconstructing it
+    from tag presence alone."""
+    hazards = callable_shape_hazards(call)
+    prov_map = getattr(call, "__wesker_shape_provenance__", {})
+    if not isinstance(prov_map, dict):
+        prov_map = {}
+    detected_map = getattr(call, "__wesker_detected_hazards__", {})
+    if not isinstance(detected_map, dict):
+        detected_map = {}
+    declared_map = getattr(call, "__wesker_declared_hazards__", {})
+    if not isinstance(declared_map, dict):
+        declared_map = {}
+    records: list[dict[str, Any]] = []
+    for hazard, active in hazards.items():
+        if active:
+            p = prov_map.get(hazard, "unknown")
+            rec: dict[str, Any] = {
+                "hazard": hazard,
+                "test_id": test_id,
+                "execution_mode": "in_process",
+                "provenance": p,
+            }
+            if hazard in detected_map:
+                rec["detected"] = bool(detected_map[hazard])
+            if hazard in declared_map:
+                rec["declared"] = bool(declared_map[hazard])
+            records.append(rec)
+    return records
+
+
 def callable_is_hermetic(call: Any) -> bool:
     """Whether a test callable is in_process-safe (hermetic), RESILIENT to the live-session path.
 
@@ -609,6 +697,8 @@ class IsolatedMutantWorker:
                 "target_file": target_file,
                 "func_qualname": func_qualname,
                 "mem_limit_bytes": mem_limit_bytes,
+                # Detective #105: the live session's declared write roots, which the worker inherits.
+                "write_roots": list(current_roots()),
             }
         )
         try:
@@ -634,6 +724,7 @@ class IsolatedMutantWorker:
         mutant_source: str,
         timeout_s: float,
         node_ids: Sequence[str] | None = None,
+        step_caps: dict[str, int] | None = None,
     ) -> IsolatedRun:
         """Evaluate ONE mutant on the reused worker. A hang kills the group and retires the worker.
 
@@ -646,6 +737,9 @@ class IsolatedMutantWorker:
         spec: dict[str, Any] = {"mutant_source": mutant_source}
         if node_ids is not None:
             spec["node_ids"] = list(node_ids)
+        if step_caps:
+            # W#27: per-node loop budgets, keyed by `isolated_selector_key`.
+            spec["step_caps"] = dict(step_caps)
         try:
             # Explicit checks, not `assert`s (see `open`): an assert vanishes under `python -O`.
             if self._proc.stdin is None or self._proc.stdout is None:
@@ -688,10 +782,15 @@ class IsolatedMutantWorker:
             entered_probe=bool(data.get("entered", False)),
             memory_cut=bool(data.get("memory_cut", False)),
             mem_enforced=bool(data.get("enforced", False)),
+            diverged=bool(data.get("diverged", False)),
+            write_blocked=data.get("write_blocked") or None,
+            blocked_writes=tuple(str(p) for p in data.get("blocked_writes") or ()),
         )
 
     def _reap(self) -> bool:
-        return _terminate_group(self._proc)
+        contained = _terminate_group(self._proc)
+        _close_pipes(self._proc)
+        return contained
 
     def close(self) -> None:
         with contextlib.suppress(Exception):
@@ -699,4 +798,7 @@ class IsolatedMutantWorker:
                 self._proc.stdin.close()
         if self._proc.poll() is None:
             self._reap()
+        # A worker that had already exited is not reaped above, so without this its stdout would
+        # stay open until garbage collection.
+        _close_pipes(self._proc)
         self._alive = False

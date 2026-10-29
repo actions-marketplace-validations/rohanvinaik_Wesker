@@ -14,7 +14,7 @@ and MC/DC verification.
 # restated... bump both, or neither", which was true until the number moved here and stopped being
 # restated. Following it now would put a second copy back in pyproject and recreate precisely the
 # drift going dynamic removed: 0.6.0 shipped to PyPI announcing itself as 0.5.1.)
-__version__ = "0.13.0"
+__version__ = "1.2.2"
 
 from .engine import (
     BoundaryInput,
@@ -36,7 +36,9 @@ from .engine import (
 from .filter import CategoryPrior, filter_categories, prioritize_categories
 from .policy import MutationPolicy, mutation_policy
 
-__all__ = [
+# RUF022: grouped by kind, and the group comments carry meaning (the policy-id note);
+# an alphabetical sort would scatter the groups and orphan those comments
+__all__ = [  # noqa: RUF022
     # Enums
     "MutationCategory",
     # The versioned mutation policy (issue #8) — proof receipts key on

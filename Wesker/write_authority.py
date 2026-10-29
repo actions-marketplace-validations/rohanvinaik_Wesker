@@ -1,0 +1,591 @@
+"""Write authority — where a test run under a mutant may change the filesystem (Detective #105).
+
+THE DEFECT. Mutant evaluation runs with the working directory set to the project root, on purpose:
+tests may read relative paths from it. So a mutant of a file-writing function writes wherever its
+mutated paths resolve. Measured while dogfooding `audit --remove` on Detective: a SWAP mutant of
+``atomic_write_text(path, source)`` wrote files NAMED by a test's source text into the project root,
+and staging files such as ``pyproject.toml.tmp-<pid>`` landed beside the real ``pyproject.toml``. One
+more mutated rename and the real file would have been replaced. Nothing contained it.
+
+THE AUTHORITY, and why it is not "the temporary directory". A test run may change:
+
+* the session's pytest temporary directory (``tmp_path``, ``tmpdir``, ``tmp_path_factory``) — the
+  regime's own declared root, wherever ``--basetemp`` puts it, or, by default, pytest's per-user
+  scratch root (``pytest-of-<user>``) that holds every session's numbered directory, a nested
+  session's included;
+* any entry this process CREATED EXCLUSIVELY, directly in the system temporary directory, and
+  everything beneath it — what ``mkdtemp``, ``mkstemp``, ``NamedTemporaryFile`` and
+  ``TemporaryDirectory`` hand a test;
+* devices (``os.devnull``).
+
+The second grant is what keeps legitimate temporary writes working without permitting the whole
+temporary directory: an exclusive creation can never name an entry that already exists, so a test
+gains room only where nothing was. A file another process left in the temporary directory, or one
+this process wrote there non-exclusively, stays protected. And a root that contains the project
+tree (the working directory a window arms in) grants nothing, wherever the project is checked out.
+
+THE MECHANISM. One audit hook, installed once and armed only while a test runs against a mutant
+(:func:`contain_writes`). An effect outside the authority raises :class:`WriteOutsideAuthority`
+inside the hook, so it never lands. The raise is only how the test unwinds: pytest's call wrapper
+and the engine's own worker both catch ``BaseException``, so the measurement reads the window's
+record instead, after the run, where nothing the test caught can have erased it. A prevented write
+is never a kill: the run's outcome is the guard's, not the mutant's. The caller names the mutant
+``write_outside_authority``, neither killed nor survived.
+
+Bytecode is suppressed for the window (``sys.dont_write_bytecode``) rather than allowlisted, so an
+import a test performs lazily writes nothing at all.
+
+THE BOUNDARY, stated: an audit hook sees what CPython audits. A subprocess's writes, native code
+writing through its own file calls, and writes through descriptors opened before the window are
+outside it. So is an ``open`` relative to a directory descriptor (the event carries no descriptor;
+it is resolved against the working directory, the conservative reading). A thread that outlives the
+window, an uncontained worker included, is no longer guarded once the window closes.
+"""
+
+from __future__ import annotations
+
+import contextlib
+import os
+import sys
+import tempfile
+import threading
+from collections.abc import Iterable, Iterator
+
+try:  # POSIX only; without it a directory descriptor cannot be named, and stays unplaceable
+    import fcntl
+except ImportError:  # pragma: no cover
+    fcntl = None  # type: ignore[assignment]
+
+#: The refusal code a mutant carries when a test run against it tried to write outside its authority.
+WRITE_OUTSIDE_AUTHORITY = "write_outside_authority"
+
+
+def write_authority_disposition(
+    effect: str,
+    path: str,
+    exists: bool,
+    is_dir: bool,
+    roots: list[str],
+    temp_root: str,
+) -> str:
+    """Whether ONE filesystem effect of a test run lies inside its write authority (#105, pure — pinned).
+
+    Split out of the audit hook because the hook's inputs — an event's argument tuple, a directory
+    descriptor, the live filesystem — cannot be supplied as literals, so every branch behind them
+    would be unreachable by input synthesis. The hook resolves those into the plain facts here.
+
+    ``effect`` is what the operation does to ``path``:
+
+      "create"  an EXCLUSIVE creation: ``mkdir``, an ``O_EXCL`` / ``"x"`` open, a symlink or hard link
+      "remove"  ``unlink``, ``rmdir``, ``rmtree``, the source of a rename
+      "write"   any other open for writing, a truncate, the destination of a rename
+
+    ``path`` is absolute and resolved; ``exists`` / ``is_dir`` describe it at event time. ``roots`` is
+    the authority (the session's basetemp, devices, and every entry this process freshly created that
+    contains ``path``); ``temp_root`` the resolved system temporary directory.
+
+      "no_effect"          the operation cannot change the filesystem: an exclusive creation of a path
+                           that exists (``makedirs(..., exist_ok=True)``), a removal of one that does not,
+                           a write-open of an existing directory (``NamedTemporaryFile`` opens the
+                           temporary directory itself and lets its opener create the file)
+      "inside_authority"   ``path`` is a root or lies beneath one, compared by whole path components
+      "fresh_temp_entry"   an exclusive creation of a new entry directly in ``temp_root``: it cannot
+                           name anything that exists, so it is granted — and becomes authority itself
+      "outside_authority"  anything else, the project tree included: prevented
+      "unplaceable"        not an absolute path, or an effect this decision does not know: prevented,
+                           because an effect that cannot be placed cannot be shown to be inside
+    """
+    if effect not in ("create", "remove", "write") or not os.path.isabs(path):
+        return "unplaceable"
+    if (effect == "create" and exists) or (effect == "remove" and not exists):
+        return "no_effect"
+    if effect == "write" and is_dir:
+        return "no_effect"
+    for root in roots:
+        if root and (path == root or path.startswith(root.rstrip(os.sep) + os.sep)):
+            return "inside_authority"
+    if effect == "create" and temp_root and os.path.dirname(path) == temp_root:
+        return "fresh_temp_entry"
+    return "outside_authority"
+
+
+class WriteOutsideAuthority(BaseException):
+    """A test run under a mutant tried to change the filesystem outside its write authority (#105).
+
+    Raised INSIDE the audit hook, so the operation never happens. A ``BaseException``, like
+    ``interrupt.Abandoned``: a target that wraps its write in ``except Exception`` would otherwise
+    swallow it and carry on down a fallback branch the real run never takes. Swallowing it cannot
+    unwrite the window's record, which is what the measurement reads.
+    """
+
+
+class SpeculativeEffectRefused(BaseException):
+    """Code the pair ran on an input it INVENTED tried an effect the measuring process cannot undo (W#29).
+
+    Raised INSIDE the audit hook, before the operation, so it never happens. It is a ``BaseException``
+    for the reason :class:`WriteOutsideAuthority` is one. The window's record is the signal, and
+    swallowing the exception cannot erase it: :class:`contain_speculation` hands the record back.
+    """
+
+
+# The audited operations a SPECULATIVE call may never make (W#29). A speculative call is code the pair
+# runs on inputs it invented, to compare an original with a mutant: Wesker's equivalence check, and the
+# witness searches of its consumers. Each of these acts on the measuring process itself, or on the world
+# outside it, and none can be taken back:
+# - a lowered hard limit cannot be raised again by a non-root process;
+# - a spawned process has already run;
+# - a delivered signal has already been delivered.
+# `os.chdir`, `os.putenv` and `os.unsetenv` change process-wide state that every later relative path or
+# environment read depends on.
+# Measured: the equivalence check ran `_isolated_worker._apply_mem_limit` on invented inputs, and the
+# ORIGINAL set `RLIMIT_AS=(1, 1)` on the measuring process. Seconds later no thread could start
+# (`Thread.start()` waited forever).
+# Only a speculative window refuses these. A real test run keeps them, and a test's own
+# `monkeypatch.chdir(tmp_path)` stays the remedy the write authority prescribes.
+_PROCESS_EFFECTS = frozenset(
+    {
+        "resource.setrlimit",
+        "resource.prlimit",
+        "os.system",
+        "os.exec",
+        "os.posix_spawn",
+        "os.spawn",
+        "os.fork",
+        "os.forkpty",
+        "subprocess.Popen",
+        "os.kill",
+        "os.killpg",
+        "signal.pthread_kill",
+        "os.chdir",
+        "os.putenv",
+        "os.unsetenv",
+    }
+)
+
+
+# The audited operations that change the filesystem. `os.replace` raises "os.rename", and
+# `os.unlink` raises "os.remove"; both spellings are listed so neither depends on that.
+_MKDIR = "os.mkdir"
+_RENAMES = ("os.rename", "os.replace")
+_REMOVALS = ("os.remove", "os.unlink", "os.rmdir", "shutil.rmtree")
+_EVENTS = frozenset(
+    {"open", _MKDIR, *_RENAMES, *_REMOVALS, "os.symlink", "os.link", "os.truncate"}
+)
+_WRITE_FLAGS = os.O_WRONLY | os.O_RDWR | os.O_CREAT | os.O_APPEND | os.O_TRUNC
+_EXCLUSIVE = os.O_CREAT | os.O_EXCL
+# Linux's nameless file: an open with it creates no directory entry at all.
+_ANONYMOUS = getattr(os, "O_TMPFILE", 0)
+
+
+def _is_path(raw: object) -> bool:
+    return isinstance(raw, (str, bytes, os.PathLike))
+
+
+def _optional(args: tuple, index: int) -> object:
+    return args[index] if len(args) > index else None
+
+
+def _open_effect(args: tuple) -> tuple[tuple[str, object, object, bool], ...]:
+    """The effect of an ``open`` event: ``(path, mode, flags)``, mode ``None`` for ``os.open``."""
+    raw, mode, flags = args[0], _optional(args, 1), _optional(args, 2)
+    if not _is_path(raw):
+        return ()  # a descriptor: its own open was the audited event
+    if isinstance(flags, int):
+        writes, exclusive = bool(flags & _WRITE_FLAGS), flags & _EXCLUSIVE == _EXCLUSIVE
+        if _ANONYMOUS and flags & _ANONYMOUS == _ANONYMOUS:
+            return ()
+    else:
+        writes = isinstance(mode, str) and any(ch in mode for ch in "wax+")
+        exclusive = isinstance(mode, str) and "x" in mode
+    if not writes:
+        return ()
+    # A write follows a symlink to its target; an exclusive creation of an existing link fails.
+    return (
+        (("create", raw, None, False),) if exclusive else (("write", raw, None, True),)
+    )
+
+
+def _effects(event: str, args: tuple) -> tuple[tuple[str, object, object, bool], ...]:
+    """``(effect, raw path, dir_fd, follow)`` for each path an audited operation changes.
+
+    ``follow`` is True only where the operation writes THROUGH a final symlink. A removal, a rename and
+    a creation act on the entry itself, so its parent is resolved and its own name kept: resolving a
+    link in ``tmp_path`` to a target elsewhere would refuse removing the link.
+    """
+    if event == "open":
+        return _open_effect(args)
+    if event == _MKDIR:
+        return (("create", args[0], _optional(args, 2), False),)
+    if event in _RENAMES:
+        return (
+            ("remove", args[0], _optional(args, 2), False),
+            ("write", args[1], _optional(args, 3), False),
+        )
+    if event in _REMOVALS:
+        return (("remove", args[0], _optional(args, 1), False),)
+    if event == "os.symlink":
+        return (("create", args[1], _optional(args, 2), False),)
+    if event == "os.link":
+        return (("create", args[1], _optional(args, 3), False),)
+    if event == "os.truncate" and _is_path(args[0]):
+        return (("write", args[0], None, True),)
+    return ()
+
+
+def _fd_directory(fd: int) -> str | None:
+    """The path a directory descriptor names, or None where the platform cannot say.
+
+    ``shutil.rmtree`` — and so ``TemporaryDirectory.cleanup`` — removes entries RELATIVE to a directory
+    descriptor (``os.remove('f', 4)``). Resolved against the working directory instead, every one of
+    them would land in the project root and refuse an ordinary cleanup.
+    """
+    get_path = getattr(fcntl, "F_GETPATH", None)
+    try:
+        if get_path is not None:  # macOS
+            raw = fcntl.fcntl(fd, get_path, bytes(1024))  # type: ignore[union-attr]
+            return os.fsdecode(raw.split(b"\0", 1)[0]) or None
+        return os.readlink(f"/proc/self/fd/{fd}")  # Linux
+    except OSError:
+        return None
+
+
+def _place(raw: object, dir_fd: object, follow: bool) -> str | None:
+    """``raw`` as an absolute, resolved path; ``""`` for an empty one, which names nothing and fails on
+    its own; None when it cannot be placed."""
+    try:
+        text = os.fsdecode(raw)  # type: ignore[arg-type]
+        if not text:
+            return ""
+        if os.path.isabs(text):
+            absolute = text
+        elif isinstance(dir_fd, int) and dir_fd >= 0:
+            base = _fd_directory(dir_fd)
+            if base is None:
+                return None
+            absolute = os.path.join(base, text)
+        else:
+            absolute = os.path.join(os.getcwd(), text)
+        parent, name = os.path.split(absolute)
+        if follow or name in ("", ".", ".."):
+            return os.path.realpath(absolute)
+        return os.path.join(os.path.realpath(parent), name)
+    except (TypeError, ValueError, OSError):
+        return None
+
+
+_TEMP_ROOTS: dict[str, str] = {}
+
+
+def _temp_root() -> str:
+    raw = tempfile.gettempdir()
+    real = _TEMP_ROOTS.get(raw)
+    if real is None:
+        real = _TEMP_ROOTS[raw] = os.path.realpath(raw)
+    return real
+
+
+def _device_roots() -> tuple[str, ...]:
+    return (os.path.realpath(os.devnull), "/dev") if os.name == "posix" else ()
+
+
+# Every entry this process created exclusively, directly in the temporary directory. Tracked whether
+# or not a window is armed, so a temporary directory a module-scoped fixture or a collection-time
+# `mkdtemp` made before any mutant ran is still the test's own room once one does.
+_CREATED: set[str] = set()
+# Roots the regime declares for the running session (`declared_roots`): its pytest basetemp.
+_DECLARED: tuple[str, ...] = ()
+# The armed window — its interception record, its roots and the project tree it protects, read
+# together in one load so a thread racing the window's close sees one window or none — or None while
+# no test runs against a mutant.
+_ACTIVE: tuple[list[str], tuple[str, ...], str] | None = None
+# The armed SPECULATIVE window's record of refused effects (`contain_speculation`, W#29) in its one slot,
+# or None there while nothing runs on an invented input. One load, like `_ACTIVE`, and set by subscript,
+# so arming takes no `global` statement.
+_SPECULATIVE: list[list[str] | None] = [None]
+_LOCAL = threading.local()
+_INSTALL_LOCK = threading.Lock()
+_installed = False
+
+
+def _contains(root: str, path: str) -> bool:
+    return path == root or path.startswith(root.rstrip(os.sep) + os.sep)
+
+
+def _created_ancestors(path: str) -> list[str]:
+    """The freshly created entries that are ``path`` or contain it — a walk of its parents."""
+    found: list[str] = []
+    current = path
+    while True:
+        if current in _CREATED:
+            found.append(current)
+        parent = os.path.dirname(current)
+        if parent == current:
+            return found
+        current = parent
+
+
+def _concerns(event: str, args: tuple, window: object) -> bool:
+    """Whether the hook has anything to do for this audited event. While armed, every write does.
+    Unarmed, only an exclusive creation, which may become the test's room later."""
+    if window is not None:
+        return True
+    if event == "open":
+        flags = _optional(args, 2)
+        return isinstance(flags, int) and flags & _EXCLUSIVE == _EXCLUSIVE
+    return event == _MKDIR
+
+
+def _effect_standing(
+    effect: str,
+    raw: object,
+    dir_fd: object,
+    follow: bool,
+    roots: tuple[str, ...],
+    protected: str,
+) -> tuple[str, str | None]:
+    """The disposition of ONE effect and the path it lands on (`write_authority_disposition`)."""
+    path = _place(raw, dir_fd, follow)
+    if path == "":
+        return "no_effect", path
+    if path is None:
+        return "unplaceable", None
+    return (
+        write_authority_disposition(
+            effect,
+            path,
+            os.path.lexists(path),
+            os.path.isdir(path),
+            [
+                *roots,
+                *(
+                    c
+                    for c in _created_ancestors(path)
+                    if not (protected and _contains(c, protected))
+                ),
+            ],
+            _temp_root(),
+        ),
+        path,
+    )
+
+
+def _settle(
+    event: str,
+    effect: str,
+    raw: object,
+    dir_fd: object,
+    follow: bool,
+    window: tuple[list[str] | None, tuple[str, ...], str],
+) -> str:
+    """Settle ONE effect and return its disposition: record a fresh temporary entry, or, while armed,
+    record and prevent a write outside the authority (by raising before the operation runs)."""
+    blocked, roots, protected = window
+    code, path = _effect_standing(effect, raw, dir_fd, follow, roots, protected)
+    if code == "fresh_temp_entry" and path is not None:
+        _CREATED.add(path)
+    elif blocked is not None and code in ("outside_authority", "unplaceable"):
+        blocked.append(path if path is not None else repr(raw))
+        raise WriteOutsideAuthority(f"{event}: {path or raw!r}")
+    return code
+
+
+def _judge(
+    event: str, args: tuple, window: tuple[list[str], tuple[str, ...], str] | None
+) -> None:
+    """Settle each effect of one audited operation. Unarmed, only a creation is followed."""
+    settled = window if window is not None else (None, (), "")
+    for effect, raw, dir_fd, follow in _effects(event, args):
+        if settled[0] is None and effect != "create":
+            continue
+        code = _settle(event, effect, raw, dir_fd, follow, settled)
+        if event in _RENAMES and code == "no_effect":
+            return  # a rename whose source is missing fails; its destination is untouched
+
+
+def _hook(event: str, args: tuple) -> None:
+    speculative = _SPECULATIVE[0]
+    if speculative is not None and event in _PROCESS_EFFECTS:
+        # W#29: refused before the operation runs, and recorded where the caller reads it.
+        speculative.append(event)
+        raise SpeculativeEffectRefused(event)
+    if event not in _EVENTS:
+        return
+    window = _ACTIVE
+    # The second test is this hook's own resolution (a descriptor lookup), never a test's effect.
+    if not _concerns(event, args, window) or getattr(_LOCAL, "busy", False):
+        return
+    _LOCAL.busy = True
+    try:
+        _judge(event, args, window)
+    finally:
+        _LOCAL.busy = False
+
+
+def install() -> None:
+    """Install the audit hook once per process. Unarmed, it only records exclusive temporary creations.
+
+    Installed before collection where the pair controls the session (`pytest_runner.run_in_session`,
+    the isolated worker), so a temporary directory created at import or by a fixture is known by the
+    time a mutant's test writes into it. The stdlib validates its temporary directory with a probe
+    write on first use; that runs here, before the hook can see it.
+    """
+    global _installed
+    if _installed:
+        return
+    with _INSTALL_LOCK:
+        if _installed:
+            return
+        _temp_root()
+        sys.addaudithook(_hook)
+        _installed = True
+
+
+def current_roots() -> tuple[str, ...]:
+    """The roots declared right now — what an isolated worker this process spawns inherits."""
+    return _DECLARED
+
+
+@contextlib.contextmanager
+def declared_roots(roots: Iterable[str]) -> Iterator[None]:
+    """Declare the running session's write roots — its pytest basetemp — for the duration."""
+    global _DECLARED
+    install()
+    previous = _DECLARED
+    _DECLARED = tuple(os.path.realpath(root) for root in roots if root)
+    try:
+        yield
+    finally:
+        _DECLARED = previous
+
+
+# Lower-case on purpose: every call site still reads as the verb, `with contain_writes() as blocked:`.
+class contain_writes:
+    """Arm the write authority for ONE test run against a mutant; yield the record of what it prevented.
+
+    Process-wide while armed, so a thread the test or the code under test starts is held to the same
+    authority as the test's own worker. The record is the measurement's signal, not the exception:
+    read it after the run.
+
+    A root that CONTAINS the project tree is no authority at all: the project is never a test's
+    room, wherever it happens to be checked out — inside the temporary directory, or inside pytest's
+    own scratch root as the pair's own end-to-end tests put theirs. A root inside the project (a
+    project-local ``--basetemp``) stands. ``project_root`` names the tree; without it, the working
+    directory when the window arms is taken, which is the project root wherever the window arms
+    BEFORE the test's own setup. The isolated worker arms at the call phase, after a fixture may have
+    changed directory (``monkeypatch.chdir(tmp_path)``, the remedy the refusal itself prescribes), so
+    it passes the root it was started in.
+
+    A CLASS, not a ``@contextmanager`` (W#29). The window is process-wide state, and a generator that
+    arms before its ``yield`` leaves a check, the one after ``next()`` returns inside ``__enter__``,
+    where an ``interrupt.abandon`` injection lands with the window already armed, before any
+    ``finally`` can disarm it. The engine arms this inside abandonable workers on the dogfood path.
+    Here everything that can raise or yield the GIL runs before arming, and ``__enter__`` arms with
+    plain assignments and returns, so no eval-breaker check lies between arming and the protected
+    ``with`` body.
+    """
+
+    def __init__(self, project_root: str | None = None) -> None:
+        install()
+        self._blocked: list[str] = []
+        try:
+            protected = os.path.realpath(project_root or os.getcwd())
+        except OSError:
+            protected = ""
+        self._window = (
+            self._blocked,
+            tuple(
+                root
+                for root in (*_DECLARED, *_device_roots())
+                if not (protected and _contains(root, protected))
+            ),
+            protected,
+        )
+        self._previous: (
+            tuple[tuple[list[str], tuple[str, ...], str] | None, bool] | None
+        ) = None
+
+    def __enter__(self) -> list[str]:
+        global _ACTIVE
+        self._previous = (_ACTIVE, sys.dont_write_bytecode)
+        _ACTIVE = self._window
+        sys.dont_write_bytecode = True
+        return self._blocked
+
+    def __exit__(self, *exc: object) -> bool:
+        global _ACTIVE
+        if self._previous is not None:
+            _ACTIVE, sys.dont_write_bytecode = self._previous
+        return False
+
+
+class contain_speculation:
+    """Refuse the process effects in `_PROCESS_EFFECTS` while code the pair runs on inputs it INVENTED
+    executes; yield the record of what was refused (W#29).
+
+    Resource limits, spawned processes, signals, the working directory and the environment are refused
+    outright. A speculative call is no test the regime set up, and nothing it does to this process can
+    be taken back. Writes are not this window's business: stack it with :class:`contain_writes`, as
+    Wesker's equivalence check does. A caller with its own write guard composes this one alone, as
+    Detective's ContextVar-scoped guard does with its own outcome codes.
+
+    The record is the signal, read after the call: a call that swallowed a refusal still left it there.
+
+    Process-wide while armed, like :class:`contain_writes`, and armed the same way: `__enter__` arms
+    with plain assignments only (W#29's stranded-window case). THE BOUNDARY is the audit hook's. An
+    effect CPython does not audit is outside it: a C extension's own system calls, `os.setuid`, a
+    handler installed with `signal.signal`.
+    """
+
+    def __init__(self) -> None:
+        install()
+        self._refused: list[str] = []
+        self._previous: list[str] | None = None
+
+    def __enter__(self) -> list[str]:
+        self._previous = _SPECULATIVE[0]
+        _SPECULATIVE[0] = self._refused
+        return self._refused
+
+    def __exit__(self, *exc: object) -> bool:
+        _SPECULATIVE[0] = self._previous
+        return False
+
+
+def session_write_roots(config: object, create: bool = True) -> tuple[str, ...]:
+    """The write roots a pytest session's regime declares: its basetemp, resolved — and, when that is
+    pytest's DEFAULT numbered directory, the per-user root it sits in (``pytest-of-<user>``).
+
+    Reading the basetemp CREATES it on first use, and creating it rotates pytest's numbered
+    directories and repoints its ``pytest-current`` link — writes outside any test's authority. So it
+    is read here, before a window is armed, never lazily inside one. A session without the factory (a
+    pytest that does not provide it) declares nothing, and its tests' ``tmp_path`` writes are refused
+    by name rather than silently allowed.
+
+    The per-user root is the regime's own scratch area, not the temporary directory: a test that
+    starts a NESTED pytest session in-process (a tool's live session, a raw ``pytest.main``) creates
+    that session's numbered basetemp there, inside the window, and refusing it refused every mutant
+    such a test reached for the harness's write (measured on Detective's own ``candidate_reach``). An
+    explicit ``--basetemp`` is the regime's choice of place and declares only itself.
+
+    ``create=False`` reads a basetemp only if the session already made one. The isolated worker runs a
+    fresh session per mutant, so forcing one there created a numbered directory per mutant for suites
+    that never use ``tmp_path`` (measured: +30% on a 29-mutant isolated profile, 90 directories); it
+    inherits the live session's roots instead, which name the per-user root its sessions share.
+    """
+    factory = getattr(config, "_tmp_path_factory", None)
+    getbasetemp = getattr(factory, "getbasetemp", None)
+    if getbasetemp is None or (
+        not create and getattr(factory, "_basetemp", None) is None
+    ):
+        return ()
+    try:
+        basetemp = os.path.realpath(str(getbasetemp()))
+    # BLE001: describing the session's authority must not fail the session; none is declared
+    except Exception:  # noqa: BLE001
+        return ()
+    parent = os.path.dirname(basetemp)
+    return (
+        (basetemp, parent)
+        if os.path.basename(parent).startswith("pytest-of-")
+        else (basetemp,)
+    )

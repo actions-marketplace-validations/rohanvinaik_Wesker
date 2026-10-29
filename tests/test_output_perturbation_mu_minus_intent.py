@@ -27,6 +27,7 @@ from Wesker.engine import (
     generate_mutants,
 )
 from Wesker.filter import filter_categories
+from Wesker.mu_minus import CALL_MODES, YIELD_MODES
 
 
 def _load(tmp_path, name, src):
@@ -42,6 +43,15 @@ def _load(tmp_path, name, src):
 def _output_mutants(src):
     node = ast.parse(src).body[0]
     return generate_mutants(node, {MutationCategory.OUTPUT}, max_per_category=0)
+
+
+def _form_a_mutants(src):
+    # Form A only: the return-site rewrites. Since #44 every non-generator also carries the Form B
+    # call modes (stale, swallow), whose site is the `def` line and whose kill needs a second call,
+    # so the Form A claims below are stated over Form A alone.
+    return [
+        m for m in _output_mutants(src) if _sub_mode(m) not in YIELD_MODES + CALL_MODES
+    ]
 
 
 def test_fork2_sub_modes_are_type_directed():
@@ -114,7 +124,7 @@ def test_default_policy_generates_no_output_mutant():
 
 
 def test_form_a_generates_the_three_always_applicable_submodes():
-    modes = {_sub_mode(m) for m in _output_mutants("def f(x):\n    return x.upper()\n")}
+    modes = {_sub_mode(m) for m in _form_a_mutants("def f(x):\n    return x.upper()\n")}
     assert modes == {"return_none", "return_const", "return_identity"}
 
 
@@ -130,7 +140,7 @@ def test_a_kill_is_always_by_assertion_never_a_perturbation_crash(tmp_path):
         def case():
             assert mod.f("ab") == "AB"
 
-        for m in _output_mutants(src):
+        for m in _form_a_mutants(src):
             r = evaluate_mutant(m, [case], mod.f, qualname="f", source_path=path)
             assert r.constructed and r.installed, _sub_mode(m)
             assert r.killed and r.killed_by == "assertion", (_sub_mode(m), r.killed_by)
@@ -205,7 +215,7 @@ def test_a_nested_functions_return_is_not_the_targets_codomain():
     # Only the target function's own returns are its codomain; a return inside a nested def is
     # that helper's, and must not be perturbed.
     src = "def f(x):\n    def g(y):\n        return y + 1\n    return g(x)\n"
-    muts = _output_mutants(src)
+    muts = _form_a_mutants(src)
     # The outer `return g(x)` is line 4; the nested `return y + 1` is line 3 — never a target.
     lines = {int(m.dimension.split(":")[2]) for m in muts if m.dimension}
     assert lines == {4}, lines
@@ -221,7 +231,8 @@ def test_form_b_generates_yield_wrappers_only_for_generators():
         "yield_duplicate_last",
         "yield_empty",
     }
-    # A non-generator gets no wrappers (its codomain is the return value, Form A's job).
+    # A non-generator gets no yield wrapper: its codomain is the return value, Form A's job (its
+    # Form B call modes, stale and swallow, are compiled source and carry no factory).
     nongen = ast.parse("def f(x):\n    return x * 2\n").body[0]
     assert not any(
         m.wrapper_factory

@@ -35,33 +35,64 @@ from typing import Any
 import pytest
 
 from Wesker.isolation import aggregate_kill_reason, classify_kill_reason
+from Wesker.pytest_runner import _install_cheap_failure_repr
+from Wesker.write_authority import (
+    contain_writes,
+    declared_roots,
+    install,
+    session_write_roots,
+)
 
 
 def _build_mutant(target_file: str, func_name: str, mutant_source: str) -> Any | None:
-    """Compile the mutant with the target module's globals in scope (#19).
+    """Compile in the namespace pytest actually imported for this source.
 
-    Without them a function that calls a module-level helper raises ``NameError`` under EVERY
-    mutant — a false all-crash 100% that hides whether the mutation is actually caught (the reason
-    ``evaluate_mutant`` seeds the same namespace). Returns None if the file/name cannot be resolved
-    or the mutant will not compile — the caller reports ``constructed=False`` so the engine scores it
-    ``harness_error`` (outside the denominator), never a survivor.
+    Relative imports, dataclasses and namespace packages use their real module identity.
+    A flat module not imported during collection retains the standalone fallback, with
+    normal sys.modules registration while its module body executes.
     """
+    from types import ModuleType
+
     from Wesker.engine import _entry_probe
 
-    spec = importlib.util.spec_from_file_location("_wesker_mutant_target", target_file)
-    if spec is None or spec.loader is None:
-        return None
-    module = importlib.util.module_from_spec(spec)
+    target = os.path.realpath(target_file)
+    # SNAPSHOT, not a redundant copy: the search below can trigger an import (and another thread
+    # may import at any time), and mutating `sys.modules` while iterating its values raises
+    # "dictionary changed size during iteration". Materialising first is what makes this safe.
+    loaded_modules = list(sys.modules.values())
+    module = next(
+        (
+            candidate
+            for candidate in loaded_modules
+            if isinstance(candidate, ModuleType)
+            and isinstance(vars(candidate).get("__file__"), str)
+            and os.path.realpath(vars(candidate)["__file__"]) == target
+        ),
+        None,
+    )
     try:
-        spec.loader.exec_module(module)
+        if module is None:
+            name = "_wesker_mutant_target"
+            spec = importlib.util.spec_from_file_location(name, target_file)
+            if spec is None or spec.loader is None:
+                return None
+            module = importlib.util.module_from_spec(spec)
+            previous = sys.modules.get(name)
+            sys.modules[name] = module
+            try:
+                spec.loader.exec_module(module)
+            finally:
+                if previous is None:
+                    sys.modules.pop(name, None)
+                else:
+                    sys.modules[name] = previous
         namespace: dict[str, Any] = dict(vars(module))
         exec(compile(mutant_source, "<mutant>", "exec"), namespace)  # noqa: S102
-    except Exception:  # noqa: BLE001 — a mutant that will not compile installs nothing
+    # BLE001: a construction failure is UNMEASURED, never evidence of adequacy — the mutant could
+    # not be built, so there is nothing to conclude about the suite that would have faced it.
+    except Exception:  # noqa: BLE001
         return None
     obj = namespace.get(func_name)
-    # Wrap so ENTERING the mutant is observable (#18), exactly as `evaluate_mutant` does in-process:
-    # `.entered` flips True on the first call, so a mutant installed but never reached (a decorator/
-    # capture/registry holding the original) is seen as not_entered, not a false survivor.
     return _entry_probe(obj) if obj is not None else None
 
 
@@ -76,7 +107,25 @@ class _MutantPlugin:
     ``KeyboardInterrupt``/``SystemExit`` excluded exactly as it re-raises them.
     """
 
-    def __init__(self, mutated_obj: Any, func_qualname: str) -> None:
+    def __init__(
+        self,
+        mutated_obj: Any,
+        func_qualname: str,
+        target_file: str = "",
+        mutant_source: str = "",
+        step_caps: dict[str, int] | None = None,
+        project_root: str = "",
+        write_roots: tuple[str, ...] = (),
+    ) -> None:
+        self._target_file = target_file
+        #: The write roots the spawning live session declared (#105): its basetemp and pytest's
+        #: per-user root, which also holds this worker's own per-mutant session directories.
+        self._write_roots = tuple(write_roots)
+        self._mutant_source = mutant_source
+        #: The loop budget per node, keyed by canonical selector (W#27). The parent counted the
+        #: ORIGINAL on each node in its own process and sends the cap; an absent node is unbudgeted.
+        self._step_caps = step_caps or {}
+        self._project_root = project_root
         self._mutated = mutated_obj
         self._qualname = func_qualname
         self._func_name = func_qualname.split(".")[-1]
@@ -91,13 +140,45 @@ class _MutantPlugin:
         #: True when a node hit `MemoryError` under the worker's address-space cap (W#21) — a budget
         #: CUT, not a kill: the measurement could not complete, so the engine marks it non-gateable.
         self.memory_cut = False
+        #: Nodes whose loop budget stopped the mutant (W#27): the named non-kill `diverged`, never a
+        #: kill reason, whatever pytest's exit code says about the stopped node.
+        self.diverged_nodes: list[str] = []
+        self._mutant_codes: tuple[Any, ...] = ()
+        #: The first node whose run against the mutant tried to write outside its write authority
+        #: (Detective #105), and the paths that run was prevented from writing. Such a node records
+        #: no kill reason: its failure is the guard's, never the mutant's.
+        self.write_blocked: str | None = None
+        self.blocked_writes: list[str] = []
+
+    def pytest_collection_finish(self, session: Any) -> None:
+        """Compile after pytest establishes the actual package/import regime."""
+        from Wesker.engine import _step_codes_of
+
+        if self._mutant_source:
+            self._mutated = _build_mutant(
+                self._target_file, self._func_name, self._mutant_source
+            )
+        self._mutant_codes = (
+            _step_codes_of(self._mutated) if self._mutated is not None else ()
+        )
+
+    def _step_arm_for(self, nodeid: str) -> tuple[tuple[Any, ...], int | None]:
+        """The codes and cap one node's mutant observation runs under (W#27)."""
+        from Wesker.isolation import isolated_selector_key
+
+        cap = self._step_caps.get(isolated_selector_key(self._project_root, nodeid))
+        if cap is None or not self._mutant_codes:
+            return (), None
+        return self._mutant_codes, cap
 
     @pytest.hookimpl(hookwrapper=True)
     def pytest_runtest_call(self, item: Any) -> Any:
         from Wesker.engine import (
             _execution_guard,
             _is_declared_failure,
+            _patch_module_qualified,
             _patch_mutant_into_test,
+            _StepArm,
             _unpatch_mutant,
         )
 
@@ -105,17 +186,46 @@ class _MutantPlugin:
         if test_fn is None or self._mutated is None:
             yield
             return
+        arm = _StepArm(*self._step_arm_for(getattr(item, "nodeid", "")))
         with _execution_guard() as proof:
+            module_saved = _patch_module_qualified(
+                proof, self._func_name, self._mutated, self._target_file, self._qualname
+            )
             patched, saved, target = _patch_mutant_into_test(
                 proof, test_fn, self._qualname, self._mutated
             )
-            if patched:
+            if patched or module_saved:
                 self.installed = True
             self.ran += 1
+            # Armed only here, where the mutant is installed (#105) — never around `pytest.main`,
+            # whose collection and basetemp creation are the harness's writes. This session's own
+            # basetemp is read only if a fixture already made it: forcing one per mutant session costs
+            # a numbered directory per mutant for a suite that never uses `tmp_path`.
+            roots = (
+                *self._write_roots,
+                *session_write_roots(getattr(item, "config", None), create=False),
+            )
             try:
-                outcome = yield
+                with (
+                    arm,
+                    declared_roots(roots),
+                    contain_writes(_PROJECT_TREE or None) as blocked,
+                ):
+                    outcome = yield
             finally:
                 _unpatch_mutant(proof, patched, saved, target, self._func_name)
+                for owner, original in reversed(module_saved):
+                    setattr(owner, self._func_name, original)
+        if arm.stopped:
+            # Budget-relative, never a kill (W#27): whatever pytest made of the stopped node.
+            self.diverged_nodes.append(getattr(item, "nodeid", ""))
+        if blocked and self.write_blocked is None:
+            # The guard's failure, never the mutant's (Detective #105).
+            self.write_blocked = getattr(item, "nodeid", None) or "?"
+            self.blocked_writes = list(dict.fromkeys(blocked))[:3]
+        # Both facts are recorded; the engine's per-mutant disposition ranks them.
+        if arm.stopped or blocked:
+            return
         self._record(item, outcome, _is_declared_failure)
 
     def _record(self, item: Any, outcome: Any, is_declared_failure: Any) -> None:
@@ -142,9 +252,41 @@ class _MutantPlugin:
         reason = classify_kill_reason(
             isinstance(exc, AssertionError), bool(is_declared_failure(exc))
         )
+        previous = aggregate_kill_reason(self.reasons)
         self.reasons.append(reason)
-        if self.first_failing_node is None:
+        # Credit the node supplying the strongest reason, never a preceding crash
+        # that would otherwise borrow a later assertion's value-kill attribution.
+        if (
+            self.first_failing_node is None
+            or aggregate_kill_reason(self.reasons) != previous
+        ):
             self.first_failing_node = getattr(item, "nodeid", None)
+        # Like the in-process evaluator, stop once a value kill is established.
+        # Otherwise a later slow test can time out the worker and erase the already
+        # observed assertion. shouldfail ends pytest with TESTS_FAILED, preserving it.
+        if (
+            reason in ("assertion", "exception")
+            and getattr(item, "session", None) is not None
+        ):
+            item.session.shouldfail = "mutation distinguished by a value assertion"
+
+
+class _CheapFailureRepr:
+    """Give every item this worker collects the measurement session's cheap failure repr (W#34).
+
+    EP-C1 (Detective docs/ENGINEERING_PASS_2026-09-26.md): every killed mutant is a failing test to
+    pytest, and building its report formatted a source-annotated traceback — re-parsing source with
+    ``ast`` per traceback entry — for text nothing reads. ``49f7e91`` stopped it for the in-process
+    session; this process runs its OWN ``pytest.main`` per mutant (and per determinism baseline), so
+    it kept paying, once per killed mutant. Nothing here reads a report's text either: the verdict is
+    pytest's exit code, the kill reason comes from :class:`_MutantPlugin`'s raw ``excinfo``, and the
+    terminal output goes to a sink. The SAME installer as the in-process session
+    (``pytest_runner._install_cheap_failure_repr``), so the two cannot drift.
+    """
+
+    def pytest_collection_modifyitems(self, items: list[Any]) -> None:
+        for item in items:
+            _install_cheap_failure_repr(item)
 
 
 def _resolve_target(root: str, target_file: str) -> str:
@@ -154,7 +296,13 @@ def _resolve_target(root: str, target_file: str) -> str:
 
 
 def _evaluate_full(
-    target_abspath: str, func_qualname: str, node_ids: list[str], mutant_source: str
+    target_abspath: str,
+    func_qualname: str,
+    node_ids: list[str],
+    mutant_source: str,
+    step_caps: dict[str, int] | None = None,
+    project_root: str = "",
+    write_roots: tuple[str, ...] = (),
 ) -> dict[str, Any]:
     """Run the node IDs against ONE mutant; return its verdict payload.
 
@@ -165,28 +313,44 @@ def _evaluate_full(
     server mode, it cannot land in the JSON-line protocol on stdout; ``--capture=sys`` keeps the same
     isolation at the Python level without touching descriptor 1, the protocol channel.
     """
-    mutated = _build_mutant(target_abspath, func_qualname.split(".")[-1], mutant_source)
-    plugin = _MutantPlugin(mutated, func_qualname)
+    # W#27: per-node loop budgets arrive from the parent, which counted the ORIGINAL on each node in
+    # its own process — never here, where a count pass would run nodes this mutant's first value
+    # kill short-circuits, inside this request's own timeout.
+    plugin = _MutantPlugin(
+        None,
+        func_qualname,
+        target_abspath,
+        mutant_source,
+        step_caps,
+        project_root,
+        write_roots,
+    )
     with (
         contextlib.redirect_stdout(io.StringIO()),
         contextlib.redirect_stderr(io.StringIO()),
     ):
         rc = pytest.main(
             [*node_ids, "-p", "no:cacheprovider", "-q", "--no-header", "--capture=sys"],
-            plugins=[plugin],
+            plugins=[plugin, _CheapFailureRepr()],
         )
     return {
+        # W#27: a node whose loop budget stopped the mutant — the named non-kill `diverged`, read
+        # by the engine BEFORE pytest's exit code (the stopped node reads as a failure there).
+        "diverged": bool(plugin.diverged_nodes),
         "rc": int(rc),
         "killed_by": aggregate_kill_reason(plugin.reasons) or None,
-        "constructed": mutated is not None,
+        "constructed": plugin._mutated is not None,
         "test_name": plugin.first_failing_node,
         # Installation-and-entry proof (#18): the engine feeds these to `mutant_disposition` so an
         # installed-but-never-entered mutant scores `not_entered`, outside the denominator.
         "installed": plugin.installed,
         "ran": plugin.ran,
-        "entered": bool(getattr(mutated, "entered", False)),
+        "entered": bool(getattr(plugin._mutated, "entered", False)),
         # W#21: this mutant hit the worker's address-space cap — a budget CUT, not a kill.
         "memory_cut": plugin.memory_cut,
+        # Detective #105: a node whose write was prevented, and what it was prevented from writing.
+        "write_blocked": plugin.write_blocked,
+        "blocked_writes": plugin.blocked_writes,
     }
 
 
@@ -210,13 +374,10 @@ def _trace_baseline_run(target_abspath: str, node_ids: list[str]) -> dict[str, A
 
     The determinism check runs this twice in two fresh workers and compares. Here, from one fresh
     process, it captures the set of TARGET lines the covering tests execute and the run's outcome.
-    The tracer mirrors ``line_coverage._trace_one_multi``'s dispatch: a global ``settrace`` whose
-    dispatch installs the per-line recorder only on frames whose code lives in the target file —
-    ``settrace``'s global hook still fires for every nested frame, so a test in another file that
-    CALLS the target is recorded too. ``settrace`` binds the calling (main) thread, which is where
-    pytest runs the node bodies.
+    Coordinated via sys.monitoring (W#32).
     """
     from Wesker.isolation import isolated_test_outcome
+    from Wesker.monitoring import allocate_run_token, retire_run_token, subscribe
 
     # `realpath`, not `abspath`: `python -m` prepends "" (cwd) to sys.path so an import can resolve to
     # a RELATIVE co_filename, AND on macOS the target dir is reached through the /var -> /private/var
@@ -234,21 +395,29 @@ def _trace_baseline_run(target_abspath: str, node_ids: list[str]) -> dict[str, A
             _norm[fn] = hit
         return hit
 
-    def _local(frame: Any, event: str, _arg: Any) -> Any:
-        if event == "line" and _is_target(frame.f_code.co_filename):
-            covered.add(frame.f_lineno)
-        return _local
+    token = allocate_run_token()
 
-    def _dispatch(frame: Any, event: str, _arg: Any) -> Any:
-        if event == "call" and _is_target(frame.f_code.co_filename):
-            return _local
-        return None
+    def _on_line(
+        code: Any,
+        lineno: int,
+        frame: Any = None,
+        run_token: int | None = None,
+    ) -> None:
+        if _is_target(code.co_filename):
+            covered.add(lineno)
+
+    handle = subscribe(
+        [],
+        sys.monitoring.events.LINE,
+        _on_line,
+        run_token=token,
+        selectors=[target_abspath],
+    )
 
     with (
         contextlib.redirect_stdout(io.StringIO()),
         contextlib.redirect_stderr(io.StringIO()),
     ):
-        sys.settrace(_dispatch)
         try:
             rc = pytest.main(
                 [
@@ -258,15 +427,28 @@ def _trace_baseline_run(target_abspath: str, node_ids: list[str]) -> dict[str, A
                     "-q",
                     "--no-header",
                     "--capture=sys",
-                ]
+                ],
+                # The outcome is read off the exit code alone (W#34): no report text is needed here.
+                plugins=[_CheapFailureRepr()],
             )
         finally:
-            sys.settrace(None)
+            retire_run_token(token)
+            handle.close()
+    handle.check()
     return {"lines": sorted(covered), "outcome": isolated_test_outcome(int(rc), False)}
 
 
+# The project tree this worker measures, recorded at setup (#105): the write authority protects it
+# even after a fixture has changed directory, because the window arms only at the call phase.
+_PROJECT_TREE = ""
+
+
 def _setup(spec: dict[str, Any]) -> None:
+    global _PROJECT_TREE
+    # Before collection, so a temporary directory a test module or fixture creates is known (#105).
+    install()
     root = spec["project_root"]
+    _PROJECT_TREE = os.path.realpath(root)
     os.chdir(root)
     if root not in sys.path:
         sys.path.insert(0, root)
@@ -293,7 +475,15 @@ def _serve() -> int:
             continue
         spec = json.loads(line)
         nodes = spec.get("node_ids") or session_nodes
-        payload = _evaluate_full(target, qualname, nodes, spec["mutant_source"])
+        payload = _evaluate_full(
+            target,
+            qualname,
+            nodes,
+            spec["mutant_source"],
+            step_caps=spec.get("step_caps"),
+            project_root=session["project_root"],
+            write_roots=tuple(session.get("write_roots") or ()),
+        )
         payload["enforced"] = enforced
         real_stdout.write(json.dumps(payload) + "\n")
         real_stdout.flush()
@@ -320,9 +510,22 @@ def main() -> int:
     target = _resolve_target(spec["project_root"], spec["target_file"])
     # One-shot's verdict IS its exit code (`run_mutant_isolated` reads `mutant_verdict` off it); the
     # richer killed_by/constructed payload travels only over the server protocol the engine uses.
-    return _evaluate_full(
-        target, spec["func_qualname"], spec["node_ids"], spec["mutant_source"]
-    )["rc"]
+    # Past `mutant_source` every argument is named: W#27's budget and #105's write roots arrived as
+    # separate optional groups, and a positional fifth argument bound write roots to `step_caps`.
+    payload = _evaluate_full(
+        target,
+        spec["func_qualname"],
+        spec["node_ids"],
+        spec["mutant_source"],
+        step_caps=spec.get("step_caps"),
+        project_root=spec["project_root"],
+        write_roots=tuple(spec.get("write_roots") or ()),
+    )
+    if payload["write_blocked"] and not payload["killed_by"]:
+        # A prevented write is never a kill (#105). The exit code has no refusal to carry, so the
+        # run reads as a harness outcome, outside the denominator, rather than the failure pytest saw.
+        return int(pytest.ExitCode.INTERNAL_ERROR)
+    return payload["rc"]
 
 
 if __name__ == "__main__":

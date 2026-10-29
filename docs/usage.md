@@ -17,16 +17,20 @@ wesker --mcdc src/scoring.py::compute_score   # MC/DC verification
 Full option reference:
 
 ```
-wesker [targets...] [options]
+wesker [targets...] [options]      # no targets: the current directory, recursively
 
+  --version                Print the installed version and exit
   --threshold N            Exit 1 if kill rate < N%
   --mcdc FILE::FUNC ...    MC/DC verification on specific functions
   --json                   JSON output (for CI parsing)
-  --budget MS              Per-file time budget (default: 10000ms)
-  --max-per-category N     Mutants per category per pass (default: 5, 0=exhaustive)
-  --passes N               Convergence passes (default: 3)
+  --budget MS              Time budget per function (default: 10000ms)
+  --max-per-category N     Mutants per category per pass (default: derived per function from its
+                           degrees of freedom; 0=exhaustive)
+  --passes N               Convergence passes (default: 1; extra passes deepen within covered
+                           dimensions)
   --exclude FILE ...       Files to skip
   --quiet                  Minimal output
+  --purge                  Delete regeneratable .wesker/ files from old runs and exit
 ```
 
 ## As a library
@@ -59,8 +63,9 @@ print(result["kill_pct"], result["per_category"])
 [tool.wesker]
 source_dir = "src/mypackage"
 exclude = ["src/mypackage/server.py"]
-max_per_category = 5          # mutants per category per pass (default: 5)
-convergence_passes = 3        # convergence passes (default: 3)
+max_per_category = 0          # mutants per category per pass; unset (the default) derives it
+                              # per function from its degrees of freedom, 0 = exhaustive
+convergence_passes = 1        # convergence passes (default: 1)
 mcdc_targets = [["src/mypackage/scoring.py", "compute_score"]]
 ```
 
@@ -87,7 +92,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0        # the diff scope needs the merge base
-      - uses: rohanvinaik/Wesker@v0.5.1
+      - uses: rohanvinaik/Wesker@v1.1.1
         with:
           base-ref: ${{ github.event.pull_request.base.sha }}
           sarif: .wesker/wesker.sarif
@@ -110,21 +115,21 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: rohanvinaik/Wesker@v0.5.1
+      - uses: rohanvinaik/Wesker@v1.1.1
         id: spec
         with:
           budget: "30000"
       - run: echo "${{ steps.spec.outputs.spec-pct }}% of ${{ steps.spec.outputs.dimensions-total }} dimensions"
 ```
 
-See [`.github/workflows/`](.github/workflows/) for the versions this repo runs on itself,
+See [`.github/workflows/`](../.github/workflows/) for the versions this repo runs on itself,
 including badge generation.
 
 | Input | Default | |
 |-------|---------|--|
 | `base-ref` | — | scope to files changed since this ref; omit for the whole codebase |
 | `targets` | auto | explicit files; otherwise discovered from `[tool.wesker]` or layout |
-| `budget` | `15000` | per-file budget, ms |
+| `budget` | `15000` | budget per function, ms |
 | `threshold` | — | fail if `spec-pct` is below this |
 | `sarif` | `.wesker/wesker.sarif` | where to write the SARIF report |
 | `allow-truncation` | `false` | report a budget-limited sample rather than failing |

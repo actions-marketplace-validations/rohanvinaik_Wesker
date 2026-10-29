@@ -34,6 +34,7 @@ import os
 import re
 import subprocess
 import sys
+import threading
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -70,6 +71,7 @@ def _git(args: list[str], cwd: str) -> str | None:
             capture_output=True,
             text=True,
             timeout=60,
+            check=False,
         )
     except (OSError, subprocess.SubprocessError):
         return None
@@ -161,19 +163,65 @@ def gate_suite_health(report: dict, max_inert_pct: int = 50) -> str | None:
 
 
 def gate_truncation(report: dict) -> str | None:
-    """Refuse to call a CUT measurement a completeness measurement — whether it was cut by the budget
-    or by a worker that could not be contained (Wesker #13/#14). ``total_truncated`` now counts both."""
+    """Refuse to call a CUT measurement a completeness measurement — cut by the budget, by a worker
+    that could not be stopped, or by the memory cap (Wesker #13/#14/W#21).
+
+    The refusal names each cut function under the remedy its cause needs. A count alone told the
+    maintainer that something was cut and not what: the remedies differ, and for a worker that
+    could not be stopped the budget the old message pointed at is the wrong fix. A report that
+    predates the per-function record falls back to naming both remedies.
+    """
     truncated = report.get("total_truncated", 0)
     if not truncated:
         return None
+    from Wesker.ci import describe_truncation
+
+    detail = describe_truncation(report.get("truncated_functions") or [])
     return (
-        f"{truncated} function(s) were only PARTIALLY evaluated — cut by the per-file budget, or by "
-        "a timed-out worker that could not be stopped (an uncontained, invalid measurement).\n"
+        f"{truncated} function(s) were only PARTIALLY evaluated.\n"
         "Their unevaluated mutants are missing from both sides of the ratio, so this is a sample, "
         "not a completeness measurement.\n"
-        "Raise `budget` (or set [tool.wesker] max_per_category); an uncontained worker needs the "
-        "target's blocking call bounded or run in a killable process."
+        + (
+            detail
+            or "Raise `budget` (or set [tool.wesker] max_per_category); an uncontained worker "
+            "needs the target's blocking call bounded or run in a killable process."
+        )
     )
+
+
+def gate_unresolved(report: dict) -> str | None:
+    """Refuse to call a run with no-verdict mutants a completeness measurement (#27).
+
+    The sibling of `gate_truncation` for a run that was NOT cut: every mutant was evaluated, but
+    some reached no verdict (a wall-clock bound fired, a deterministic step budget was exceeded, or
+    a test's write outside its write authority was prevented; `ci.UNSCORED_ROLLUP` holds the list).
+    Those questions are missing from both sides of the ratio, exactly as a truncated run's are, so
+    the badge refuses — under their own remedy, never the "PARTIALLY evaluated" one, which is false
+    of a run that measured everything. ``--allow-truncation`` covers it as it did when these mutants
+    were reported as cuts.
+    """
+    unresolved = report.get("total_unresolved", 0)
+    if not unresolved:
+        return None
+    from Wesker.ci import describe_unresolved
+
+    detail = describe_unresolved(report.get("unresolved_functions") or [])
+    return (
+        f"{unresolved} function(s) were evaluated in full, but some mutants reached no verdict.\n"
+        "Those mutants are missing from both sides of the ratio, so this is not a completeness "
+        "measurement.\n" + detail
+    )
+
+
+def _completeness_refusal(report: dict, allow_sample: bool) -> str | None:
+    """The refusal a cut or unresolved run earns, or None — under ``allow_sample``, warnings instead."""
+    for refusal in (gate_truncation(report), gate_unresolved(report)):
+        if not refusal:
+            continue
+        if not allow_sample:
+            return refusal
+        print(f"\nWARNING: {refusal}", file=sys.stderr)
+    return None
 
 
 # ── Reporting ────────────────────────────────────────────────────
@@ -210,20 +258,26 @@ def _summary_markdown(report: dict, scope_note: str) -> str:
         "",
         "<details><summary>Why this number is comparable and a kill rate is not</summary>",
         "",
-        "A mutation score's denominator is however many mutants a run happened to sample — "
-        "change the budget and the number changes, so it cannot be compared across repos, "
-        "configs, or tools.",
+        (
+            "A mutation score's denominator is however many mutants a run happened to sample — "
+            "change the budget and the number changes, so it cannot be compared across repos, "
+            "configs, or tools."
+        ),
         "",
-        f"This denominator ({dof}) is derived from the AST. It is a property of the code: the "
-        "same on any machine, at any budget, today and tomorrow. That is what makes "
-        f"{spec}% mean something to someone who has never seen this repo.",
+        (
+            f"This denominator ({dof}) is derived from the AST. It is a property of the code: the "
+            "same on any machine, at any budget, today and tomorrow. That is what makes "
+            f"{spec}% mean something to someone who has never seen this repo."
+        ),
         "",
-        f"Selection reached {report.get('dof_pct', 0)}% of those dimensions using "
-        f"{mutants} mutants — {per_dim} per dimension. Because every mutant's cover set is a "
-        "singleton, greedy selection here is not merely within the usual `1 - 1/e` bound for "
-        "submodular covers — it is *exactly* optimal at `min(m, D)`. That is machine-checked "
-        "in Lean (`coverage_submodular`, `marginal_antitone`, `greedy_coverage_bound`), so the "
-        "cost of this measurement is provably minimal, not just empirically low.",
+        (
+            f"Selection reached {report.get('dof_pct', 0)}% of those dimensions using "
+            f"{mutants} mutants — {per_dim} per dimension. Because every mutant's cover set is a "
+            "singleton, greedy selection here is not merely within the usual `1 - 1/e` bound for "
+            "submodular covers — it is *exactly* optimal at `min(m, D)`. That is machine-checked "
+            "in Lean (`coverage_submodular`, `marginal_antitone`, `greedy_coverage_bound`), so the "
+            "cost of this measurement is provably minimal, not just empirically low."
+        ),
         "</details>",
         "",
     ]
@@ -233,9 +287,11 @@ def _summary_markdown(report: dict, scope_note: str) -> str:
             f"### {len(survivors)} unspecified "
             + ("dimension" if len(survivors) == 1 else "dimensions"),
             "",
-            "Each line below is a *proof obligation*, not an opinion: Wesker changed the code "
-            "and every test still passed. Write a test that fails against the change and it is "
-            "discharged — verifiably, by re-running.",
+            (
+                "Each line below is a *proof obligation*, not an opinion: Wesker changed the code "
+                "and every test still passed. Write a test that fails against the change and it is "
+                "discharged — verifiably, by re-running."
+            ),
             "",
             "| Location | Dimension | No test distinguishes |",
             "|---|---|---|",
@@ -261,8 +317,10 @@ def _summary_markdown(report: dict, scope_note: str) -> str:
             f"pipx run {_DETECTIVE_PKG} converge <file>::<function>",
             "```",
             "",
-            "It synthesizes a complete, minimal suite for the function and Wesker re-runs to "
-            "confirm the mutants die. No inference in the finding, none in the check.",
+            (
+                "It synthesizes a complete, minimal suite for the function and Wesker re-runs to "
+                "confirm the mutants die. No inference in the finding, none in the check."
+            ),
             "",
         ]
     else:
@@ -320,7 +378,7 @@ def _annotate(report: dict) -> None:
 # ── Entry point ──────────────────────────────────────────────────
 
 
-def _stream_reentry() -> "Callable[[], None]":
+def _stream_reentry() -> Callable[[], None]:
     """Snapshot the REAL stdout/stderr fds; return the hand that re-enters them.
 
     Self-profiling runs mutants OF the fd-capture machinery in-process
@@ -355,10 +413,266 @@ def _stream_reentry() -> "Callable[[], None]":
     return reenter
 
 
+def _profile_live(
+    profile_codebase_live: Callable[..., dict | None],
+    targets: list[str],
+    budget: float,
+    config: dict,
+) -> tuple[dict | None, str]:
+    """Run the live profile between the stream re-entry and the stack dump; ``(report, refusal)``.
+
+    ``refusal`` is non-empty only for a lost worker (W#29), which ends the run with its own name. Every
+    other outcome is the report's, as before, including None for no live session.
+    """
+    lost_worker = worker_lost_types()
+    reenter_streams = _stream_reentry()
+    cancel_stack_dump = _stack_dump_from_env()
+    try:
+        return (
+            profile_codebase_live(
+                ".",
+                targets,
+                budget_ms_per_file=budget,
+                max_per_category=config.get("max_per_category"),
+                passes=config.get("convergence_passes", 1),
+                verbose=True,
+            ),
+            "",
+        )
+    except lost_worker as lost:
+        return None, worker_lost_reason(lost)
+    finally:
+        cancel_stack_dump()
+        # Everything from here down is the REPORT — gates, SARIF, annotations,
+        # outputs, summary, banner — and must not inherit a corpse fd from a
+        # hostile mutant of the capture machinery.
+        reenter_streams()
+
+
+def worker_lost_types() -> tuple[type[BaseException], ...]:
+    """`interrupt.WorkerLost` from every loaded copy of Wesker (W#29).
+
+    A self-profiling run measures through the private copy (`self_profile`), and that copy's exception
+    is not the public class, so a handler naming only one would let the other through as a traceback.
+    """
+    from Wesker.self_profile import PRIVATE_PREFIX
+
+    found: list[type[BaseException]] = []
+    for name in ("Wesker.interrupt", f"{PRIVATE_PREFIX}.interrupt"):
+        cls = getattr(sys.modules.get(name), "WorkerLost", None)
+        if isinstance(cls, type) and issubclass(cls, BaseException):
+            found.append(cls)
+    return tuple(found)
+
+
+def worker_lost_reason(lost: BaseException) -> str:
+    """The refusal a lost worker earns (W#29): named, never a traceback, and never a re-run in a loop."""
+    return (
+        f"{lost}.\nA measurement worker's thread ended before it signalled its start, so the test it was to "
+        "run never ran. Something raised into its bootstrap, or this process can no longer create a "
+        "thread (a resource limit the measured code lowered is one measured cause). Nothing measured "
+        "after it can be trusted. If it recurs, report it with this log."
+    )
+
+
 def _fail(reason: str) -> int:
     print("\n::error::Wesker could not produce a trustworthy number", file=sys.stderr)
     print(f"\nWESKER REFUSED TO REPORT: {reason}\n", file=sys.stderr)
     return 1
+
+
+def stack_dump_setting(raw: str) -> tuple[str, int]:
+    """Whether the run arms a periodic all-thread stack dump, and how often (pure — pinned).
+
+    A whole-codebase run that stalls prints nothing until the CI job's own limit kills it, and
+    that leaves no evidence of WHERE it stalled: every push of 2026-10-24 sat silent for six hours
+    after "Whole codebase — 22 file(s)." ``WESKER_STACK_DUMP_S`` asks for a dump of every thread's
+    stack at a fixed interval instead. Three codes, because absent and malformed are different
+    facts and a typo must not read as "off":
+
+    * ``off``     — unset or blank: nothing is armed, the default for every caller.
+    * ``armed``   — a positive whole number of seconds: dump every that many seconds.
+    * ``invalid`` — anything else (zero, a sign, a fraction, text): nothing is armed, and the run
+      says so.
+    """
+    text = raw.strip()
+    if not text:
+        return "off", 0
+    if not text.isdecimal():
+        return "invalid", 0
+    seconds = int(text)
+    if seconds <= 0:
+        return "invalid", 0
+    return "armed", seconds
+
+
+def stack_dump_owner(marker: str, pid: int) -> str:
+    """Whether THIS process already owns an armed stack dump (W#52, pure — pinned).
+
+    Under self-measurement, a test of the Action calls `main` inside the measuring process. Each such
+    call armed its own dump and, on the way out, unregistered faulthandler's SIGURG handler, which is
+    process-global. The run's own clock kept signalling a process with no handler, SIGURG is ignored
+    by default, and the dump went silent: spec-full 40237240506 dumped at 22:04 and never again, through
+    two and a half hours of silence. ``marker`` is ``WESKER_STACK_DUMP_OWNER``, which the arming process
+    sets to its own pid; every module copy in the process sees it, the measured one included.
+
+      "nested"  the marker names this process: an outer Action owns the dump, so arm nothing and cancel
+                nothing
+      "owner"   anything else (unset, or a marker inherited from another process): arm, and own it
+    """
+    return "nested" if marker == str(pid) else "owner"
+
+
+# The process-global marker an armed dump's owner sets (W#52): its pid.
+_DUMP_OWNER_ENV = "WESKER_STACK_DUMP_OWNER"
+# How often the owner re-asserts its SIGURG registration (W#52). A mutant of this very code, run by a test
+# in the measuring process, can unregister it; the owner restores it within this many seconds.
+_REASSERT_S = 30.0
+
+
+# The tick the dump clock sends. SIGURG is ignored by default, so if the code under measurement
+# ever replaces or removes the handler, a stray tick is dropped instead of ending the run.
+_DUMP_SIGNAL = "SIGURG"
+
+# The dump clock: a child that signals its parent every `every` seconds until it is terminated
+# or its parent is gone. Standard library only, and it holds none of the parent's pipes.
+_DUMP_CLOCK = (
+    "import os, sys, time\n"
+    "parent, every, signum = int(sys.argv[1]), float(sys.argv[2]), int(sys.argv[3])\n"
+    "while True:\n"
+    "    time.sleep(every)\n"
+    "    if os.getppid() != parent:\n"
+    "        break\n"
+    "    try:\n"
+    "        os.kill(parent, signum)\n"
+    "    except OSError:\n"
+    "        break\n"
+)
+
+
+def _arm_stack_dump(seconds: int) -> Callable[[], None]:
+    """Arm a periodic all-thread stack dump on a PRIVATE copy of stderr; return its cancel.
+
+    The copy is the point. The live pytest session captures at the descriptor level, and
+    self-profiling runs mutants of that capture machinery, so fd 2 can point at a capture file —
+    or be closed — for long stretches of the run (see ``_stream_reentry``). A dump written to fd 2
+    there vanishes with the capture. A descriptor duplicated before profiling starts still reaches
+    the CI log. No exit: the job's own time limit ends the run, and successive dumps show whether
+    a stall moves. A diagnostic must never break the run it observes, so a failure to arm
+    degrades to a cancel that does nothing.
+
+    THE CLOCK IS ITS OWN PROCESS (W#29). The first version armed
+    ``faulthandler.dump_traceback_later``, which is ONE process-wide timer. pytest's own
+    faulthandler plugin cancels that timer in ``pytest_exception_interact``, unconditionally, on
+    every failing test (and on entering pdb). A self-measurement fails tests within seconds, so
+    the dump armed before profiling was gone long before the stall. The 636 s local reproduction
+    printed nothing, and sampling it showed no watchdog thread at all. Measured directly: a 1 s
+    timer stops the moment pytest.main runs one failing test, and keeps going across a passing
+    one. Now faulthandler dumps from a SIGURG handler (``faulthandler.register``, C-level, so it
+    fires while every Python thread is deadlocked), and a separate child process sends the signal
+    every ``seconds``. Nothing pytest or the measured code does to faulthandler's timer reaches it.
+    """
+    import faulthandler
+    import signal
+
+    signum = getattr(signal, _DUMP_SIGNAL, None)
+    if signum is None or not hasattr(faulthandler, "register"):
+        print(
+            "WARNING: WESKER_STACK_DUMP_S needs POSIX signals; no stack dump is armed",
+            file=sys.stderr,
+        )
+        return lambda: None
+    try:
+        stream = os.fdopen(os.dup(sys.stderr.fileno()), "w")
+    # BLE001: a diagnostic degrades silently; it never fails the run it observes
+    except Exception:  # noqa: BLE001
+        return lambda: None
+    try:
+        faulthandler.register(signum, file=stream, all_threads=True, chain=False)
+    # BLE001: a diagnostic degrades silently; it never fails the run it observes
+    except Exception:  # noqa: BLE001
+        stream.close()
+        return lambda: None
+    try:
+        clock = subprocess.Popen(
+            [
+                sys.executable,
+                "-c",
+                _DUMP_CLOCK,
+                str(os.getpid()),
+                str(seconds),
+                str(signum),
+            ],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    # BLE001: a diagnostic degrades silently; it never fails the run it observes
+    except Exception:  # noqa: BLE001
+        faulthandler.unregister(signum)
+        stream.close()
+        return lambda: None
+
+    stopped = threading.Event()
+
+    def reassert() -> None:
+        # W#52: a mutant of this code, run by a test in this process, can unregister the handler.
+        while not stopped.wait(_REASSERT_S):
+            try:
+                faulthandler.register(
+                    signum, file=stream, all_threads=True, chain=False
+                )
+            except (
+                OSError,
+                RuntimeError,
+                ValueError,
+            ):  # what register raises: the diagnostic stops
+                return
+
+    threading.Thread(
+        target=reassert, name="wesker-stack-dump-reassert", daemon=True
+    ).start()
+
+    def cancel() -> None:
+        stopped.set()
+        clock.terminate()
+        try:
+            clock.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            clock.kill()
+            clock.wait()
+        faulthandler.unregister(signum)
+        stream.close()
+
+    return cancel
+
+
+def _stack_dump_from_env() -> Callable[[], None]:
+    """Arm the dump ``WESKER_STACK_DUMP_S`` asks for and return its cancel (a no-op when off).
+
+    Once per process (W#52): a nested Action, a test calling `main` in the measuring process, finds the
+    owner's marker (`stack_dump_owner`) and neither arms nor cancels the process's dump."""
+    code, seconds = stack_dump_setting(os.environ.get("WESKER_STACK_DUMP_S", ""))
+    if code == "invalid":
+        print(
+            "WARNING: WESKER_STACK_DUMP_S must be a positive whole number of seconds; "
+            "no stack dump is armed",
+            file=sys.stderr,
+        )
+    if (
+        code != "armed"
+        or stack_dump_owner(os.environ.get(_DUMP_OWNER_ENV, ""), os.getpid())
+        == "nested"
+    ):
+        return lambda: None
+    cancel = _arm_stack_dump(seconds)
+    os.environ[_DUMP_OWNER_ENV] = str(os.getpid())
+
+    def release() -> None:
+        cancel()
+        os.environ.pop(_DUMP_OWNER_ENV, None)
+
+    return release
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -379,7 +693,7 @@ def main(argv: list[str] | None = None) -> int:
         "--threshold", type=int, default=0, help="Fail if spec %% is below this"
     )
     parser.add_argument(
-        "--budget", type=float, default=15000, help="Per-file budget in ms"
+        "--budget", type=float, default=15000, help="Budget per function, in ms"
     )
     parser.add_argument(
         "--allow-truncation",
@@ -424,22 +738,11 @@ def main(argv: list[str] | None = None) -> int:
     # Wesker profiling Wesker runs from a private copy of the package, so the modules being
     # mutated are not the ones executing the run. Any other project resolves to the public
     # engine here, exactly as before.
-    profile_codebase_live = profiler_for_targets(targets)
-    reenter_streams = _stream_reentry()
-    try:
-        report = profile_codebase_live(
-            ".",
-            targets,
-            budget_ms_per_file=args.budget,
-            max_per_category=config.get("max_per_category"),
-            passes=config.get("convergence_passes", 1),
-            verbose=True,
-        )
-    finally:
-        # Everything from here down is the REPORT — gates, SARIF, annotations,
-        # outputs, summary, banner — and must not inherit a corpse fd from a
-        # hostile mutant of the capture machinery.
-        reenter_streams()
+    report, lost = _profile_live(
+        profiler_for_targets(targets), targets, args.budget, config
+    )
+    if lost:
+        return _fail(lost)
     if report is None:
         return _fail(
             gate_execution_mode({"execution_mode": "legacy-direct-call"}) or ""
@@ -449,19 +752,13 @@ def main(argv: list[str] | None = None) -> int:
     for gate in (gate_execution_mode(report), gate_suite_health(report)):
         if gate:
             return _fail(gate)
-    truncation = gate_truncation(report)
-    if truncation and not args.allow_truncation:
-        return _fail(truncation)
-    if truncation:
-        print(f"\nWARNING: {truncation}", file=sys.stderr)
+    refusal = _completeness_refusal(report, args.allow_truncation)
+    if refusal:
+        return _fail(refusal)
 
     Path(".wesker").mkdir(exist_ok=True)
     Path(".wesker/mutation_report.json").write_text(json.dumps(report, indent=2))
     if args.sarif:
-        # Kept inside the workspace. `--sarif` names an output file, and an output file that
-        # can be `../../../anywhere` is a path-traversal write with `parents=True` behind it —
-        # this runs on a CI runner with a checkout and a token, so "the caller chose the path"
-        # is not a reason to skip the check.
         # ALLOWLIST. `--sarif` names an output file, and an output file that can be
         # `../../../anywhere` is a path-traversal write with `parents=True` behind it. This
         # runs on a CI runner with a checkout and a token, so "the caller chose the path" is
@@ -505,7 +802,9 @@ def _version() -> str:
         from importlib.metadata import version
 
         return version("Wesker")
-    except Exception:
+    # BLE001: the version is a label on the report, and describing the run must not
+    # fail the run
+    except Exception:  # noqa: BLE001
         return ""
 
 

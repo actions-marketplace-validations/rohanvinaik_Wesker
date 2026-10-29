@@ -3,10 +3,14 @@
 In-process AST mutation engine with:
 - 3-layer test discovery (convention → static impact → full fallback)
 - Real equivalent mutant detection via boundary input evaluation
-- Categorical profiling (VALUE, BOUNDARY, SWAP, STATE, TYPE, ARITHMETIC, LOGICAL)
+- Categorical profiling (VALUE, BOUNDARY, ARITHMETIC, LOGICAL, SWAP, STATE, TYPE, STMT, EXCEPTION,
+  DATAFLOW; OUTPUT only under the two-sign policy)
 - Clean, progressive terminal output
 
 Zero external dependencies beyond the test framework.
+
+References (in the Detective repository, github.com/rohanvinaik/Detective):
+    §4.5, D3  docs/TEST_BASIS.md
 """
 
 from __future__ import annotations
@@ -22,17 +26,17 @@ import os
 import sys
 import textwrap
 import time
-from contextvars import ContextVar
 import unittest
-from pathlib import Path
 from collections.abc import Callable, Iterable
+from contextvars import ContextVar
+from pathlib import Path
 from typing import Any
 
 from Wesker.engine import (
     run_function_converged,
 )
 from Wesker.filter import filter_categories, prioritize_categories
-
+from Wesker.write_authority import WRITE_OUTSIDE_AUTHORITY
 
 # ── ANSI colors for terminal output ──────────────────────────────
 
@@ -82,8 +86,7 @@ def _name_matches_convention(
         or name == f"test_{base}.py"
         or name == f"test_{base_stripped}.py"
         # Prefix match
-        or name.startswith(f"test_{base}_")
-        or name.startswith(f"test_{base_stripped}_")
+        or name.startswith((f"test_{base}_", f"test_{base_stripped}_"))
         # Parent dir (extraction/det.py -> test_extraction.py)
         or (parent_qualified and name == f"test_{parent_dir}.py")
         # Contains-stem (test_prescriptive_deterministic.py)
@@ -109,8 +112,7 @@ def _discover_by_convention(project_root: str, source_file: str) -> list[str]:
     except ValueError:
         rel = base
     safe = rel.replace(os.sep, "_").replace("/", "_").replace(".", "_")
-    if safe.endswith("_py"):
-        safe = safe[:-3]
+    safe = safe.removesuffix("_py")
     generated_name = f"test_{safe}.py"
 
     # Parent-aware matching
@@ -149,11 +151,15 @@ def _discover_by_convention(project_root: str, source_file: str) -> list[str]:
                 partial_stems,
             )
 
-            # Suppress ambiguous bare-stem matches for common names in subdirs
-            if match and parent_qualified and base_stripped in ambiguous_stems:
-                # Only keep if it also matches parent dir or generated name
-                if not (parent_dir in name or name == generated_name):
-                    continue
+            # Suppress ambiguous bare-stem matches for common names in subdirs: keep one
+            # only if it also matches the parent dir or the generated name
+            if (
+                match
+                and parent_qualified
+                and base_stripped in ambiguous_stems
+                and not (parent_dir in name or name == generated_name)
+            ):
+                continue
 
             if match and path_str not in found:
                 found.append(path_str)
@@ -657,7 +663,7 @@ def partition_live_callables(
 # ── Test callable loading ────────────────────────────────────────
 
 
-def _parametrize_cases(func: Any) -> "list[Any] | None":
+def _parametrize_cases(func: Any) -> list[Any] | None:
     """Expand a ``@pytest.mark.parametrize``-decorated test into one bound, runnable callable per
     case — the legacy loader's parity with pytest for the parametrize forms it can resolve without a
     live session.
@@ -703,9 +709,11 @@ def _parametrize_cases(func: Any) -> "list[Any] | None":
                     )  # a single argname takes each value whole (even a tuple is ONE value)
                 else:
                     vals = tuple(v)
-                frags.append(dict(zip(names, vals)))
+                frags.append(dict(zip(names, vals, strict=False)))
             combined = [{**c, **f} for c in combined for f in frags]
-    except Exception:
+    # BLE001: parametrize marks carry arbitrary user objects; one that cannot be
+    # expanded falls back to the bare callable (the caller's `None` branch)
+    except Exception:  # noqa: BLE001
         return None
 
     cases: list[Any] = []
@@ -768,7 +776,9 @@ def load_test_callables(
                 mod = importlib.util.module_from_spec(spec)
                 sys.modules[mod_name] = mod
                 spec.loader.exec_module(mod)
-            except Exception:
+            # BLE001/S112: importing a test module runs arbitrary user code; a module
+            # that cannot be imported contributes no callables to this fallback loader
+            except Exception:  # noqa: BLE001, S112
                 continue
 
         for name in dir(mod):
@@ -789,10 +799,13 @@ def load_test_callables(
                     if mname.startswith("test_"):
                         try:
                             callables.append(getattr(obj(mname), mname))
-                        except Exception:
+                        # BLE001: instantiating a user TestCase runs its __init__; try
+                        # the no-argument form before giving up on the method
+                        except Exception:  # noqa: BLE001
                             try:
                                 callables.append(getattr(obj(), mname))
-                            except Exception:
+                            # BLE001/S110: neither form constructs; the method is skipped
+                            except Exception:  # noqa: BLE001, S110
                                 pass
     return callables
 
@@ -855,6 +868,10 @@ branch on the shape. The contract every shape satisfies:
     The USER's underlying test function. ``inspect.getsource``/``unwrap`` follow it, and
     content-hashing consumers (trace cache, Detective's verdict cache) depend on it. Read
     it through :func:`callable_source`, never directly.
+``__wesker_item_status__`` (optional, live pytest items only)
+    pytest's terminal category for the callable's LAST run (#17): a skip and an expected
+    failure return normally, so this is the only place they differ from a pass. Read it
+    through :func:`callable_item_status`, never directly.
 Invocation
     Zero-argument call, raising on test failure. Parametrized bindings are already bound.
 
@@ -899,6 +916,20 @@ def callable_source(call: Any) -> Any:
     ``__wrapped__`` read.
     """
     return getattr(call, "__wrapped__", call)
+
+
+def callable_item_status(call: Any) -> str:
+    """pytest's terminal category for the LAST run of a live-item callable, or ``unobserved``.
+
+    Accessor of :data:`DISCOVERED_CALLABLE_CONTRACT` — the STATUS axis (#17). The live-session
+    wrapper returns normally for a pass, a skip and an expected failure alike, so the category rides
+    beside the return on ``__wesker_item_status__`` (``pytest_runner._make_item_callable``). Read it
+    right after the run it describes: the next run overwrites it. Any other callable shape — a plain
+    function, a legacy closure — carries none and reads ``unobserved``, which leaves the engine's own
+    run code to decide (``trace_evidence.baseline_outcome``).
+    """
+    value = getattr(getattr(call, "__wesker_item_status__", None), "value", None)
+    return value if isinstance(value, str) else "unobserved"
 
 
 def callable_base_name(call: Any) -> str:
@@ -1137,7 +1168,9 @@ def discover_test_callables(
             collected = collect_pytest_callables(
                 project_root, paths=list(scoped) + extra
             )
-        except Exception:
+        # BLE001: collection runs the target's conftests and plugins; any failure
+        # falls through to the legacy loader below (unless the backend is pytest)
+        except Exception:  # noqa: BLE001
             collected = None
         if collected:
             return collected
@@ -1229,7 +1262,9 @@ def _load_cached_state(project_root: str) -> dict | None:
         return None
     try:
         return json.loads(report_path.read_text())
-    except Exception:
+    except (OSError, ValueError):
+        # An unreadable or corrupt cache is the same as no cache. ValueError covers both
+        # json.JSONDecodeError and UnicodeDecodeError.
         return None
 
 
@@ -1245,6 +1280,8 @@ def profile_file(
     cached_state: dict | None = None,
     full_matrix: bool = False,
     test_discovery: str = "auto",
+    isolated: bool = False,
+    worker_mem_limit_mb: int | None = None,
 ) -> list[dict]:
     """Profile all functions in a file with multi-pass convergence.
 
@@ -1311,6 +1348,8 @@ def profile_file(
             category_order=cat_order,
             full_matrix=full_matrix,
             source_path=full_path,
+            isolated=isolated,
+            worker_mem_limit_mb=worker_mem_limit_mb,
         )
         results.append(sr.to_dict())
 
@@ -1330,6 +1369,8 @@ def profile_function(
     cached_state: dict | None = None,
     full_matrix: bool = False,
     test_discovery: str = "auto",
+    isolated: bool = False,
+    worker_mem_limit_mb: int | None = None,
 ) -> dict | None:
     """Profile a single function by name — the interactive/library entry point.
 
@@ -1402,6 +1443,8 @@ def profile_function(
         category_order=cat_order,
         full_matrix=full_matrix,
         source_path=full_path,
+        isolated=isolated,
+        worker_mem_limit_mb=worker_mem_limit_mb,
     )
     return result.to_dict()
 
@@ -1492,7 +1535,8 @@ def refresh_live_suite(project_root: str, path: str) -> int:
         from Wesker.pytest_discovery import collect_pytest_callables
 
         fresh = list(collect_pytest_callables(project_root, paths=[target]) or [])
-    except Exception:  # noqa: BLE001 — a failed refresh must not fail the caller's run
+    # BLE001: a failed refresh must not fail the caller's run
+    except Exception:  # noqa: BLE001
         fresh = []
     for c in fresh:
         with contextlib.suppress(Exception):  # builtins/C callables reject attributes
@@ -1660,7 +1704,7 @@ def run_with_live_suite(
                     resolved,
                     # Every routed phase reports itself. The callback resets after each completed
                     # batch, so a seed and a later widen are two honest progress phases rather than
-                    # a fast mutant "done" line followed by minutes of silence (#15/Fix B).
+                    # a fast mutant "done" line followed by minutes of silence (#15, target-first).
                     trace_progress=trace_progress,
                     # The persistent cache lives under the CONSUMER's `.wesker/`, so the root has
                     # to reach it — this closure is the only place that has both. `fresh` bypasses
@@ -1698,7 +1742,14 @@ def run_with_live_suite(
         ident_token = _SESSION_IDENTITY.set(_live_collection_identity())
         base_token = (
             _SESSION_BASELINE.set(
-                LazySessionBaseline(_build, budgets=effective, regime_digest=_regime)
+                LazySessionBaseline(
+                    _build,
+                    budgets=effective,
+                    regime_digest=_regime,
+                    # The files `_build` traces, so a consumer can tell when this baseline cannot
+                    # answer for a function (Detective #103): real paths, the form a frame reports.
+                    target_files=frozenset(os.path.realpath(p) for p in resolved),
+                )
             )
             if resolved
             else None
@@ -1837,6 +1888,287 @@ def is_truncated_measurement(coverage_depth: str, budget_exhausted: bool) -> boo
     return coverage_depth == "cut" or budget_exhausted
 
 
+def truncation_cause(
+    coverage_depth: str, budget_exhausted: bool, memory_standing: str
+) -> str:
+    """WHY one function's profile was cut, named for the remedy it needs (pure).
+
+    `is_truncated_measurement` answers whether a profile may be counted. A refusal built on that
+    alone can say how many functions were cut but not what to do about them, and the remedies
+    differ — one of them is not a budget at all:
+
+      "budget"         the function ran past its budget before its selected mutants were all
+                       evaluated. When the budget ran out, containment is not recorded separately,
+                       so this code makes no claim that the worker was contained.
+      "memory"         a mutant hit the isolated worker's address-space cap (W#21).
+      "uncontained"    a timed-out test could not be stopped — blocked outside the interpreter — and
+                       the profile stopped there (#14). More budget cannot fix it.
+      "not_truncated"  a measurement the rollup counts.
+
+    Decided from the fields `ProfilingResult.to_dict` emits, so the rollup reads the engine's own
+    record rather than re-deriving a narrower one.
+    """
+    if not is_truncated_measurement(coverage_depth, budget_exhausted):
+        return "not_truncated"
+    if budget_exhausted:
+        return "budget"
+    if memory_standing == "cut":
+        return "memory"
+    return "uncontained"
+
+
+# Every disposition `engine.mutant_disposition` can return outside `SCORED_DISPOSITIONS`, with the part
+# of the rollup that owns it (W#51). The rollup used to read two dispositions by name. So a third,
+# Detective #105's `write_outside_authority`, left the denominator and was named nowhere: a function
+# whose test's write was prevented reported `total_unresolved: 0`. Totality is tested against
+# `mutant_disposition` itself, and `unresolved_causes` reads a disposition this table does not know as
+# unresolved under its own name: a new one can refuse the badge, but it can no longer vanish.
+#
+#   "unresolved"  evaluated in full, but no verdict, so it is missing from both sides of the ratio.
+#                 Counted in `total_unresolved`, named per function in `unresolved_functions`, and
+#                 refused by the badge under its own remedy (`_UNRESOLVED_REMEDIES`).
+#   "truncated"   the run itself stopped short; `truncation_cause` owns it at the function level.
+#   "harness"     the outcome measures the harness, not the suite: the mutant was never built, never
+#                 installed, never entered, or the test it needed runs the engine and was refused
+#                 before it could wait for itself. It leaves the ratio, as it always has.
+UNSCORED_ROLLUP: tuple[tuple[str, str], ...] = (
+    ("undetermined", "unresolved"),
+    ("diverged", "unresolved"),
+    (WRITE_OUTSIDE_AUTHORITY, "unresolved"),
+    ("cut", "truncated"),
+    ("harness_error", "harness"),
+    ("not_installed", "harness"),
+    ("not_entered", "harness"),
+    ("nested_measurement", "harness"),
+)
+
+
+def unresolved_causes(unscored_by: dict) -> tuple[str, ...]:
+    """Every no-verdict cause a function evaluated in FULL still holds, in table order (#27, W#51; pure
+    — pinned).
+
+    Truncation answers whether the RUN stopped short. This answers the other question a completeness
+    number depends on: whether every evaluated mutant reached a verdict. The two used to share one
+    signal — a per-mutant outcome set ``coverage_depth="cut"`` — so a function whose every mutant
+    was evaluated was refused as "only PARTIALLY evaluated" under the remedy for a test that could
+    not be stopped, which is false of both. They are separate facts with separate remedies:
+
+      "undetermined"             a mutant reached the wall-clock bound without a verdict: no kill, no
+                                 survival, nothing established. First, because it has no evidence at all.
+      "diverged"                 a mutant exceeded a deterministic step budget relative to the
+                                 original's iterations: budget-relative evidence, never a kill and
+                                 never proof of nontermination.
+      "write_outside_authority"  a test run against the mutant tried to write outside its write
+                                 authority and the write was prevented before it landed, so the test
+                                 was never observed to pass or fail (W#51).
+      a disposition `UNSCORED_ROLLUP` does not know, under its own name, after the known ones: an
+                                 unmapped outcome is never read as a verdict.
+      ()                         every evaluated mutant reached a verdict (the "truncated" and
+                                 "harness" dispositions are owned elsewhere in the table).
+
+    ALL present causes, not the first. A function holding both undetermined and write-refused mutants
+    used to be listed under one cause with that cause's mutants only, so the others were named nowhere.
+
+    Read off ``unscored_by``, the per-disposition counts `ProfilingResult.to_dict` emits, so the
+    rollup consumes the engine's record instead of re-deriving it.
+    """
+    owners = dict(UNSCORED_ROLLUP)
+    present = {disposition for disposition, count in unscored_by.items() if count}
+    known = [
+        d for d, owner in UNSCORED_ROLLUP if owner == "unresolved" and d in present
+    ]
+    return (*known, *sorted(present - owners.keys()))
+
+
+# The remedy each cause needs, in the order a reader should act on them: a worker that could not be
+# stopped is the one no budget fixes, so it comes first.
+_TRUNCATION_REMEDIES = (
+    (
+        "uncontained",
+        (
+            "A timed-out test could not be stopped (it was blocked outside the interpreter), so "
+            "the profile stopped there. A larger budget will not help: bound the blocking call, "
+            "or run that test in a killable process."
+        ),
+    ),
+    (
+        "memory",
+        "A mutant hit the isolated worker's memory cap. Raise the worker's memory limit.",
+    ),
+    (
+        "budget",
+        (
+            "The function ran past its budget, which applies to each function separately. Raise "
+            "`budget`; a truncated run is a sample, never a completeness measurement."
+        ),
+    ),
+)
+
+
+# What a baseline marker stands for when no single test could be named (see engine._containment_lost).
+_BASELINE_MARKERS = {
+    "session_baseline": "the session's baseline trace",
+    "baseline_sizing": "the baseline timing run",
+}
+
+
+def _describe_containment_lost(lost: list[dict], limit: int = 3) -> list[str]:
+    """The lines naming what could not be stopped for one cut function (pure).
+
+    A baseline entry names the test whose traced run outlived the stop; a mutation entry names the
+    test and the mutant it was running. At most ``limit`` entries, then a count of the rest.
+    """
+    lines: list[str] = []
+    for entry in lost[:limit]:
+        test = str(entry.get("test") or "")
+        if entry.get("phase") == "baseline":
+            where = _BASELINE_MARKERS.get(test) or (
+                (test or "an unnamed test") + ", in the baseline trace"
+            )
+            lines.append(f"    could not stop: {where}")
+        else:
+            lines.append(
+                f"    could not stop: {test or 'an unnamed test'}, running mutant "
+                f"{entry.get('mutant') or entry.get('mutant_id') or '?'} "
+                f"(line {entry.get('mutated_line', '?')})"
+            )
+    if len(lost) > limit:
+        lines.append(f"    … and {len(lost) - limit} more")
+    return lines
+
+
+def describe_truncation(truncated: list[dict], limit: int = 20) -> str:
+    """The cut functions, grouped by cause, each group under the remedy it needs (pure).
+
+    One renderer for both places a truncated run is reported, the Action's refusal and the CLI's
+    warning, so the two cannot describe the same cut differently. An empty list renders as "": a
+    report written before the functions were recorded carries only a count. Under each function,
+    `containment_lost` names what could not be stopped: the test, and the mutant it was running.
+    """
+    remedies = dict(_TRUNCATION_REMEDIES)
+    known = [cause for cause, _ in _TRUNCATION_REMEDIES]
+    recorded = {str(t.get("cause", "")) for t in truncated}
+    blocks: list[str] = []
+    for cause in known + sorted(recorded - set(known)):
+        group = [t for t in truncated if str(t.get("cause", "")) == cause]
+        if not group:
+            continue
+        header = (
+            remedies.get(cause) or "Cut, cause not recorded: " + (cause or "none") + "."
+        )
+        lines = [f"{header} [{len(group)}]"]
+        for t in group[:limit]:
+            seconds = float(t.get("elapsed_ms") or 0.0) / 1000
+            lines.append(
+                f"  {t.get('function_key') or '?'} — {seconds:.1f} s, "
+                f"{t.get('tested', 0)}/{t.get('universe', 0)} mutants evaluated"
+            )
+            lines.extend(_describe_containment_lost(t.get("containment_lost") or []))
+        if len(group) > limit:
+            lines.append(f"  … and {len(group) - limit} more")
+        blocks.append("\n".join(lines))
+    return "\n".join(blocks)
+
+
+def completeness_warnings(mutation: dict) -> str:
+    """The warnings a codebase rollup's ratio must carry beside it, or "" when it needs none (W#51, pure).
+
+    One renderer for every text surface that prints the rollup: `python -m Wesker` and
+    `Wesker.metrics`. A cut function's unevaluated mutants and an unresolved function's no-verdict
+    mutants are missing from BOTH sides of the ratio. Before W#51 only `Wesker.metrics` said so, and
+    `python -m Wesker` printed the bare kill rate and exited 0 with the cause named nowhere.
+    """
+    lines: list[str] = []
+    truncated = mutation.get("total_truncated", 0)
+    if truncated:
+        # The percentage is a sample of whatever was cheap to reach, not a mutation score. Each
+        # cut function is named under the remedy its cause needs, in the Action refusal's words.
+        lines += [
+            f"  !! WARNING: {truncated} function(s) were only PARTIALLY evaluated — the",
+            "     kill rate below is a partial result, not a mutation score.",
+        ]
+        detail = describe_truncation(mutation.get("truncated_functions") or [])
+        lines += ["     " + ln for ln in detail.splitlines()]
+    unresolved = mutation.get("total_unresolved", 0)
+    if unresolved:
+        # Evaluated in full, but with mutants that reached no verdict: missing from both sides of
+        # the ratio like a truncated run's, and named under their own remedy (#27).
+        lines += [
+            f"  !! WARNING: {unresolved} function(s) hold mutants with no verdict — the kill",
+            "     rate below leaves those questions out of both sides of the ratio.",
+        ]
+        detail = describe_unresolved(mutation.get("unresolved_functions") or [])
+        lines += ["     " + ln for ln in detail.splitlines()]
+    return "\n".join(lines)
+
+
+# The remedy each unresolved cause in `UNSCORED_ROLLUP` needs. None is a budget problem by default: a
+# larger budget helps an undetermined mutant only when it was merely slow, never a diverged one, and
+# never a prevented write, whose repair is in the test.
+_UNRESOLVED_REMEDIES = (
+    (
+        "undetermined",
+        (
+            "A mutant reached the wall-clock bound without a verdict — no kill and no survival, so "
+            "its question is missing from both sides of the ratio. Most often the mutant does not "
+            "terminate on a test's input: a deterministic step budget decides that, and more budget "
+            "helps only a mutant that was merely slow."
+        ),
+    ),
+    (
+        "diverged",
+        (
+            "A mutant exceeded the deterministic step budget relative to the original's iterations "
+            "— budget-relative evidence, never a kill and never proof of nontermination, so its "
+            "question is missing from both sides of the ratio."
+        ),
+    ),
+    (
+        WRITE_OUTSIDE_AUTHORITY,
+        (
+            "A test run against the mutant tried to write outside its write authority (the "
+            "session's pytest temporary directory, or a temporary entry the test created). The "
+            "write was prevented before it landed, so the test was never observed to pass or fail "
+            "and the mutant's question is missing from both sides of the ratio. Keep the test's "
+            "writes inside its temporary directory (resolve relative paths there, e.g. "
+            "monkeypatch.chdir(tmp_path)) to measure it."
+        ),
+    ),
+)
+
+
+def describe_unresolved(unresolved: list[dict], limit: int = 20) -> str:
+    """The functions holding mutants with no verdict, grouped by cause under its remedy (pure).
+
+    The sibling of `describe_truncation`, for a run that was NOT cut: one renderer for the Action's
+    refusal and the CLI's warning, naming each function and the mutants that reached no verdict.
+    """
+    remedies = dict(_UNRESOLVED_REMEDIES)
+    known = [cause for cause, _ in _UNRESOLVED_REMEDIES]
+    recorded = {str(u.get("cause", "")) for u in unresolved}
+    blocks: list[str] = []
+    for cause in known + sorted(recorded - set(known)):
+        group = [u for u in unresolved if str(u.get("cause", "")) == cause]
+        if not group:
+            continue
+        header = (
+            remedies.get(cause) or f"No verdict, cause not recorded: {cause or 'none'}."
+        )
+        lines = [f"{header} [{len(group)}]"]
+        for u in group[:limit]:
+            mutants = [str(m) for m in (u.get("mutants") or [])]
+            named = ", ".join(mutants[:5]) + (
+                f", … +{len(mutants) - 5}" if len(mutants) > 5 else ""
+            )
+            lines.append(
+                f"  {u.get('function_key') or '?'} — {named or 'mutants not recorded'}"
+            )
+        if len(group) > limit:
+            lines.append(f"  … and {len(group) - limit} more")
+        blocks.append("\n".join(lines))
+    return "\n".join(blocks)
+
+
 def profile_codebase(
     project_root: str,
     targets: list[str],
@@ -1845,6 +2177,8 @@ def profile_codebase(
     passes: int = 1,
     *,
     verbose: bool = True,
+    isolated: bool = False,
+    worker_mem_limit_mb: int | None = None,
 ) -> dict:
     """Profile all functions across multiple files with multi-pass convergence.
 
@@ -1875,6 +2209,8 @@ def profile_codebase(
     total_mutants = 0
     total_equivalent = 0
     total_truncated = 0
+    truncated_functions: list[dict] = []
+    unresolved_functions: list[dict] = []
     total_universe = 0
     total_dof = 0
     total_dof_covered = 0
@@ -1904,6 +2240,8 @@ def profile_codebase(
             max_per_category=max_per_category,
             passes=passes,
             cached_state=cached_state,
+            isolated=isolated,
+            worker_mem_limit_mb=worker_mem_limit_mb,
         )
         file_ms = (time.monotonic() - file_start) * 1000
 
@@ -1930,13 +2268,43 @@ def profile_codebase(
         # #14 (aggregation): consume the engine's COMPUTED signal, not a budget-only proxy. A run cut
         # for CONTAINMENT (an uncontained worker: coverage_depth="cut", budget_exhausted=False) is a
         # truncated measurement too — counting only budget_exhausted dropped it before the gate.
-        total_truncated += sum(
-            1
-            for r in results
-            if is_truncated_measurement(
-                r.get("coverage_depth", ""), bool(r.get("budget_exhausted"))
+        # Each cut is recorded with its cause, so a refusal can name the function and the remedy
+        # rather than only count them.
+        for r in results:
+            cause = truncation_cause(
+                r.get("coverage_depth", ""),
+                bool(r.get("budget_exhausted")),
+                str(r.get("memory_standing", "n/a")),
             )
-        )
+            if cause != "not_truncated":
+                truncated_functions.append(
+                    {
+                        "function_key": r.get("function_key", ""),
+                        "cause": cause,
+                        "elapsed_ms": r.get("elapsed_ms", 0.0),
+                        "tested": r.get("total_mutants", 0),
+                        "universe": r.get("universe_size", 0),
+                        "containment_lost": list(r.get("containment_lost") or []),
+                    }
+                )
+                continue
+            # A run that was NOT cut can still hold mutants with no verdict (#27). Before the depth
+            # stopped calling them a cut, they reached this gate as "truncated", named under the
+            # wrong remedy (a test that could not be stopped); now they reach it under their own.
+            # One entry per cause the function holds (W#51), each naming that cause's own mutants.
+            for unresolved in unresolved_causes(dict(r.get("unscored_by") or {})):
+                unresolved_functions.append(
+                    {
+                        "function_key": r.get("function_key", ""),
+                        "cause": unresolved,
+                        "mutants": [
+                            str(u.get("mutant_id", "?"))
+                            for u in (r.get("unscored_records") or [])
+                            if u.get("disposition") == unresolved
+                        ],
+                    }
+                )
+        total_truncated = len(truncated_functions)
 
         # Carry each survivor up with the function it came from. ``function_key`` is
         # "path::qualname", so the record is self-locating: file, line, and the dimension
@@ -2034,10 +2402,20 @@ def profile_codebase(
         "spec_pct": round(100 * total_dof_pinned / max(total_dof, 1)),
         "kill_pct": kill_pct,
         "total_functions": total_functions,
-        # Functions whose per-file budget ran out before every selected mutant was
-        # evaluated. Non-zero means ``kill_pct`` is a PARTIAL result: raise
-        # ``budget_ms_per_file`` before quoting it as a mutation score.
+        # Functions whose profile was cut: the budget ran out (it applies to each function,
+        # despite the parameter's name), a worker could not be stopped, or the memory cap was
+        # hit. Non-zero means ``kill_pct`` is a PARTIAL result.
         "total_truncated": total_truncated,
+        # Which functions, and why (`truncation_cause`), so a refusal names the function and the
+        # remedy instead of a count.
+        "truncated_functions": truncated_functions,
+        # Functions evaluated in full whose universe still holds a mutant with no verdict
+        # (`unresolved_causes`): those mutants are missing from both sides of the ratio, so a
+        # non-zero count means the number is not a completeness measurement either — but nothing
+        # was cut, so it is reported apart from truncation, with its own remedy. A FUNCTION count:
+        # a function holding two causes has an entry under each (W#51) and is counted once.
+        "total_unresolved": len({u["function_key"] for u in unresolved_functions}),
+        "unresolved_functions": unresolved_functions,
         "passes": passes,
         "elapsed_ms": round(elapsed),
         "per_file": per_file,

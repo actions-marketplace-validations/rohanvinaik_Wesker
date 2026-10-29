@@ -41,6 +41,9 @@ ON DISK under `.wesker/`, and `memory_guard.purge_caches` owns its lifecycle —
 `trace_cache.json` by name (it did NOT for this file's whole early life, so `purge` reported "clean"
 while a poisoned entry survived; that gap is closed). This is a regeneratable measurement, never a
 product, and a user who distrusts it deletes it.
+
+References (in the Detective repository, github.com/rohanvinaik/Detective):
+    §2.2, §4.6, §16, B3, D4, G1, X1  docs/TEST_BASIS.md
 """
 
 from __future__ import annotations
@@ -50,6 +53,7 @@ import inspect
 import json
 import os
 import tempfile
+import tokenize
 from collections.abc import Callable
 from typing import Any
 
@@ -116,10 +120,15 @@ def test_fingerprint(fn: Callable[..., Any]) -> str:
     disc = callable_node_id(fn)
     try:
         declared = inspect.getsource(real)
-    except (OSError, TypeError):
+    except (OSError, TypeError, SyntaxError, tokenize.TokenError):
         # No readable source (a C callable, a closure built at runtime). Its NAME is not content,
         # so this cannot detect an edit — but it is stable, and the alternative is refusing to
-        # cache the whole suite because one test is unreadable.
+        # cache the whole suite because one test is unreadable. A STALE code object lands here
+        # too: its file was edited after import, so `getsource` tokenizes from a line number that
+        # now falls inside another construct and raises SyntaxError or TokenError (measured:
+        # Detective's in-process re-audit after `audit --remove` deleted tests above it, Detective
+        # #104). The name is safe there as well, because the origin file's content digest below
+        # changes with the edit, so a stale entry is never warmed.
         declared = f"{getattr(real, '__module__', '?')}.{getattr(real, '__qualname__', repr(real))}"
 
     # The function body is not the whole call path. A module helper or autouse/conftest fixture can
@@ -255,8 +264,15 @@ def save(
     regime_digest: str = "",
     outcomes_observed: list[str] | None = None,
     outcome_fingerprints: dict[str, str] | None = None,
+    outcome_status: dict[str, str] | None = None,
 ) -> None:
-    """Write the baseline. Best-effort: a cache that fails a run is worse than no cache."""
+    """Write the baseline. Best-effort: a cache that fails a run is worse than no cache.
+
+    ``outcome_status`` is each observed TestId's TYPED baseline outcome (#17 —
+    ``trace_evidence.baseline_outcome``). ``failing``/``inert_names`` alone cannot tell a skipped
+    or expected-failure test from a passing one, so a warm build that reused them would re-admit
+    the very reach the typing exists to refuse; the reuse is gated on this map instead.
+    """
     temp_path = ""
     try:
         cache_dir = os.path.join(project_root, _CACHE_DIR)
@@ -277,6 +293,7 @@ def save(
                     "inert_names": sorted(set(inert_names)),
                     "outcomes_observed": sorted(set(outcomes_observed or ())),
                     "outcome_fingerprints": dict(outcome_fingerprints or {}),
+                    "outcome_status": dict(outcome_status or {}),
                 },
                 fh,
             )
@@ -380,6 +397,29 @@ def load_outcomes(
         list(blob.get("outcomes_observed") or []),
         dict(blob.get("outcome_fingerprints") or {}),
     )
+
+
+def load_outcome_status(
+    project_root: str,
+    targets: str,
+    budgets: tuple[float | None, float | None],
+    regime_digest: str = "",
+) -> dict[str, str]:
+    """Each observed TestId's TYPED baseline outcome (#17), from the same validated blob.
+
+    Shares :func:`_load_valid_blob` with :func:`load` and :func:`load_outcomes`, so the three views
+    of one file cannot disagree on whether it is fresh. A file written before outcomes were typed has
+    no map: every TestId is then absent, and the caller re-measures that test's outcome rather than
+    reading "not failing" as "passed" — the misread that would let a skipped test's reach back into
+    the proof view on a warm run.
+    """
+    blob = _load_valid_blob(project_root, targets, budgets, regime_digest)
+    if blob is None:
+        return {}
+    status = blob.get("outcome_status")
+    if not isinstance(status, dict):
+        return {}
+    return {str(k): str(v) for k, v in status.items()}
 
 
 def _engine_version() -> str:

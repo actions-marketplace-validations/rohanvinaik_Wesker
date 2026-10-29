@@ -33,11 +33,8 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 
-# Ensure scripts/ is on the path for wesker_engine/wesker_filter imports
-
-from Wesker.ci import profile_codebase  # noqa: E402
-from Wesker.self_profile import profiler_for_targets  # noqa: E402
-
+from Wesker.ci import completeness_warnings, profile_codebase
+from Wesker.self_profile import profiler_for_targets
 
 # ---------------------------------------------------------------------------
 # Project configuration — auto-discovered from pyproject.toml
@@ -74,17 +71,12 @@ def _load_config() -> dict:
     if not pyproject.exists():
         return config
 
-    try:
-        if sys.version_info >= (3, 11):
-            import tomllib
-        else:
-            try:
-                import tomllib  # ty: ignore[unresolved-import] — 3.11+, tomli fallback below
-            except ImportError:
-                import tomli as tomllib  # type: ignore[no-redef]  # ty: ignore[unresolved-import]
+    import tomllib
 
+    try:
         data = tomllib.loads(pyproject.read_text())
-    except Exception:
+    # an unreadable file, or invalid TOML: defaults
+    except (OSError, ValueError):
         return config
 
     # Project name
@@ -209,6 +201,7 @@ def _count_tests() -> int:
         capture_output=True,
         text=True,
         timeout=120,
+        check=False,
     )
     return sum(1 for line in result.stdout.splitlines() if "::" in line)
 
@@ -362,6 +355,7 @@ def _verify_mcdc_single(filepath: str, func_name: str) -> dict:
                 capture_output=True,
                 text=True,
                 timeout=60,
+                check=False,
             )
             killed = result.returncode != 0
             if killed:
@@ -417,7 +411,8 @@ def _discover_mcdc_targets(source_files: list[str]) -> list[tuple[str, str]]:
         try:
             source = Path(filepath).read_text()
             tree = ast.parse(source)
-        except Exception:
+        # unreadable, undecodable (a ValueError) or unparseable: not an MC/DC candidate
+        except (OSError, SyntaxError, ValueError):
             continue
         for node in ast.walk(tree):
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
@@ -465,8 +460,7 @@ def _write_metrics(metrics: dict) -> None:
     env_file = os.environ.get("GITHUB_ENV")
     if env_file:
         with open(env_file, "a") as f:
-            for k, v in metrics.items():
-                f.write(f"{k}={v}\n")
+            f.writelines(f"{k}={v}\n" for k, v in metrics.items())
     else:
         for k, v in metrics.items():
             print(f"  {k}={v}")
@@ -532,17 +526,11 @@ def main():
         )
     mutation["execution_mode"] = execution_mode
     print(f"  Execution: {execution_mode}")
-    truncated = mutation.get("total_truncated", 0)
-    if truncated:
-        # A truncated run's unevaluated mutants are missing from BOTH sides of the
-        # ratio, so the percentage below is a sample of whatever was cheap to reach —
-        # not a mutation score. Say so where the number is produced.
-        print(
-            f"  !! WARNING: {truncated} function(s) hit the per-file budget and were\n"
-            f"     only PARTIALLY evaluated — the kill rate below is a partial result.\n"
-            f"     Raise budget_ms_per_file before quoting it as a mutation score.",
-            file=sys.stderr,
-        )
+    # A cut or no-verdict function's mutants are missing from both sides of the ratio below; the
+    # one renderer every text surface shares names each under its remedy (W#51).
+    warnings = completeness_warnings(mutation)
+    if warnings:
+        print(warnings, file=sys.stderr)
     equiv = mutation.get("total_equivalent", 0)
     universe = mutation.get("total_universe", 0)
     equiv_note = f" ({equiv} equivalent)" if equiv else ""

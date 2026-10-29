@@ -41,9 +41,15 @@ import contextlib
 import io
 import os
 import sys
-from typing import Any, Callable
+from collections.abc import Callable
+from typing import Any
 
-__all__ = ["session_callables", "run_in_session"]
+from Wesker.interrupt import Abandoned
+from Wesker.trace_evidence import item_run_status
+from Wesker.write_authority import declared_roots, session_write_roots
+from Wesker.write_authority import install as install_write_authority
+
+__all__ = ["run_in_session", "session_callables"]
 
 try:  # pytest is an OPTIONAL dependency — this module degrades to a no-op without it.
     import pytest as _pytest
@@ -52,7 +58,9 @@ try:  # pytest is an OPTIONAL dependency — this module degrades to a no-op wit
     # and this real decorator as a conflicting reassignment. Both are "callable that returns
     # its argument"; only the fallback's shape is expressible here.
     _hookwrapper = _pytest.hookimpl(hookwrapper=True)  # type: ignore[assignment]
-except Exception:  # pragma: no cover — no pytest: run_in_session returns None anyway
+# BLE001: pytest is optional, and a broken install must degrade like an absent one
+# (no pytest: run_in_session returns None anyway)
+except Exception:  # pragma: no cover  # noqa: BLE001
 
     def _hookwrapper(fn):  # type: ignore[misc]
         return fn
@@ -75,6 +83,12 @@ class _ExcCapture:
     @_hookwrapper
     def pytest_runtest_makereport(self, item, call):  # type: ignore[no-untyped-def]
         outcome = yield
+        # The wrapped call RAISED (an abandoned test's `Abandoned` unwinding through makereport):
+        # there is no report to read, and `get_result()` would re-raise inside this old-style
+        # wrapper's teardown, which pluggy reports as PluggyTeardownRaisedWarning. Returning lets
+        # pluggy propagate the original exception unchanged.
+        if getattr(outcome, "excinfo", None) is not None:
+            return
         rep = outcome.get_result()
         if rep.when == "call" or (rep.failed and rep.when in ("setup", "teardown")):
             exc = getattr(call, "excinfo", None)
@@ -143,11 +157,97 @@ def _reset_item(item: Any) -> None:
                 continue
             try:
                 fixturedef.finish(request)
-            except BaseException:  # noqa: BLE001,S110 — stale teardown; see docstring
+            # BLE001,S110: stale teardown; see docstring. `Abandoned` is named because it derives
+            # from BaseException by design; narrowing to this pair keeps that case while letting a
+            # genuine KeyboardInterrupt/SystemExit end the run rather than be swallowed (S5754).
+            except (Exception, Abandoned):  # noqa: BLE001,S110
                 pass
     init = getattr(item, "_initrequest", None)
     if init is not None:
         init()
+
+
+def _cheap_failure_repr(excinfo: Any, *_args: Any, **_kwargs: Any) -> str:
+    """The failure text a MEASUREMENT session's reports carry: the exception's type and message, and
+    no traceback (EP-C1 — Detective docs/ENGINEERING_PASS_2026-09-26.md).
+
+    Every killed mutant is a failing test to pytest, and ``runtestprotocol`` builds a ``TestReport``
+    for each; pytest's own ``repr_failure`` formats a source-annotated traceback for it, re-parsing the
+    source of every traceback entry with ``ast``. Nothing in this session reads that text: the runner
+    :func:`_make_item_callable` builds consumes ``report.failed`` and :class:`_ExcCapture`'s raw
+    exception, and ``log=False`` means no reporter ever sees the report. Measured on a converge of an
+    18-line function: the formatting was ~45% of the run's CPU and 99% of its AST allocation (945 MB of
+    1.415 GB allocated). A value computed for no consumer.
+
+    Swapping it keeps pytest's report construction — outcome, captured sections, the xfail wrapper's
+    rewrites — exactly as it is; only the formatting nobody reads is skipped. Whatever formatting
+    options pytest passes (``_repr_failure_py``'s ``style=``) are accepted and ignored, so one function
+    serves both entry points. Never raises: an exception whose ``__str__`` fails still yields its type
+    name.
+    """
+    try:
+        return f"{excinfo.typename}: {excinfo.value}"
+    # BLE001: the text of a report nobody reads must never be what fails the run it describes
+    except Exception:  # noqa: BLE001
+        return str(getattr(excinfo, "typename", "failure"))
+
+
+class _ItemStatus:
+    """pytest's category for the LAST run of one live item (#17) — the wrapper's per-item state.
+
+    One holder per wrapper, bound as a keyword-only default exactly like ``_cap`` (the rebound
+    wrapper may close over nothing), and exposed on the callable as ``__wesker_item_status__`` for
+    ``ci.callable_item_status``. ``value`` is ``unobserved`` until a run has produced reports.
+    """
+
+    __slots__ = ("value",)
+
+    def __init__(self) -> None:
+        self.value = "unobserved"
+
+
+def _reports_status(reports: list[Any]) -> str:
+    """pytest's terminal category for one run of an item, from the reports it produced (#17).
+
+    The accessor half of :func:`Wesker.trace_evidence.item_run_status`, which holds the decision:
+    this only turns each phase's report into the token that decision reads — the report outcome,
+    rewritten to ``xfailed`` / ``xpassed`` when pytest's skipping plugin marked it ``wasxfail``.
+    Never raises: a report shape this does not recognise yields ``unobserved``, which leaves the
+    engine's own channel to decide, exactly as before this existed.
+    """
+    try:
+        phases = {"setup": "", "call": "", "teardown": ""}
+        for rep in reports:
+            when = getattr(rep, "when", "")
+            if when not in phases:
+                continue
+            outcome = str(getattr(rep, "outcome", ""))
+            if hasattr(rep, "wasxfail"):
+                outcome = {"skipped": "xfailed", "passed": "xpassed"}.get(
+                    outcome, outcome
+                )
+            phases[when] = outcome
+        return item_run_status(phases["setup"], phases["call"], phases["teardown"])
+    # BLE001: describing a run must never be what fails it
+    except Exception:  # noqa: BLE001
+        return "unobserved"
+
+
+def _install_cheap_failure_repr(item: Any) -> None:
+    """Point this item's two failure-formatting entry points at :func:`_cheap_failure_repr` (EP-C1).
+
+    pytest routes a call-phase failure through ``item.repr_failure(excinfo)`` and a setup/teardown
+    failure through ``item._repr_failure_py(excinfo, style=...)`` (``_pytest.reports.
+    _format_failed_longrepr``, pytest 9.1.1). Instance attributes shadow the methods for THIS item
+    only. Two measurement sessions install it, and neither reads a report's text: this module's own,
+    whose loop the driver replaces, so pytest never renders its reports; and the isolated worker's
+    (``_isolated_worker._CheapFailureRepr``, W#34), whose verdict is the exit code and whose terminal
+    output goes to a sink — a plain-string longrepr renders there as itself. Best-effort: an item
+    that refuses the assignment keeps pytest's formatting, which is slower and never wrong.
+    """
+    with contextlib.suppress(Exception):
+        item.repr_failure = _cheap_failure_repr
+        item._repr_failure_py = _cheap_failure_repr
 
 
 def _make_item_callable(item: Any, capture: _ExcCapture) -> Callable[[], None]:
@@ -186,12 +286,29 @@ def _make_item_callable(item: Any, capture: _ExcCapture) -> Callable[[], None]:
 
     from _pytest.runner import runtestprotocol
 
+    # EP-C1: failure reports in this session are read for `failed` and the raw exception only.
+    _install_cheap_failure_repr(item)
+    # pytest's category for the LAST run of this item (#17), exposed on the callable as
+    # `__wesker_item_status__` (read through `ci.callable_item_status`). The wrapper returns normally
+    # for a pass, a skip AND an expected failure alike — that is what keeps a skip from reading as a
+    # kill under a mutant — so the distinction the baseline needs travels beside the return, never in
+    # it. Reset at the start of every run, so a stopped run reads `unobserved`, not a stale verdict.
+    status = _ItemStatus()
+
     def run(  # type: ignore[no-untyped-def]
-        *, _item=item, _cap=capture, _rtp=runtestprotocol, _reset=_reset_item
+        *,
+        _item=item,
+        _cap=capture,
+        _rtp=runtestprotocol,
+        _reset=_reset_item,
+        _status=status,
+        _classify=_reports_status,
     ) -> None:
         _cap.last.pop(_item.nodeid, None)
+        _status.value = "unobserved"
         _reset(_item)
         reports = _rtp(_item, nextitem=None, log=False)
+        _status.value = _classify(reports)
         if not any(r.failed for r in reports):
             return
         exc = _cap.last.get(_item.nodeid)
@@ -216,6 +333,7 @@ def _make_item_callable(item: Any, capture: _ExcCapture) -> Callable[[], None]:
         run = rebound  # ty: ignore[invalid-assignment]
     run.__name__ = name
     run.__qualname__ = str(getattr(item, "nodeid", name))
+    run.__wesker_item_status__ = status  # type: ignore[attr-defined]  # ty: ignore[unresolved-attribute]
     if mod is not None:
         # inspect.getmodule() fallback in _patch_mutant_into_test keys off __module__.
         run.__module__ = getattr(mod, "__name__", run.__module__)
@@ -278,7 +396,7 @@ class _CollectionErrorCapture:
     def __init__(self) -> None:
         self.errors: list[tuple[str, str]] = []
 
-    def pytest_collectreport(self, report: Any) -> None:  # noqa: ANN401
+    def pytest_collectreport(self, report: Any) -> None:
         if report.failed:
             longrepr = str(report.longrepr) if report.longrepr else "(no detail)"
             self.errors.append((report.nodeid or "(root)", longrepr[:800]))
@@ -367,7 +485,8 @@ def run_in_session(
                 box["manifest_token"] = _LAST_MANIFEST.set(
                     capture_manifest(session, config, items)
                 )
-            except Exception:  # noqa: BLE001 — a manifest that raises breaks a working run
+            # BLE001/S110: a manifest that raises breaks a working run
+            except Exception:  # noqa: BLE001, S110
                 pass
             # Surface the collection errors this live session captured (a test that failed to COLLECT
             # is silently absent from the routed suite, so its target's COMPLETE claim is unsafe).
@@ -380,7 +499,8 @@ def run_in_session(
                 _LAST_COLLECTION_ERRORS.set(
                     tuple(nid for nid, _ in collect_errors.errors)
                 )
-            except Exception:  # noqa: BLE001 — describing the run must not fail the run
+            # BLE001/S110: describing the run must not fail the run
+            except Exception:  # noqa: BLE001, S110
                 pass
 
         def pytest_runtestloop(self, session):  # type: ignore[no-untyped-def]
@@ -403,15 +523,20 @@ def run_in_session(
                 return None
             box["ran"] = True
             try:
-                if quiet:
-                    with (
-                        contextlib.redirect_stdout(real_stdout),
-                        contextlib.redirect_stderr(real_stderr),
-                    ):
+                # The session's pytest temporary directory is its tests' write authority under a
+                # mutant (Detective #105). Read here, before any test runs against one: the first
+                # read creates it, and creating it rotates pytest's numbered directories.
+                with declared_roots(session_write_roots(session.config)):
+                    if quiet:
+                        with (
+                            contextlib.redirect_stdout(real_stdout),
+                            contextlib.redirect_stderr(real_stderr),
+                        ):
+                            box["result"] = body(calls, session)
+                    else:
                         box["result"] = body(calls, session)
-                else:
-                    box["result"] = body(calls, session)
-            except BaseException as exc:  # noqa: BLE001 — captured to re-raise below
+            # BLE001: captured to re-raise below
+            except BaseException as exc:  # noqa: BLE001
                 # pytest.main would otherwise absorb this (SystemExit especially) and the
                 # caller would see an indistinguishable None. Stash and re-raise outside.
                 box["exc"] = exc
@@ -472,6 +597,8 @@ def run_in_session(
     # consumer inside `body` admits only this session's manifest (#26). Reset in `finally` — with
     # the manifest token — restores the enclosing scope even if collection or the body raises.
     scope_token = _MEASUREMENT_SCOPE.set(next(_SCOPE_COUNTER))
+    # Before collection, so a temporary directory a test module or fixture creates is known (#105).
+    install_write_authority()
     try:
         os.chdir(project_root)
         if project_root not in sys.path:
@@ -486,7 +613,9 @@ def run_in_session(
                 )
         else:
             rc = int(pytest.main(args, plugins=[_Driver(), capture, collect_errors]))
-    except Exception:
+    # BLE001: pytest.main runs the target's suite and plugins; a crash is recorded in
+    # `diagnostic` and returned as no result
+    except Exception:  # noqa: BLE001
         if diagnostic is not None:
             diagnostic["reason"] = "pytest_crashed"
         return None

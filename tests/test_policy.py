@@ -1,7 +1,7 @@
 """The versioned mutation policy (issue #8): identity, derivation, enforcement.
 
-Two goldens carry the enforcement story. The policy-id golden makes "a policy
-change without a version bump" a test failure instead of a silent drift; the
+Two goldens carry the enforcement story. The policy-id golden makes an unreviewed
+policy change a test failure instead of a silent drift; the
 fingerprint-counts golden is the same fact in a readable shape, so the failure
 names the category that moved instead of handing you a hash. Everything else
 pins that the manifest is DERIVED from the engine's own tables — the manifest
@@ -17,13 +17,17 @@ from dataclasses import asdict
 
 from Wesker.engine import (
     _EXCEPTION_SUB_MODES,
+    _OUTPUT_CALL_SUB_MODES,
     _OUTPUT_SUB_MODES,
+    _OUTPUT_TYPE_CONDITIONAL,
+    _OUTPUT_YIELD_SUB_MODES,
     _STATE_SUB_MODES,
     MutationCategory,
     _SwapMutator,
     estimate_universe_size,
     generate_mutants,
 )
+from Wesker.mu_minus import MU_MINUS_CATALOG
 from Wesker.policy import (
     _FINGERPRINT_CORPUS,
     POLICY_VERSION,
@@ -37,15 +41,28 @@ from Wesker.policy import (
 #     Wesker/policy.py, re-run `python -c "from Wesker import mutation_policy;
 #     print(mutation_policy().policy_id)"`, and update this golden (and the
 #     counts below, which will name what moved); or
+#   * you repaired observation semantics without changing the universe — retain
+#     POLICY_VERSION, verify categories/counts unchanged, and update the id with
+#     the repair receipt so older observation results cannot share its basis; or
 #   * you changed eligibility semantics BY ACCIDENT — a mutator, a counter, a
 #     skip rule — and this failure is the entire point: find the drift before
 #     touching the golden.
-GOLDEN_POLICY_ID = "5.751e8e9f4f11"  # 5: type-impossible arithmetic leaves the universe
+# W#47: the same policy-8 universe, with single-invocation observation semantics.
+# Policy 9: an existing `return None` is no longer a STATE return_none target (the rewrite was the
+# original program); the corpus gained fp_return_none.
+# W#27: the same policy-9 universe; each mutant observation is bounded by the calibrated loop
+# budget (32x the original's count on that test, plus 10,000), whose time is never charged to the
+# mutant's allowance, and the equivalence probes are budgeted too.
+# Detective #105: the same policy-9 universe; each test run against a mutant writes only inside its
+# write authority, and a prevented write is the unscored outcome write_outside_authority, never a kill
+# (categories and counts verified unchanged: GOLDEN_FINGERPRINT holds).
+GOLDEN_POLICY_ID = "9.261d14e34119"
 
 # The same fact, readable: the engine's target counts over the fingerprint
 # corpus. A failure here names the category and function that moved.
 GOLDEN_FINGERPRINT = {
-    "fp_value": {"VALUE": 9, "STATE": 1, "STMT": 1},
+    "fp_annotations": {"ARITHMETIC": 1, "DATAFLOW": 1, "STATE": 1, "VALUE": 4},
+    "fp_value": {"STATE": 1, "STMT": 1, "VALUE": 9},
     "fp_boundary": {"BOUNDARY": 17, "STATE": 1},
     "fp_arith_logic": {
         "ARITHMETIC": 4,
@@ -54,7 +71,13 @@ GOLDEN_FINGERPRINT = {
         "STMT": 1,
         "VALUE": 2,
     },
+    "fp_bitwise": {"ARITHMETIC": 8, "STATE": 1, "STMT": 1, "VALUE": 2},
     "fp_swap": {"ARITHMETIC": 1, "STATE": 1, "SWAP": 9, "VALUE": 4},
+    # Policy 7's witness. Every OTHER corpus call has at most two positional arguments, where
+    # "every pair" and "every adjacent pair" coincide — so this row is the only one that moves
+    # when the argument-order vocabulary does. SWAP 15 = g(a,b,c)'s three pairs + its unwrap,
+    # plus h(...)'s ten ASKED pairs (of C(6,2)=15, five withheld) + its unwrap.
+    "fp_swap_wide": {"ARITHMETIC": 1, "STATE": 1, "SWAP": 15},
     "fp_state_type_exc": {
         "ARITHMETIC": 1,
         "BOUNDARY": 3,
@@ -68,21 +91,39 @@ GOLDEN_FINGERPRINT = {
     },
     "fp_stmt": {"DATAFLOW": 2, "STATE": 1, "STMT": 3, "SWAP": 1, "VALUE": 7},
     "fp_async": {"ARITHMETIC": 1, "STATE": 1, "VALUE": 2},
-    # The enrolled slice: return total over both visible candidates. (name_sub
-    # would add x→y/y→x at the binding statement — implemented, not enrolled;
-    # see _DATAFLOW_SUB_MODES for the measured reason.)
     "fp_dataflow": {"ARITHMETIC": 1, "DATAFLOW": 2, "STATE": 1},
-    # Policy 3: one STATE target per self-write SPELLING (plain, annotated,
-    # augmented); the valueless declaration is not a write. STMT's overlap on
-    # attribute writes extends symmetrically; ARITHMETIC is the += itself.
-    # Policy 4: the two-target write adds one dimension PER attribute (left,
-    # right), each with its own per-target mutant.
-    "fp_state_spellings": {"ARITHMETIC": 1, "STATE": 5, "STMT": 4},
-    # Policy 5: only the one-sided f-string Add, `n + 1`, and the name-name
-    # return Add survive as arithmetic; the two-str Adds and `'-' * 3` are
-    # type-impossible. VALUE 9 = four str literals + two ints (two dims each)
-    # + the f-string's '!' fragment.
     "fp_str_arith": {"ARITHMETIC": 3, "STATE": 1, "SWAP": 1, "VALUE": 9},
+    "fp_state_spellings": {"ARITHMETIC": 1, "STATE": 5, "STMT": 4},
+    "fp_return_none": {"BOUNDARY": 3, "STATE": 1},
+}
+
+
+# The TWO-SIGN fingerprint's OUTPUT column, readable (no hash golden: the two-sign id also moves
+# with every observation-text repair the one-sign golden above records). Fork 1 per return site
+# (none, const, identity; identity needs a parameter, and a no-op is not a target), plus Form B
+# (#44): return_stale on every non-generator, and raise_swallow where the function's own body
+# raises (fp_state_type_exc). The corpus holds no generator, so no yield mode appears here.
+# #44 on policy 9: each row is one more than before (two more for fp_state_type_exc), and the
+# one-sign id is unchanged. Two-sign id: 9+neg.aaff90df3dbf -> 9+neg.e273b30c9a36 (Form A's Fork 2
+# table enters the manifest) -> 9+neg.8144c37b1638 (Form B and the unbuilt catalog) ->
+# 9+neg.f5a15364c11d (integrated with W#27's loop budget and #105's write authority, both
+# observation texts the one-sign golden records).
+GOLDEN_TWO_SIGN_OUTPUT = {
+    "fp_annotations": 4,
+    "fp_value": 3,
+    "fp_boundary": 4,
+    "fp_arith_logic": 4,
+    "fp_bitwise": 4,
+    "fp_swap": 4,
+    "fp_swap_wide": 4,
+    "fp_state_type_exc": 5,
+    "fp_stmt": 4,
+    "fp_async": 4,
+    "fp_dataflow": 4,
+    "fp_str_arith": 4,
+    "fp_state_spellings": 1,
+    # `return None` -> const, identity; `return x` -> none, const (identity is a no-op); + stale.
+    "fp_return_none": 5,
 }
 
 
@@ -90,7 +131,9 @@ def test_policy_id_is_the_golden():
     assert mutation_policy().policy_id == GOLDEN_POLICY_ID, (
         "The mutation-policy fingerprint moved. Intentional universe change → "
         "bump POLICY_VERSION and update GOLDEN_POLICY_ID (+ GOLDEN_FINGERPRINT, "
-        "which names what moved). Unintentional → you changed eligibility "
+        "which names what moved). Observation-only repair → verify unchanged "
+        "categories/counts and record the new observation id. Unintentional → "
+        "you changed eligibility "
         "semantics by accident; find the drift before touching the golden."
     )
 
@@ -109,6 +152,17 @@ def test_fingerprint_counts_are_the_goldens():
         for fn, by_cat in GOLDEN_FINGERPRINT.items()
     }
     assert got == want
+
+
+def test_two_sign_output_column_is_the_golden():
+    two = mutation_policy(two_sign=True).fingerprint_counts
+    assert {fn: cats["OUTPUT"] for fn, cats in two.items()} == GOLDEN_TWO_SIGN_OUTPUT
+    # Every other column is the one-sign fingerprint's: μ⁻ adds questions, it moves none.
+    one = mutation_policy().fingerprint_counts
+    assert all(
+        {cat: n for cat, n in two[fn].items() if cat != "OUTPUT"} == one[fn]
+        for fn in one
+    )
 
 
 def test_policy_id_embeds_the_version():
@@ -149,6 +203,34 @@ def test_manifest_sub_modes_are_the_engine_tuples():
     assert mutation_policy(two_sign=True).categories["OUTPUT"]["sub_modes"] == dict(
         _OUTPUT_SUB_MODES
     )
+
+
+def test_two_sign_manifest_declares_the_type_conditional_table():
+    # #44: Fork 2's table is the question set a two-sign run asks of an observed codomain. It was
+    # left out of the manifest ("type-conditional perturbations are out of this policy"), so adding
+    # 23 operators to it would not have moved the two-sign id, and a receipt measured before them
+    # would have read as current. Derived from the engine table, never restated.
+    two = mutation_policy(two_sign=True)
+    assert two.categories["OUTPUT"]["type_conditional"] == {
+        mode: {"question": desc, "types": sorted(types)}
+        for mode, desc, types in _OUTPUT_TYPE_CONDITIONAL
+    }
+    # The id before #44 (Wesker 204a760, policy 9). Its universe lacked the new operators.
+    assert two.policy_id != "9+neg.aaff90df3dbf"
+
+
+def test_two_sign_manifest_declares_form_b_and_what_it_does_not_measure():
+    # Form B is static (no observed type decides it), so it is in the census; the manifest names
+    # its modes from the engine tables and, from the catalog, every Def. 11.8 operator a two-sign
+    # certificate does NOT measure, so a receipt cannot be read as covering the whole family.
+    two = mutation_policy(two_sign=True)
+    form_b = two.categories["OUTPUT"]["form_b"]
+    assert form_b["yield"] == dict(_OUTPUT_YIELD_SUB_MODES)
+    assert form_b["call"] == dict(_OUTPUT_CALL_SUB_MODES)
+    unbuilt = {
+        op.key for op in MU_MINUS_CATALOG if op.status in ("partial", "unsupported")
+    }
+    assert unbuilt == {"dict", "field", "class", "clamp", "raise", "state-extra"}
 
 
 def test_manifest_duals_are_the_engine_table():
@@ -332,10 +414,12 @@ def test_augassign_removal_keeps_the_prior_value():
 
     ns_orig: dict = {}
     ns_mut: dict = {}
-    exec(src, ns_orig)
+    # S102: executing the original and mutated class is the observation under test
+    exec(src, ns_orig)  # noqa: S102
     mutated_cls = ast.parse(src)
     mutated_cls.body[0].body[1] = mutant.mutated_node
-    exec(compile(ast.fix_missing_locations(mutated_cls), "<m>", "exec"), ns_mut)
+    # S102: as above, for the mutant
+    exec(compile(ast.fix_missing_locations(mutated_cls), "<m>", "exec"), ns_mut)  # noqa: S102
     c_orig, c_mut = ns_orig["C"](), ns_mut["C"]()
     c_orig.bump(5)
     c_mut.bump(5)

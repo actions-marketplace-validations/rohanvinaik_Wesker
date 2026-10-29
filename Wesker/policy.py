@@ -39,7 +39,10 @@ from typing import Any
 from .engine import (
     _DATAFLOW_SUB_MODES,
     _EXCEPTION_SUB_MODES,
+    _OUTPUT_CALL_SUB_MODES,
     _OUTPUT_SUB_MODES,
+    _OUTPUT_TYPE_CONDITIONAL,
+    _OUTPUT_YIELD_SUB_MODES,
     _STATE_SUB_MODES,
     MutationCategory,
     _ArithmeticMutator,
@@ -49,6 +52,9 @@ from .engine import (
     _ValueMutator,
     estimate_universe_size,
 )
+from .monitoring import STEP_BUDGET_FACTOR, STEP_BUDGET_FLOOR, STEP_PROBE_CAP
+from .mu_minus import MU_MINUS_CATALOG
+from .swap_plan import SWAP_PAIR_BUDGET
 
 # 2: DATAFLOW landed (issue #10) — reference substitution enters the universe,
 #    and the fingerprint corpus gained fp_dataflow. Every completeness verdict
@@ -67,7 +73,46 @@ from .engine import (
 #    unproven-equivalent bucket ("COMPLETE modulo 12" where the honest number
 #    was 4). Proof-only inference — literals, f-strings, str-literal-receiver
 #    methods — never annotations; the corpus gained fp_str_arith.
-POLICY_VERSION = 5
+# 6: ARITHMETIC becomes COMPLETE over the grammar's operator families, measured
+#    against `ast` rather than curated. `_BIN_SWAP` covered 7 of 13 `operator`
+#    nodes and `visit_UnaryOp` 1 of the 3 arithmetic `unaryop` nodes, so
+#    MatMult, LShift, RShift, BitAnd, BitOr, BitXor, Invert and UAdd had NO
+#    fault model — not withheld, not declared, absent. A target using `@` or
+#    `<<` carried a dimension nothing covered and nothing said so, which is the
+#    one state the project forbids. Each dual is behaviourally distinguishable
+#    rather than merely symmetric (verified: every one has a distinguishing
+#    input; Invert is never equivalent over ints since `~x == -x - 1`), and
+#    `+x` maps to `-x` rather than removal because `+x -> x` is identity for
+#    every builtin numeric and would pad the bucket policy 5 exists to shrink.
+#    The corpus gained fp_bitwise. Every verdict under policy 5 is a claim
+#    about a universe missing eight operator identities.
+# 7: SWAP asks about EVERY pair of positional arguments, not only adjacent ones,
+#    selected greedily under a hard per-call-site budget of 10 (`swap_plan`).
+#    Through policy 6 only `(i, i+1)` was a question, so `g(a, b, c) ->
+#    g(c, b, a)` — the first-and-third transposition — was never asked at all: a
+#    suite whose inputs happened to repeat a value across positions 0 and 2 read
+#    COMPLETE while that rewrite passed it, and `verify-rewrite` called it
+#    PRESERVED. Every pair is its own behavioral dimension (a singleton cover),
+#    so greedy marginal coverage ties across them and nearest-first is the
+#    deterministic tie-break; the budget bounds what is ASKED AT ALL, and what it
+#    does not reach is WITHHELD — counted by the census, carried to the reader,
+#    never dropped and never read as verified. Neighbour labels are byte-identical
+#    to policy 6 and keep their emission position, so no per-site prefix moves;
+#    farther pairs take the new `~p<i>,<j>` spelling. The corpus gained
+#    fp_swap_wide, because every other corpus call has at most two positional
+#    arguments — without it the policy id would move while every fingerprint
+#    count stayed identical, which is a version bump the corpus cannot tell you
+#    anything about. Every verdict under policy 6 is a claim about a universe
+#    that never asked whether non-adjacent argument positions are distinguished.
+# 8: annotation subtrees are excluded from runtime mutation; wall bounds are
+#    unresolved execution evidence, never detection kills (#27/#30).
+# 9: an existing `return None` is no longer a STATE return_none target — the
+#    rewrite was the original program, an empty-diff survivor no test can kill.
+#    The corpus gained fp_return_none, so the change is visible in the counts.
+#    (Not a bump: #44 added the rest of Def. 11.8's μ⁻ operators to the TWO-SIGN manifest, which
+#    moves only the `+neg` digest. The one-sign universe did not change, so its id and every
+#    one-sign receipt stay valid; a shared counter bump would have invalidated them for nothing.)
+POLICY_VERSION = 9
 
 # The behavioral fingerprint corpus: small functions that together reach every
 # category, every sub-mode, dead dimensions, the docstring skip, int
@@ -76,6 +121,12 @@ POLICY_VERSION = 5
 # part of the policy definition — extend it when a new category lands (that is
 # a policy change by definition), never rearrange it casually.
 _FINGERPRINT_CORPUS: tuple[str, ...] = (
+    # Annotation-only operations contribute nothing; definition defaults still execute.
+    (
+        "def fp_annotations(x: list[int | str] = 1 + 2) -> int | None:\n"
+        "    y: tuple[int, 3 + 4] = x\n"
+        "    return y\n"
+    ),
     # VALUE: docstring skipped; int (two dims), str, bool, float constants.
     'def fp_value():\n    """Doc."""\n    n = 1\n    n = n\n    return (n, "s", True, 1.5)\n',
     # BOUNDARY: orderings (boundary shift, direction, equality collapse, two
@@ -83,33 +134,58 @@ _FINGERPRINT_CORPUS: tuple[str, ...] = (
     "def fp_boundary(a, b):\n    return (a < b) == (a in b) is (a is b)\n",
     # ARITHMETIC + LOGICAL: BinOp, AugAssign, unary minus; and/or, not.
     "def fp_arith_logic(a, b):\n    a += 1\n    return -(a * b) if a and not b else a - b\n",
+    # ARITHMETIC, policy 6: the eight operator identities that had no fault model
+    # before it — MatMult, the shifts, the three bitwise, and unary Invert/UAdd.
+    # Without a corpus entry reaching them the policy id would move while every
+    # fingerprint count stayed identical, which is a version bump the corpus
+    # cannot tell you anything about.
+    (
+        "def fp_bitwise(a, b, m):\n"
+        "    a <<= 1\n"
+        "    return (m @ m, a >> b, a & b, a | b, a ^ b, ~a, +a)\n"
+    ),
     # SWAP: adjacent transposition, used-call unwrap, builtin dual (min),
     # provenance-resolved math dual (floor).
     "def fp_swap(xs):\n    import math\n    return math.floor(min(len(xs), 2)) + pow(len(xs), 2)\n",
+    # SWAP, policy 7: the non-adjacent pairs, and the budget that bounds them.
+    # EVERY other corpus call has at most two positional arguments, where "every
+    # pair" and "every adjacent pair" are the same set — so without this entry the
+    # policy id would move while every fingerprint count stayed identical. The
+    # three-argument call carries the (0, 2) question that policy 6 never asked;
+    # the six-argument call exceeds C(6,2)=15 > 10, so it is also the corpus's
+    # only witness that the budget WITHHOLDS rather than silently truncates.
+    (
+        "def fp_swap_wide(a, b, c, d, e, f):\n"
+        "    return g(a, b, c) + h(a, b, c, d, e, f)\n"
+    ),
     # STATE (all three sub-modes) + TYPE + EXCEPTION (raise_type,
     # handler_swallow, handler_broaden).
-    "def fp_state_type_exc(self, xs):\n"
-    "    self.total = 0\n"
-    "    for x in xs:\n"
-    "        if isinstance(x, bool):\n"
-    "            continue\n"
-    "        if x is None:\n"
-    "            break\n"
-    "        try:\n"
-    "            self.total = int(x)\n"
-    "        except ValueError:\n"
-    "            self.total = -1\n"
-    "    if not xs:\n"
-    "        raise LookupError(xs)\n"
-    "    return self.total\n",
+    (
+        "def fp_state_type_exc(self, xs):\n"
+        "    self.total = 0\n"
+        "    for x in xs:\n"
+        "        if isinstance(x, bool):\n"
+        "            continue\n"
+        "        if x is None:\n"
+        "            break\n"
+        "        try:\n"
+        "            self.total = int(x)\n"
+        "        except ValueError:\n"
+        "            self.total = -1\n"
+        "    if not xs:\n"
+        "        raise LookupError(xs)\n"
+        "    return self.total\n"
+    ),
     # STMT: discarded-value call, subscript/attribute aliased writes, a
     # rebinding (deletable) after a first binding (not deletable).
-    "def fp_stmt(items, cfg):\n"
-    "    items.append(1)\n"
-    '    cfg["k"] = 2\n'
-    "    total = 3\n"
-    "    total = abs(total)\n"
-    "    return total\n",
+    (
+        "def fp_stmt(items, cfg):\n"
+        "    items.append(1)\n"
+        '    cfg["k"] = 2\n'
+        "    total = 3\n"
+        "    total = abs(total)\n"
+        "    return total\n"
+    ),
     # Async carries the same universe as sync.
     "async def fp_async(x):\n    return x + 1\n",
     # DATAFLOW (enrolled slice): return_sub over both visible candidates.
@@ -118,22 +194,30 @@ _FINGERPRINT_CORPUS: tuple[str, ...] = (
     # str × int-literal Mult carry NO arithmetic dimension; the one-sided
     # f-string Add and the name-name Adds still do (a name may carry
     # __radd__ — provable cases only).
-    "def fp_str_arith(parts, n):\n"
-    "    label = 'if ' + ' and '.join(parts) + ' then '\n"
-    "    bar = '-' * 3\n"
-    "    grown = f'{label}!' + label\n"
-    "    total = n + 1\n"
-    "    return label + bar\n",
+    (
+        "def fp_str_arith(parts, n):\n"
+        "    label = 'if ' + ' and '.join(parts) + ' then '\n"
+        "    bar = '-' * 3\n"
+        "    grown = f'{label}!' + label\n"
+        "    total = n + 1\n"
+        "    return label + bar\n"
+    ),
     # STATE remove_assign across all three write spellings (policy 3); the
     # valueless declaration is NOT a write and must stay out. The two-target
     # write (policy 4) carries one dimension PER attribute, each with its own
     # per-target mutant.
-    "def fp_state_spellings(self, v):\n"
-    "    self.plain = v\n"
-    "    self.annotated: int = v\n"
-    "    self.augmented += v\n"
-    "    self.left = self.right = v\n"
-    "    self.declared: int\n",
+    (
+        "def fp_state_spellings(self, v):\n"
+        "    self.plain = v\n"
+        "    self.annotated: int = v\n"
+        "    self.augmented += v\n"
+        "    self.left = self.right = v\n"
+        "    self.declared: int\n"
+    ),
+    # STATE return_none (2026-10-25): an existing `return None` is not a target, the value
+    # return is. Without this entry the corpus could not see the no-op target the operator
+    # used to emit, and a cache keyed on the policy id would replay its empty-diff survivor.
+    "def fp_return_none(x):\n    if x is None:\n        return None\n    return x\n",
 )
 
 
@@ -210,15 +294,33 @@ def _categories(two_sign: bool = False) -> dict[str, dict[str, Any]]:
         MutationCategory.SWAP.value: {
             "question": "are argument positions, call effect, and fold direction pinned?",
             "alternatives": [
-                "adjacent positional transposition per pair",
+                "positional transposition per PAIR — every pair, not only adjacent ones",
                 "unwrap (f(x, ...) -> x) when the call's value is used",
                 "curated callee dual, resolved by import provenance, not spelling",
             ],
             "duals": dict(_SwapMutator._DUALS),
+            # The budget is part of the declared surface, not an implementation detail: it is
+            # what makes a SWAP verdict a claim about the pairs ASKED rather than about all of
+            # them. Every pair of a call with up to five positional arguments fits.
+            "pair_budget": SWAP_PAIR_BUDGET,
+            "pair_order": (
+                "nearest first, then by left index — every pair is one behavioral dimension, so "
+                "greedy marginal coverage ties and nearest-first is the deterministic tie-break"
+            ),
+            "withheld": (
+                "pairs past the budget are WITHHELD: counted by the operator census and reported, "
+                "never generated and never read as verified (see swap_plan)"
+            ),
         },
         MutationCategory.STATE.value: {
             "question": "are side effects, return values, and loop control pinned?",
             "sub_modes": {mode: desc for mode, desc in _STATE_SUB_MODES},
+            "skips": [
+                (
+                    "an existing `return None` under return_none: it is the value the operator "
+                    "writes, so the rewrite would be the original program"
+                )
+            ],
         },
         MutationCategory.TYPE.value: {
             "question": "is this type guard exercised?",
@@ -263,13 +365,33 @@ def _categories(two_sign: bool = False) -> dict[str, dict[str, Any]]:
     if two_sign:
         cats[MutationCategory.OUTPUT.value] = {
             "question": (
-                "is the output's existence and input-dependence pinned? (μ⁻ Form A)"
+                "is each output invariant Def. 11.8 names pinned? (μ⁻, Forms A and B)"
             ),
             "sub_modes": {mode: desc for mode, desc in _OUTPUT_SUB_MODES},
+            # Fork 2 (Def. 11.10): which of these a run measures is decided by its observed
+            # codomain, but the table is the question set, so it belongs to the policy.
+            "type_conditional": {
+                mode: {"question": desc, "types": sorted(types)}
+                for mode, desc, types in _OUTPUT_TYPE_CONDITIONAL
+            },
+            # Form B (Def. 11.6): what the return-site rewrite cannot reach. Static (no observed
+            # type decides it), so it is in the census and the fingerprint.
+            "form_b": {
+                "yield": dict(_OUTPUT_YIELD_SUB_MODES),
+                "call": dict(_OUTPUT_CALL_SUB_MODES),
+                "rule": (
+                    "a generator gets the yield modes; any other function gets "
+                    "return_stale, and raise_swallow when its own body raises "
+                    "(form_b_output_modes)"
+                ),
+            },
             "form": (
-                "A — return-site rewrite; always-applicable perturbations only "
-                "(the independence pair + existence). Type-conditional perturbations "
-                "and Form B are out of this policy."
+                "A — return-site rewrite. sub_modes apply to every return (Fork 1); a "
+                "type_conditional mode applies only where every observed return type is "
+                "in its types (Fork 2, output_mode_applies), and never raises there. "
+                "B — the target's own definition with Wesker.mu_minus.form_b(<mode>) "
+                "applied innermost, so every evaluator, the isolated worker included, "
+                "builds it from source."
             ),
         }
     return cats
@@ -318,13 +440,49 @@ def mutation_policy(two_sign: bool = False) -> MutationPolicy:
         ),
         "observation": [
             "a mutant is killed when a covering test fails under it",
-            "assertion kills (value-specified) are distinguished from "
-            "crash/timeout kills (run-only), and an assertion kill takes "
-            "precedence over a crash kill for the same mutant",
-            "survivors probe synthesized boundary inputs for likely "
-            "equivalence; equivalence is reported, never silently claimed",
-            "covering-test scoping and categorical exclusion are "
-            "verdict-preserving reductions",
+            (
+                "each test observation invokes the test at most once; a no-argument "
+                "unpatched fallback requires pre-execution signature binding against "
+                "the callable and compatible advertised wrapper signatures, with "
+                "annotation-free Python function signature views; "
+                "a TypeError during execution never triggers a retry"
+            ),
+            (
+                "assertion kills (value-specified) are distinguished from "
+                "crash kills (run-only), and an assertion kill takes "
+                "precedence over a crash kill for the same mutant"
+            ),
+            (
+                "each mutant observation of a test is bounded by a loop budget of "
+                f"{STEP_BUDGET_FACTOR}x the original's backward-jump count on that same "
+                f"test plus {STEP_BUDGET_FLOOR}, armed only where the original passed the "
+                "test under the identical count; exceeding it is the unscored outcome "
+                "diverged — budget-relative, never a kill, survival evidence or proof of "
+                "nontermination; a budgeted observation's wall bound covers reaching its "
+                "cap inside the aggregate deadline and its time is never charged to the "
+                "mutant's allowance, so wall-clock bounds bound liveness only and yield "
+                "undetermined, never kills or survival evidence"
+            ),
+            (
+                "each test run against a mutant writes only inside its write authority — "
+                "the session's pytest temporary roots and the entries this process created "
+                "in the system temporary directory, never a root that contains the project "
+                "tree; a write outside it is prevented, and the observation is the unscored "
+                "outcome write_outside_authority — the guard's, never a kill or survival "
+                "evidence, while another test's kill of the same mutant still stands"
+            ),
+            (
+                "survivors probe synthesized boundary inputs for likely equivalence "
+                f"under a loop budget (the original's {STEP_PROBE_CAP} iterations, the "
+                "mutant's the cap above); an input the original cannot finish inside its "
+                "budget is no evidence, a mutant that exceeds its budget where the "
+                "original finished is never equivalent, and equivalence is reported, "
+                "never silently claimed"
+            ),
+            (
+                "covering-test scoping and categorical exclusion are "
+                "verdict-preserving reductions"
+            ),
         ],
         "purity_overlay": (
             "filter_categories(is_pure=True) suppresses the remove_assign "
@@ -333,25 +491,57 @@ def mutation_policy(two_sign: bool = False) -> MutationPolicy:
         ),
         "categories": _categories(two_sign),
         "exclusions": [
-            "first-order only: mutants are generated one at a time from the "
-            "original AST; kills do not certify compositions of operators "
-            "(see the composite-blind-spot witness in issue #11)",
-            "DATAFLOW's enrolled slice is returned-name substitution only: "
-            "general name-load substitution is implemented but not enrolled "
-            "(measured at +217% dimensions on Wesker itself — awaiting a "
-            "candidate restraint), and attribute selectors, subscript keys, "
-            "callable references, and receiver (self/cls) substitutions are "
-            "declared out of the supported slice, not silently covered "
-            "(issue #10's remaining subfamilies)",
+            (
+                "annotation subtrees, return annotations, type parameters and type aliases "
+                "are outside the runtime mutation universe; definition defaults, decorators "
+                "and annotated-assignment values remain behavioral targets"
+            ),
+            (
+                "first-order only: mutants are generated one at a time from the "
+                "original AST; kills do not certify compositions of operators "
+                "(see the composite-blind-spot witness in issue #11)"
+            ),
+            (
+                "DATAFLOW's enrolled slice is returned-name substitution only: "
+                "general name-load substitution is implemented but not enrolled "
+                "(measured at +217% dimensions on Wesker itself — awaiting a "
+                "candidate restraint), and attribute selectors, subscript keys, "
+                "callable references, and receiver (self/cls) substitutions are "
+                "declared out of the supported slice, not silently covered "
+                "(issue #10's remaining subfamilies)"
+            ),
+            (
+                "argument-order questions are budgeted per call site: every PAIR of "
+                "positional arguments is a question, asked nearest-first up to "
+                f"{SWAP_PAIR_BUDGET} (every pair through five positional arguments). A "
+                "wider call has its remaining pairs WITHHELD — counted by the operator "
+                "census and reported, never generated. 'never asked' and 'asked, and no "
+                "distinguishing input was found' are different states with different "
+                "remedies; neither may be read as verified"
+            ),
+            (
+                "argument order WITHIN a starred expansion is not a target: f(a, *rest) "
+                "carries two argument expressions whatever `rest` holds at runtime, so "
+                "the pairs are over the AST's positional entries, not the call's eventual "
+                "arguments"
+            ),
+            (
+                "no rotations or multi-position reorderings: catching one does not pin "
+                "the pairs it moves, and the pairs are the declared dimension"
+            ),
             "sorted(reverse=) has no curated dual until a measured case wants it",
-            "bare re-raise carries no EXCEPTION target; an already-pass "
-            "handler is not a handler_swallow target; an untyped except: is "
-            "not a handler_broaden target",
-            "type-impossible ARITHMETIC swaps are not targets: Add on two "
-            "provably-str operands and Mult on str x int-literal can only "
-            "raise TypeError (reachability, not specification); provable "
-            "inference only — annotations are never trusted, and a one-sided "
-            "str Add stays in the universe",
+            (
+                "bare re-raise carries no EXCEPTION target; an already-pass "
+                "handler is not a handler_swallow target; an untyped except: is "
+                "not a handler_broaden target"
+            ),
+            (
+                "type-impossible ARITHMETIC swaps are not targets: Add on two "
+                "provably-str operands and Mult on str x int-literal can only "
+                "raise TypeError (reachability, not specification); provable "
+                "inference only — annotations are never trusted, and a one-sided "
+                "str Add stays in the universe"
+            ),
         ],
         "fingerprint_corpus": list(_FINGERPRINT_CORPUS),
         "fingerprint_counts": fingerprint,
@@ -360,8 +550,21 @@ def mutation_policy(two_sign: bool = False) -> MutationPolicy:
         # Only the two-sign manifest carries this key, so the default digest is unchanged.
         manifest["negative_policy"] = {
             "operator": "mu-minus",
-            "form": "A",
+            "form": "A+B",
             "sub_modes": [mode for mode, _desc in _OUTPUT_SUB_MODES],
+            "type_conditional": [
+                mode for mode, _desc, _types in _OUTPUT_TYPE_CONDITIONAL
+            ],
+            "form_b": [
+                mode for mode, _desc in _OUTPUT_YIELD_SUB_MODES + _OUTPUT_CALL_SUB_MODES
+            ],
+            # What a two-sign certificate does NOT measure, named with its reason, so a
+            # receipt cannot be read as covering the whole of Def. 11.8 (Wesker.mu_minus).
+            "unbuilt": {
+                op.key: f"{op.status}: {op.note}"
+                for op in MU_MINUS_CATALOG
+                if op.status in ("partial", "unsupported")
+            },
         }
     canonical = json.dumps(manifest, sort_keys=True, separators=(",", ":"))
     digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:12]

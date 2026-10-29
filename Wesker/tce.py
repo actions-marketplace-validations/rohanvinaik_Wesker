@@ -52,6 +52,10 @@ from typing import Any
 #: the one discipline the whole tool's credibility rests on.
 WARRANT_BYTECODE = "bytecode_identity"
 
+#: The filename every TCE compilation carries: both sides of a comparison must compile under the
+#: same name, or the code objects differ on `co_filename` alone.
+_TCE_FILENAME = "<tce>"
+
 
 def _op_key(ins: Any) -> tuple:
     """One instruction reduced to what the interpreter will DO with it.
@@ -171,24 +175,49 @@ def bytecode_equivalent(original_src: str, mutant_src: str) -> bool:
     user could not have answered.
     """
     try:
-        a = compile(original_src, "<tce>", "exec")
-        b = compile(mutant_src, "<tce>", "exec")
+        a = compile(original_src, _TCE_FILENAME, "exec")
+        b = compile(mutant_src, _TCE_FILENAME, "exec")
     except (SyntaxError, ValueError, MemoryError, RecursionError):
         return False
     return code_identical(a, b)
 
 
-def nodes_equivalent(original_node: Any, mutant_node: Any) -> bool:
+def compute_node_key(node: Any) -> tuple | None:
+    """Precompute the TCE code key for an AST node (#41).
+
+    Computes the bytecode key of an original function once per profiling pass so
+    mutant evaluations do not repeatedly unparse and compile the unmutated node.
+    Returns None if unparse or compilation fails.
+    """
+    try:
+        src = ast.unparse(node)
+        code = compile(src, _TCE_FILENAME, "exec")
+        return _code_key(code)
+    except (SyntaxError, ValueError, MemoryError, RecursionError):
+        return None
+
+
+def nodes_equivalent(
+    original_node: Any, mutant_node: Any, original_key: tuple | None = None
+) -> bool:
     """:func:`bytecode_equivalent` over two AST nodes — the engine-facing adapter.
 
     Thin on purpose: the decision lives in `bytecode_equivalent`, typed over source so it sits
     inside a literal grammar and can be pinned. This only unparses.
+
+    Accepts an optional precomputed `original_key` (#41) to avoid re-compiling the original AST
+    for every mutant in the profiling loop.
 
     Any failure returns False. `ast.unparse` can raise on a malformed node, and a mutant built
     from a rewritten AST is exactly where malformed nodes appear — but an equivalence check is
     an optimisation, and one that can fail a run is a liability. False claims nothing.
     """
     try:
+        if original_key is not None:
+            mutant_src = ast.unparse(mutant_node)
+            mutant_code = compile(mutant_src, _TCE_FILENAME, "exec")
+            return original_key == _code_key(mutant_code)
         return bytecode_equivalent(ast.unparse(original_node), ast.unparse(mutant_node))
-    except Exception:  # noqa: BLE001 — an optimisation must never fail the run
+    # BLE001: an optimisation must never fail the run
+    except Exception:  # noqa: BLE001
         return False

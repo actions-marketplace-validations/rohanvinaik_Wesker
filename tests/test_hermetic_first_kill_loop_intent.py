@@ -21,9 +21,10 @@ import os
 import pytest
 
 Detective = pytest.importorskip("Detective")
-from Detective import engine as deng  # noqa: E402
-from Wesker import engine as weng  # noqa: E402
-from Wesker.ci import callable_test_id, run_with_live_suite  # noqa: E402
+from Detective import engine as deng
+
+from Wesker import engine as weng
+from Wesker.ci import callable_test_id, run_with_live_suite
 
 pytestmark = pytest.mark.skipif(
     not getattr(deng, "_WESKER_TARGET_FIRST", False),
@@ -64,10 +65,12 @@ def test_shaped_covering_test_is_not_run_when_a_hermetic_test_kills_first(
     runs: dict[str, int] = {}
     real = weng._run_test_with_timeout
 
-    def spy(test_fn, mutated_obj, patched, remaining_ms):
+    def spy(test_fn, mutated_obj, patched, remaining_ms, **step_args):
+        # W#27: an armed observation (and the original's counted run) carries the loop-budget
+        # arguments; the spy forwards them untouched.
         tid = callable_test_id(test_fn)
         runs[tid] = runs.get(tid, 0) + 1
-        return real(test_fn, mutated_obj, patched, remaining_ms)
+        return real(test_fn, mutated_obj, patched, remaining_ms, **step_args)
 
     monkeypatch.setattr(weng, "_run_test_with_timeout", spy)
 

@@ -27,7 +27,6 @@ from Wesker.isolation import (
     should_recycle,
 )
 
-
 # ── the pure decision ──────────────────────────────────────────────────────────
 
 
@@ -436,6 +435,158 @@ def test_isolated_profiling_is_gateable_on_a_clean_run(tmp_path):
     assert iso.is_gateable is True
 
 
+@pytest.mark.parametrize("namespace_package", [False, True])
+def test_worker_uses_collected_package_identity(tmp_path, namespace_package):
+    """Audit B/#19: relative imports and postponed dataclasses must remain measurable."""
+    import json
+    import subprocess
+
+    package = tmp_path / "closure_package"
+    package.mkdir()
+    if not namespace_package:
+        (package / "__init__.py").write_text("")
+    (package / "support.py").write_text("OFFSET = 2\n")
+    (package / "target.py").write_text(
+        "from __future__ import annotations\n"
+        "from dataclasses import dataclass\n"
+        "from .support import OFFSET\n"
+        "@dataclass\nclass Box:\n    value: int\n"
+        "def f(x: int) -> int:\n    return Box(x).value + OFFSET\n"
+    )
+    (tmp_path / "test_target.py").write_text(
+        "from closure_package.target import f\ndef test_f():\n    assert f(3) == 5\n"
+    )
+    script = (
+        "import json,sys\n"
+        "from Wesker._isolated_worker import _evaluate_full\n"
+        "print(json.dumps(_evaluate_full(sys.argv[1], 'f', ['test_target.py::test_f'], "
+        "'def f(x):\\n    return Box(x).value - OFFSET\\n')))\n"
+    )
+    run = subprocess.run(
+        [sys.executable, "-c", script, str(package / "target.py")],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=True,
+        timeout=30,
+    )
+    result = json.loads(run.stdout)
+    assert result["constructed"] is True
+    assert result["installed"] is True
+    assert result["entered"] is True
+    assert result["rc"] == 1
+    assert result["killed_by"] == "assertion"
+
+
+@pytest.mark.parametrize("call", ["alias.f(1)", "helper(1)", "local(1)"])
+def test_worker_patches_indirect_calls_and_credits_the_asserting_test(tmp_path, call):
+    """Ledger B: module/local imports and bridge helpers must actually enter the mutation."""
+    import json
+    import subprocess
+
+    (tmp_path / "indirect.py").write_text(
+        "def f(x):\n    return x + 1\ndef helper(x):\n    return f(x)\n"
+    )
+    (tmp_path / "test_indirect.py").write_text(
+        "import indirect as alias\nfrom indirect import helper\n"
+        "def local(x):\n    from indirect import f\n    return f(x)\n"
+        f"def test_crash():\n    if {call} != 2:\n        raise RuntimeError('changed')\n"
+        f"def test_value():\n    assert {call} == 2\n"
+    )
+    script = (
+        "import json\nfrom Wesker._isolated_worker import _evaluate_full\n"
+        "print(json.dumps([_evaluate_full('indirect.py', 'f', "
+        "['test_indirect.py::test_crash', 'test_indirect.py::test_value'], s) "
+        "for s in ['def f(x): return x + 2', 'def f(x): return x + 1']]))"
+    )
+    run = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=True,
+        timeout=30,
+    )
+    killed, unchanged = json.loads(run.stdout)
+    # Split rather than composed: a failure must name WHICH half broke — "installed but never
+    # entered" is a different defect from "never installed" (S9073).
+    assert killed["installed"]
+    assert killed["entered"]
+    assert killed["killed_by"] == "assertion"
+    assert killed["test_name"].endswith("::test_value")
+    assert unchanged["rc"] == 0
+    assert unchanged["installed"]
+    assert unchanged["entered"]
+
+
+def test_a_value_kill_stops_before_a_later_blocking_test(tmp_path):
+    """A completed assertion must not be downgraded to a worker timeout."""
+    (tmp_path / "early.py").write_text("def f(x):\n    return x + 1\n")
+    (tmp_path / "test_early.py").write_text(
+        "from early import f\n"
+        "def test_value():\n    assert f(1) == 2\n"
+        "def test_later():\n    import time\n    time.sleep(100)\n"
+    )
+    worker = IsolatedMutantWorker(str(tmp_path), [], "early.py", "f")
+    try:
+        result = worker.evaluate(
+            "def f(x): return x + 2",
+            5.0,
+            node_ids=["test_early.py::test_value", "test_early.py::test_later"],
+        )
+    finally:
+        worker.close()
+    assert not result.timed_out
+    assert result.killed_by == "assertion"
+    assert result.test_name.endswith("::test_value")
+
+
+def test_a_mutant_construction_failure_cannot_certify_an_empty_universe(
+    tmp_path, monkeypatch
+):
+    """Audit B/#18: excluded harness errors must refuse the aggregate certificate."""
+    from Wesker import engine
+    from Wesker.ci import _PROJECT_ROOT
+    from Wesker.filter import filter_categories
+
+    node, func_obj, tests = _real_project(tmp_path)
+
+    def fail(mutant, *args, **kwargs):
+        return engine.MutantResult(mutant, False, constructed=False)
+
+    monkeypatch.setattr(engine, "evaluate_mutant", fail)
+    token = _PROJECT_ROOT.set(str(tmp_path))
+    try:
+        result = engine.run_function_profiling(
+            node, "m.py::in_range", filter_categories(node), tests, func_obj
+        )
+    finally:
+        _PROJECT_ROOT.reset(token)
+        _drop_project(tmp_path)
+    assert result.total_mutants == 0
+    assert sum(c.unscored_by.get("harness_error", 0) for c in result.per_category) > 0
+    assert result.is_gateable is False
+    # Construction failure refuses the gate without claiming a truncated trace.
+    assert result.coverage_depth == "profiled"
+
+
+@pytest.mark.parametrize(
+    ("node_id", "plain", "expected"),
+    [
+        ("test_mod.py::test_f[x]", False, "recorded"),
+        ("test_f", True, "collect_plain"),
+        ("test_f", False, "unavailable"),
+        ("factory.<locals>.wrapped", True, "unavailable"),
+        ("legacy:test_mod.py::test_f", True, "unavailable"),
+    ],
+)
+def test_isolated_selection_does_not_execute_legacy_identity(node_id, plain, expected):
+    """Audit B/#19: a fallback observation ID is not an executable pytest selector."""
+    from Wesker.isolation import isolated_test_selection
+
+    assert isolated_test_selection(node_id, plain) == expected
+
+
 # ── mode -> gateability standing (increment 4c) ──────────────────────────────────
 #
 # The tier a result earns from its execution mode, layered on top of the measurement validity.
@@ -637,6 +788,34 @@ def test_collection_stamps_the_shape_a_test_reveals(tmp_path):
     assert clean["spawns_subprocess"] is False
 
 
+def test_callable_shape_records_provenance_and_override():
+    """W#19/B01: callable_shape_records preserves detection, declaration, override, and unknown."""
+    from Wesker.isolation import callable_shape_records
+
+    def dummy():
+        pass
+
+    # 1. Unstamped or missing provenance defaults to 'unknown' rather than guessing 'detected'
+    dummy.__wesker_shape__ = {"starts_background_thread": True}
+    records = callable_shape_records(dummy, test_id="test_mod.py::test_dummy")
+    assert len(records) == 1
+    assert records[0]["hazard"] == "starts_background_thread"
+    assert records[0]["provenance"] == "unknown"
+    assert records[0]["test_id"] == "test_mod.py::test_dummy"
+
+    # 2. Detected and declared override
+    dummy.__wesker_shape__ = {"signal_main_thread": True}
+    dummy.__wesker_shape_provenance__ = {"signal_main_thread": "declared_override"}
+    dummy.__wesker_detected_hazards__ = {"signal_main_thread": False}
+    dummy.__wesker_declared_hazards__ = {"signal_main_thread": True}
+    records = callable_shape_records(dummy, test_id="test_mod.py::test_override")
+    assert len(records) == 1
+    assert records[0]["hazard"] == "signal_main_thread"
+    assert records[0]["provenance"] == "declared_override"
+    assert records[0]["detected"] is False
+    assert records[0]["declared"] is True
+
+
 def test_in_process_gateability_now_requires_hermetic_shapes(tmp_path):
     """THE increment-5 payoff: a non-hermetic in_process result is no longer gateable, and NAMES the
     hazard; a hermetic one still gates conditionally; the isolated mode contains any shape, so its
@@ -746,10 +925,10 @@ def _counter_project(tmp_path):
     import sys
 
     (tmp_path / "cc.py").write_text(
-        "import os\n"
+        "import os, pathlib\n"
         "_P = os.path.join(os.path.dirname(__file__), 'ctr2')\n"
-        "_n = int(open(_P).read() or '0') if os.path.exists(_P) else 0\n"
-        "open(_P, 'w').write(str(_n + 1))\n"
+        "_n = int(pathlib.Path(_P).read_text() or '0') if os.path.exists(_P) else 0\n"
+        "pathlib.Path(_P).write_text(str(_n + 1))\n"
         "def g():\n"
         "    if _n % 2 == 0:\n"
         "        return 'even'\n"

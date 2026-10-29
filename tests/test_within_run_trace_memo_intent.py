@@ -19,9 +19,10 @@ import os
 import pytest
 
 Detective = pytest.importorskip("Detective")
-from Detective import engine as deng  # noqa: E402
-from Wesker import line_coverage as lc  # noqa: E402
-from Wesker.ci import run_with_live_suite  # noqa: E402
+from Detective import engine as deng
+
+from Wesker import line_coverage as lc
+from Wesker.ci import run_with_live_suite
 
 pytestmark = pytest.mark.skipif(
     not getattr(deng, "_WESKER_TARGET_FIRST", False),
@@ -56,9 +57,9 @@ def test_second_pass_reuses_the_first_passes_traces_within_one_session(
     calls = {"n": 0}
     real = lc._trace_one_multi
 
-    def spy(fn, tf, budget, capture_arcs=True):
+    def spy(fn, tf, budget, capture_arcs=True, **kw):
         calls["n"] += 1
-        return real(fn, tf, budget, capture_arcs=capture_arcs)
+        return real(fn, tf, budget, capture_arcs=capture_arcs, **kw)
 
     monkeypatch.setattr(lc, "_trace_one_multi", spy)
 

@@ -22,11 +22,37 @@ THE BOUNDARY, stated honestly and NOT fixable in-process: a thread blocked OUTSI
 until that call returns on its own. `abandon` returns False there rather than claiming a stop it
 did not make. Bounding that for real needs process isolation, which is a different engine than an
 in-process one.
+
+THE STRANDED LOCK (W#29). The injection lands at the target's next eval-breaker check, and the
+check right after a call returns is one of them. A thread parked in a CONTENDED acquire releases
+the GIL, so the injection is made while it waits; the lock is then handed to it, the acquire
+returns, and the exception is raised at that call's own check, with the lock held and before any
+``try`` or ``with`` that would release it. The thread unwinds and exits owning a lock nobody can
+release, and every later acquirer in every thread waits forever. ``with lock:`` is exposed on
+3.14, which compiles the statement to ``LOAD_SPECIAL __enter__; CALL 0`` and only then begins
+the protected range (3.11–3.13's single ``BEFORE_WITH`` opcode had no check there). A
+``@contextmanager`` wrapper, or a bare ``acquire()`` written before its ``try``, is exposed on
+every supported version: the acquire is its own call. Code that abandonment can reach takes its
+locks through :func:`acquire_unstranded` and releases them in the very next ``try``'s
+``finally``.
+
+THE START/JOIN EDGE (#28). One blocking call that boundary covers is ENTIRELY the pair's own: the
+execution lock. A test that runs the engine, measured inside a held evaluation, parks its worker in
+the lock's C-level acquire while the lock's owner — the very thread that started the worker and is
+joining it — waits for the worker. A wait-for cycle; the injection cannot land; the worker dies
+owning the lock when the holder finally releases. Unlike a socket, this wait is KNOWABLE before it
+begins: every worker the pair bounds is a :class:`JoinedWorker`, which records the thread that
+started it, so a worker can ask whether the lock's owner is upstream of it and refuse instead of
+waiting (:class:`MeasurementRefused`). A thread the code UNDER TEST starts records nothing, so a
+cycle routed through one stays outside what can be seen here — it is still detected and refused by
+the lock's orphan channels, never prevented.
 """
 
 from __future__ import annotations
 
 import ctypes
+import threading
+import weakref
 from typing import Any
 
 
@@ -38,6 +64,190 @@ class Abandoned(BaseException):
     SWALLOW the injection and keep running, leaving the leak in place exactly where the code looks
     safest. The interrupt has to outrank the interrupted code's own error handling to be one.
     """
+
+
+class MeasurementRefused(BaseException):
+    """Raised INSTEAD of a blocking wait that could only complete a wait-for cycle (#28).
+
+    ``code`` names why (``"nested_measurement"``: the execution lock is held by a thread upstream of
+    this one on the start/join edge, so waiting for it waits for itself); ``owner_tid`` is the owner
+    it would have waited on.
+
+    A ``BaseException``, like :class:`Abandoned`: the engine nested inside a test is ordinary code
+    full of ``except Exception`` handlers (and one ``except ExecutionLockUnavailable``), and any of
+    them catching the refusal would let it carry on into the next acquire — or worse, into a result.
+    Outranking them unwinds the nested engine at once. That is NOT what makes the outcome survive,
+    though: pytest's call wrapper and the measurement's own worker both catch ``BaseException``, so
+    the status travels on :attr:`JoinedWorker.refusal`, written BEFORE this is raised
+    (:func:`mark_refusal`). Swallowing the exception cannot unwrite the record.
+    """
+
+    def __init__(self, code: str, owner_tid: int) -> None:
+        super().__init__(f"{code} (owner_tid={owner_tid})")
+        self.code = code
+        self.owner_tid = owner_tid
+
+
+class WorkerLost(BaseException):
+    """A :class:`JoinedWorker`'s thread ended before it signalled its start (W#29).
+
+    ``Thread.start()`` waits on ``_started`` with no timeout. A bootstrap that ends before setting it,
+    because an exception was raised into it before its first line ran, leaves that wait unbounded. It
+    was measured on the whole-codebase CI run: two runs sat 180 minutes each at the same
+    ``_run_test_with_timeout`` start, with no other thread alive. It was then reproduced on Linux
+    CPython 3.14 under a diagnostic (2026-10-25). The thread is gone, so the test it was to run never
+    ran: no kill, no pass. And the process that ended it is not one to keep measuring in.
+    :meth:`JoinedWorker.start` raises this instead of waiting, so every starter names it.
+
+    A ``BaseException``, like :class:`Abandoned` and :class:`MeasurementRefused`, so that no broad
+    ``except Exception`` between a start and its handler can turn a lost worker into a result.
+    """
+
+    code = "worker_lost"
+
+    def __init__(self, thread: threading.Thread) -> None:
+        super().__init__(
+            f"worker_lost: {thread.name} ended before it signalled its start"
+        )
+        self.thread_name = thread.name
+
+
+# How often a start's wait re-checks whether the thread has already ended. A healthy start returns
+# the moment `_started` is set, so the slice costs nothing unless the bootstrap died.
+_START_SLICE_S = 0.05
+
+
+def _run_is_over(thread: threading.Thread, entry_released: list[object]) -> bool:
+    """Whether ``thread``'s OS-level run has ended (W#29).
+
+    On 3.13+ the thread's own handle says so: CPython's thread runner notifies it as the very last
+    thing it does, whatever ended the run. 3.12 has no handle, so there the signal is the release of
+    the entry callable CPython's bootstate held: a bound method, which no traceback frame references,
+    so a hook that keeps the dead bootstrap's exception (pytest's unraisable plugin does) cannot
+    withhold the release.
+    """
+    handle = getattr(thread, "_os_thread_handle", None) or getattr(
+        thread, "_handle", None
+    )
+    if handle is not None:
+        return bool(handle.is_done())
+    return bool(entry_released)
+
+
+def _forget_unstarted(thread: threading.Thread) -> None:
+    """Take a thread whose bootstrap died out of ``threading._limbo`` (W#29).
+
+    ``Thread.start()`` put it there, and only its bootstrap would have taken it out. Left behind,
+    ``threading.enumerate()`` would list a dead thread forever, and every later trace would read
+    ``incomplete_thread``. One ``dict.pop``, which completes before the next bytecode boundary, so
+    no lock is taken that an injected exception could strand (the module docstring's STRANDED LOCK).
+    """
+    vars(threading)["_limbo"].pop(thread, None)
+
+
+class JoinedWorker(threading.Thread):
+    """A worker its starter waits on under a bounded join — the start/join edge, recorded (#28).
+
+    ``starter`` is the thread that constructed it, which in every site that uses this class is the
+    thread that starts it and then waits in :func:`bounded_join` for it. ``refusal`` is the side
+    channel :func:`mark_refusal` writes: empty until something this worker ran was refused, then the
+    refusal's code. The starter reads it after the join, where neither pytest's exception capture nor
+    the worker's own ``except BaseException`` can have erased it.
+
+    :meth:`start` never waits forever on a bootstrap that died: it raises :class:`WorkerLost` (W#29).
+    """
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self.starter = threading.current_thread()
+        self.refusal = ""
+        self._boot_released: list[object] = []
+        self._boot_ref: weakref.ref | None = None
+
+    def start(self) -> None:
+        """``Thread.start()``, except that a bootstrap which ended before it signalled raises
+        :class:`WorkerLost` instead of leaving the start waiting forever (W#29).
+
+        The end is OBSERVED, not timed (`_run_is_over`). On 3.13+ it is the thread's own handle. On
+        3.12 it is the release of the entry callable, recorded by a weakref whose callback is the
+        C-level ``list.append``, so no Python code runs in the dying thread to record it.
+
+        The entry is the bound ``self._bootstrap`` that ``Thread.start()`` would read anyway, held on
+        the instance for that one read so its release can be watched. A bound method is C-level: it
+        leaves no frame in a dead bootstrap's traceback, so a hook that keeps that exception (pytest's
+        unraisable plugin does) keeps no reference to it. The instance's reference is dropped before
+        the wait polls, so CPython's bootstate is the only holder left.
+
+        ``Thread.start()`` ends in ``self._started.wait()``. Shadowing that one bound method on the
+        instance turns the unbounded wait into slices that check between them. Both shadows are removed
+        before this returns, and a start that succeeds returns exactly as ``Thread.start()`` does.
+        """
+        started = self._started
+        wait = started.wait
+        entry = self._bootstrap
+        self._boot_ref = weakref.ref(entry, self._boot_released.append)
+        vars(self)["_bootstrap"] = entry
+        del entry
+
+        def _wait(
+            *_unbounded: object,
+        ) -> bool:  # Thread.start() calls it with no timeout
+            vars(self).pop("_bootstrap", None)  # the C starter holds the entry now
+            while not wait(_START_SLICE_S):
+                if _run_is_over(self, self._boot_released) and not started.is_set():
+                    _forget_unstarted(self)
+                    raise WorkerLost(self)
+            return True
+
+        started.wait = _wait  # type: ignore[method-assign]
+        try:
+            super().start()
+        finally:
+            del started.wait
+            vars(self).pop("_bootstrap", None)
+
+
+def starter_chain() -> tuple[int, ...]:
+    """Idents of the live threads waiting, through bounded joins, on the CURRENT thread — nearest first.
+
+    Empty for any thread that is not a :class:`JoinedWorker` (the main thread, a thread the code
+    under test started), which is the common case and costs one ``isinstance``. The walk stops at the
+    first starter that is no longer alive: a dead thread waits on nothing, and its ident may already
+    belong to an unrelated thread, so naming it would forge an edge. Bounded by a seen-set as well,
+    because a chain is only acyclic by construction and this must terminate even if constructed wrong.
+    """
+    chain: list[int] = []
+    seen: set[int] = set()
+    current = threading.current_thread()
+    while isinstance(current, JoinedWorker) and id(current) not in seen:
+        seen.add(id(current))
+        starter = current.starter
+        if starter.ident is None or not starter.is_alive():
+            break
+        chain.append(starter.ident)
+        current = starter
+    return tuple(chain)
+
+
+def mark_refusal(code: str, owner_tid: int) -> None:
+    """Record ``code`` on every :class:`JoinedWorker` from the current thread up to — not including —
+    the thread ``owner_tid`` names (#28).
+
+    Every level below the owner learns it, because each is a measurement whose result now contains a
+    refused nested measurement; the owner's own measurement is the one the refusal protects, and a
+    worker ABOVE it was never part of the cycle. The first code recorded on a worker is kept.
+    """
+    seen: set[int] = set()
+    current = threading.current_thread()
+    while (
+        isinstance(current, JoinedWorker)
+        and current.ident != owner_tid
+        and id(current) not in seen
+    ):
+        seen.add(id(current))
+        if not current.refusal:
+            current.refusal = code
+        current = current.starter
 
 
 # How long to let an injected thread unwind before conceding it is blocked outside the interpreter.
@@ -112,3 +322,37 @@ def bounded_join(
                 thread.join(timeout=unwind_s)
                 contained = not thread.is_alive()
     return timed_out, contained
+
+
+def acquire_unstranded(lock: Any, timeout: float = -1) -> bool:
+    """Take an RLock so that an injected :class:`Abandoned` cannot strand it (W#29). The caller
+    writes ``try: … finally: lock.release()`` on the next line, never ``with lock:``.
+
+    MEASURED 2026-10-25: Wesker's whole-codebase CI run sat silent for six hours on 10 pushes of
+    10. Its all-thread dump showed exactly two threads, both parked acquiring the monitoring
+    broker's lock. An RLock never blocks its own owner, so neither thread held it: the owner was
+    a test's runaway thread, abandoned while it was taking that lock, and by then dead (the
+    module docstring's STRANDED LOCK). On a deterministic harness (lock contended, injection made
+    while the taker waits, lock then handed over), ``with lock:`` strands 50/50 on 3.14 and 0/50
+    on 3.12 and 3.13. A ``@contextmanager`` strands 40/40 on all three. This function strands
+    0/40 on all three.
+
+    THE CLOSE: the acquire runs INSIDE the ``try``, so an exception raised at the check after it
+    returns lands in the handler, which undoes exactly this acquire. The test is the recursion
+    DEPTH, not ``_is_owned``: a re-entrant entry already owns the lock, so only the depth says
+    whether this acquire took (``_recursion_count`` is on the C RLock in every supported version;
+    ``test_rlock_recursion_count_still_reports_depth`` fails loudly if CPython drops it).
+    Returning here and then entering the caller's ``try`` passes no eval-breaker check, so
+    nothing can land between the two.
+
+    One injection per thread is the model ``abandon`` provides. A second asynchronous exception
+    arriving inside the handler itself could still strand the lock; nothing in the pair sends
+    one.
+    """
+    depth = lock._recursion_count()
+    try:
+        return lock.acquire(timeout=timeout)
+    except BaseException:
+        if lock._recursion_count() > depth:
+            lock.release()
+        raise

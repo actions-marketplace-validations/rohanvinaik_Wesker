@@ -70,7 +70,7 @@ def main(argv: list[str] | None = None) -> int:
         help="Minimum kill rate %% (exit 1 if below)",
     )
     parser.add_argument(
-        "--budget", type=float, default=10000, help="Per-file budget in ms"
+        "--budget", type=float, default=10000, help="Budget per function, in ms"
     )
     parser.add_argument(
         "--max-per-category",
@@ -85,6 +85,17 @@ def main(argv: list[str] | None = None) -> int:
         default=1,
         help="Convergence passes (extra passes deepen within covered dimensions)",
     )
+    parser.add_argument(
+        "--isolated",
+        action="store_true",
+        help="Run mutant evaluation in isolated worker subprocesses with memory boundaries (#45)",
+    )
+    parser.add_argument(
+        "--mem-limit-mb",
+        type=int,
+        default=512,
+        help="Memory limit in MB for isolated workers (default: 512)",
+    )
     parser.add_argument("--exclude", nargs="*", default=[], help="Files to exclude")
     parser.add_argument("--quiet", action="store_true", help="Minimal output")
     parser.add_argument(
@@ -93,6 +104,8 @@ def main(argv: list[str] | None = None) -> int:
         help="delete regeneratable .wesker/ cruft from old runs and exit",
     )
     args = parser.parse_args(argv)
+    if args.mem_limit_mb <= 0:
+        parser.error("--mem-limit-mb must be a positive integer")
 
     if args.purge:
         from Wesker.memory_guard import purge_caches
@@ -122,14 +135,22 @@ def main(argv: list[str] | None = None) -> int:
 
     # Run mutation profiling — pytest judges every mutant (real fixtures, conftest,
     # parametrization), so the kill rate is a standards-compliant mutation score.
-    result = profile_codebase_live(
-        ".",
-        files,
-        budget_ms_per_file=args.budget,
-        max_per_category=args.max_per_category,
-        passes=args.passes,
-        verbose=not args.quiet and not args.json_output,
-    )
+    from Wesker.action import worker_lost_reason, worker_lost_types
+
+    try:
+        result = profile_codebase_live(
+            ".",
+            files,
+            budget_ms_per_file=args.budget,
+            max_per_category=args.max_per_category,
+            passes=args.passes,
+            verbose=not args.quiet and not args.json_output,
+            isolated=args.isolated,
+            worker_mem_limit_mb=args.mem_limit_mb,
+        )
+    except worker_lost_types() as lost:  # W#29: named, never a traceback
+        print(f"WESKER REFUSED TO REPORT: {worker_lost_reason(lost)}", file=sys.stderr)
+        return 1
     execution_mode = "pytest-live"
     if result is None:
         # Degrade only OUT LOUD, and on stderr so it survives --json-output being
@@ -149,6 +170,8 @@ def main(argv: list[str] | None = None) -> int:
             max_per_category=args.max_per_category,
             passes=args.passes,
             verbose=not args.quiet and not args.json_output,
+            isolated=args.isolated,
+            worker_mem_limit_mb=args.mem_limit_mb,
         )
     result["execution_mode"] = execution_mode
 
@@ -171,6 +194,14 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps(output, indent=2))
     else:
         if not args.quiet:
+            # A cut or no-verdict function's mutants are missing from both sides of the ratio
+            # below. Say so before the number, in the renderer `Wesker.metrics` shares (W#51):
+            # this summary used to print the bare kill rate and exit 0 with the cause unnamed.
+            from Wesker.ci import completeness_warnings
+
+            warnings = completeness_warnings(result)
+            if warnings:
+                print(warnings, file=sys.stderr)
             print(f"\n{'─' * 50}")
             print(
                 f"Kill rate: {result['kill_pct']}% ({result['total_killed']}/{result['total_mutants']})"
@@ -200,7 +231,8 @@ def main(argv: list[str] | None = None) -> int:
             from Wesker.memory_guard import telemetry
 
             print(f"[{telemetry()}]")
-        except Exception:  # noqa: BLE001 — telemetry is advisory
+        # BLE001/S110: telemetry is advisory; a footer that fails is simply not printed
+        except Exception:  # noqa: BLE001, S110
             pass
 
     # Threshold gate

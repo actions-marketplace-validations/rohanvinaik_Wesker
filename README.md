@@ -3,10 +3,15 @@
 **Mutation testing that counts the behavioral questions your tests leave open — one mutant per question, not the forty ways to ask it.**
 
 <p align="center">
-  <a href="https://github.com/rohanvinaik/Wesker/actions/workflows/ci.yml"><img src="https://github.com/rohanvinaik/Wesker/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
-  <a href="https://sonarcloud.io/summary/new_code?id=rohanvinaik_Wesker"><img src="https://sonarcloud.io/api/project_badges/measure?project=rohanvinaik_Wesker&amp;metric=alert_status" alt="Quality Gate"></a>
-  <a href="https://opensource.org/licenses/MIT"><img src="https://img.shields.io/badge/License-MIT-3367d6.svg" alt="License: MIT"></a>
-  <a href="https://www.python.org/downloads/"><img src="https://img.shields.io/badge/python-3.10+-3367d6.svg" alt="Python 3.10+"></a>
+  <a href="https://pypi.org/project/Wesker/"><img src="https://img.shields.io/pypi/v/Wesker?style=flat-square&amp;logo=pypi&amp;logoColor=white&amp;color=3776ab" alt="PyPI version"></a>
+  <a href="https://github.com/rohanvinaik/Wesker/releases/latest"><img src="https://img.shields.io/github/v/release/rohanvinaik/Wesker?style=flat-square&amp;logo=github&amp;label=release" alt="Latest GitHub release"></a>
+  <a href="https://www.python.org/downloads/"><img src="https://img.shields.io/badge/Python-3.12%2B-3776ab?style=flat-square&amp;logo=python&amp;logoColor=white" alt="Python 3.12+"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/github/license/rohanvinaik/Wesker?style=flat-square&amp;color=5b6abf" alt="License: MIT"></a>
+  <br>
+  <a href="https://github.com/rohanvinaik/Wesker/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/rohanvinaik/Wesker/ci.yml?branch=main&amp;style=flat-square&amp;logo=githubactions&amp;logoColor=white&amp;label=CI" alt="CI status"></a>
+  <a href="https://github.com/rohanvinaik/Wesker/actions/workflows/codeql.yml"><img src="https://img.shields.io/github/actions/workflow/status/rohanvinaik/Wesker/codeql.yml?branch=main&amp;style=flat-square&amp;logo=github&amp;label=CodeQL" alt="CodeQL status"></a>
+  <a href="https://sonarcloud.io/summary/new_code?id=rohanvinaik_Wesker"><img src="https://sonarcloud.io/api/project_badges/measure?project=rohanvinaik_Wesker&amp;metric=alert_status" alt="Sonar quality gate"></a>
+  <a href="https://docs.astral.sh/ruff/"><img src="https://img.shields.io/badge/code%20style-Ruff-d7ff64?style=flat-square&amp;logo=ruff&amp;logoColor=d7ff64&amp;labelColor=261230" alt="Code style: Ruff"></a>
 </p>
 
 `10 semantic categories · 1.00 mutants per behavioral dimension · Zero dependencies · Fully deterministic`
@@ -34,7 +39,7 @@ Mutation testing measures what your tests actually pin down. Change the code, se
 
 The other half is the denominator, and it is an artifact. Enumerate every change an operator can express and you count one gap many times over. An unconstrained return value can be phrased forty ways, so you get forty survivors for a single fact. The number that comes out is not weighted by your code. It is weighted by the operator's enumeration. Worse, most of the universe is one fact restated: of mutmut's 8,657 mutants on Detective, **4,212 (49%) sit in code with no test at all** — "this is untested," reported four thousand times. Neither the repetition nor the untested count is a property of your code.
 
-Wesker counts the questions instead of the phrasings. A function has some number of *behavioral dimensions* — places where its behavior could genuinely differ — and that is the real denominator. Exhaustive mode is the ceiling: every mutant, **2.04 per question**. DOF mode is the claim: **2,795 mutants for 2,795 questions, 1.00.** One mutant per dimension, on a real repository, and it was not tuned toward — the cover sets here are singletons, so greedy selection is *exactly* optimal rather than the 1−1/e that bounds the general case. It costs nothing to trust: DOF reproduces the exhaustive verdict with **98.26% agreement and zero false "specified" claims**, and where it differs it *under*-claims. Run `--complete` and the ceiling comes back unchanged — not a fallback, a receipt.
+Wesker counts the questions instead of the phrasings. A function has some number of *behavioral dimensions* — places where its behavior could genuinely differ — and that is the real denominator. Exhaustive mode is the ceiling: every mutant, **2.04 per question**. DOF mode is the claim: **2,795 mutants for 2,795 questions, 1.00.** One mutant per dimension, on a real repository, and it was not tuned toward — the cover sets here are singletons, so greedy selection is *exactly* optimal rather than the 1−1/e that bounds the general case. It costs nothing to trust: DOF reproduces the exhaustive verdict with **98.26% agreement and zero false "specified" claims**, and where it differs it *under*-claims. Run with `--max-per-category 0` and the ceiling comes back unchanged — not a fallback, a receipt.
 
 ---
 
@@ -67,7 +72,7 @@ The cost drops multiplicatively across three layers, and no information is lost 
 
 **Layer 1 · In-process AST mutation.** Traditional tools spawn a subprocess per mutant, rewrite source on disk, and shell out to the runner — roughly 400 ms of overhead before a single test runs. Wesker compiles mutant ASTs in memory, patches them into a sandboxed namespace through the test's `__globals__`, and evaluates in-process: no subprocess, no disk I/O. The mutated function is compiled from the same AST a file-rewriting tool would produce and judged by the same assertion — the execution path differs, the observable semantics do not. This is the **meta-mutant dispatch** pattern validated by mutest-rs (Lévai & McMinn, ICST 2023) and mu2 (Vikram & Padhye, ISSTA 2023).
 
-**Layer 2 · Categorical exclusion — the Monty Hall filter.** Before generating a single mutant, Wesker walks the AST and asks which categories even *have* a target. No comparison operators → no BOUNDARY mutant can exist; no `self.x = …` → no STATE; fewer than two call arguments → no SWAP. This is not sampling. It is elimination of structural impossibilities, and skipping an absent category loses exactly nothing. A typical function has 3–4 applicable categories out of 9, cutting the space 40–60% before any test runs.
+**Layer 2 · Categorical exclusion — the Monty Hall filter.** Before generating a single mutant, Wesker walks the AST and asks which categories even *have* a target. No comparison operators → no BOUNDARY mutant can exist; no `self.x = …` → no STATE; fewer than two call arguments → no SWAP. This is not sampling. It is elimination of structural impossibilities, and skipping an absent category loses exactly nothing. A typical function has 3–4 applicable categories out of 10, cutting the space 40–60% before any test runs.
 
 **Layer 3 · Targeted test discovery.** A test that neither imports, references, nor transitively calls the mutated function cannot detect the mutation; running it is pure waste. Wesker resolves covering tests in three tiers — convention (`src/query.py` → `tests/test_query.py`), then static AST impact, then full fallback only if the first two find nothing — so each mutant runs against 3–15 tests rather than the whole suite. This is the one comparison with nothing confounded: `scope_tests=False` *is* classical mutation testing, and it was Wesker's own default until these numbers were taken.
 
@@ -112,7 +117,7 @@ The reduction is in redundancy, not in rigour. Wesker does not test fewer things
 
 ## Equivalent mutants, and MC/DC
 
-Some mutants are *semantically equivalent* — no input distinguishes them from the original — and they inflate the denominator and make a score look worse than it is. When a mutant survives, Wesker compiles both versions, runs them on synthesized boundary inputs (`0, 1, -1, 0.5, boundary ± 1`), and compares outputs. If every input agrees, the mutant is **likely equivalent** — no test *can* kill it — and it is reported separately and removed from the effective rate:
+Some mutants are *semantically equivalent* — no input distinguishes them from the original — and they inflate the denominator and make a score look worse than it is. When a mutant survives, Wesker compiles both versions, runs them on a fixed set of inputs (`0, 1, -1, 2, -2`, `0.0, 1.0, -1.0, 0.5`, `True`, `False`), and compares outputs. Methods are skipped: there is no receiver to synthesize. If every input agrees, the mutant is **likely equivalent** — no test *can* kill it — and it is reported separately and removed from the effective rate:
 
 $$\text{effective kill rate} \;=\; \frac{\text{killed}}{\text{tested} - \text{equivalent}}.$$
 
@@ -131,12 +136,12 @@ wesker src/                    # profile a directory
 wesker src/ --threshold 90     # fail CI below 90%
 ```
 
-Zero dependencies beyond the standard library and your test framework. Python 3.10+. As a GitHub Action, one step, and survivors land on the diff as code-scanning alerts:
+Zero dependencies beyond the standard library and your test framework. Python 3.12+. As a GitHub Action, one step, and survivors land on the diff as code-scanning alerts:
 
 ```yaml
 - uses: actions/checkout@v4
   with: {fetch-depth: 0}
-- uses: rohanvinaik/Wesker@v0.7.1
+- uses: rohanvinaik/Wesker@v1.2.2
   with:
     base-ref: ${{ github.event.pull_request.base.sha }}
     sarif: .wesker/wesker.sarif
@@ -144,7 +149,7 @@ Zero dependencies beyond the standard library and your test framework. Python 3.
   with: {sarif_file: .wesker/wesker.sarif, category: wesker}
 ```
 
-It requires pytest and a suite that passes on unmutated code, and it fails loudly rather than publish a number it cannot stand behind — a non-pytest runner, a suite broken before any mutant exists, or a budget-truncated run each fail with the diagnosis and the fix.
+The Action requires pytest and a suite that passes on unmutated code, and it fails loudly rather than publish a number it cannot stand behind — a non-pytest runner, a suite broken before any mutant exists, or a budget-truncated run each fail with the diagnosis and the fix.
 
 By default Wesker samples, and three things keep that honest. The universe is always computable: `estimate_universe_size()` counts every possible target by walking the AST, with no generation and no execution, so `82/82 [82/173]` means 82 tested and killed out of a 173-mutant universe — you always know how much of the space you covered. Multi-pass convergence deepens rather than re-rolls: each pass takes the next window of the greedy order, so N passes test N × `max_per_category` *unique* mutants per category, not a fresh random subset. And category order comes from predictive priors — each run writes per-category survival rates to `.wesker/mutation_report.json`, and the next run tests the historically weak categories first. Set `max_per_category = 0` and the budget disappears: every mutant, identical to classical mutation testing.
 
