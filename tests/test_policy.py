@@ -56,7 +56,21 @@ from Wesker.policy import (
 # Detective #105: the same policy-9 universe; each test run against a mutant writes only inside its
 # write authority, and a prevented write is the unscored outcome write_outside_authority, never a kill
 # (categories and counts verified unchanged: GOLDEN_FINGERPRINT holds).
-GOLDEN_POLICY_ID = "9.261d14e34119"
+# Wesker #55: the same policy-9 universe; every evaluation receives the test's arguments as authored
+# (fresh copies, either mode), and a failure the ORIGINAL reproduces in the same process state is the
+# unscored outcome original_also_fails, never a kill (categories and counts verified unchanged:
+# GOLDEN_FINGERPRINT holds). One-sign id 9.261d14e34119 -> 9.415d3755221e -> 9.008828e5f6a9 (the copy is
+# a measured precondition: an argument the original fails on as a copy stays shared).
+# Wesker #27: the same policy-9 universe; the liveness wall is a compute budget stretched by the
+# machine's calibrated slowdown and a fired wall is retried once (counts verified unchanged:
+# GOLDEN_FINGERPRINT holds). 9.008828e5f6a9 -> 9.10f8e602bf48.
+# Wesker #45: the same policy-9 universe; in an isolated run a mutant the worker's address-space cap
+# stops is the unscored outcome memory_cut, never a kill, survivor or equivalent (counts verified
+# unchanged: GOLDEN_FINGERPRINT holds). 9.10f8e602bf48 -> 9.5d2c6bafc8ae.
+# Wesker #29: the same policy-9 universe; the memory_cut clause now covers an in-process run, whose
+# mutant is capped by the growth the run's memory budget allows (counts verified unchanged:
+# GOLDEN_FINGERPRINT holds). 9.5d2c6bafc8ae -> 9.a5aeead0de4f.
+GOLDEN_POLICY_ID = "9.a5aeead0de4f"
 
 # The same fact, readable: the engine's target counts over the fingerprint
 # corpus. A failure here names the category and function that moved.
@@ -107,7 +121,13 @@ GOLDEN_FINGERPRINT = {
 # one-sign id is unchanged. Two-sign id: 9+neg.aaff90df3dbf -> 9+neg.e273b30c9a36 (Form A's Fork 2
 # table enters the manifest) -> 9+neg.8144c37b1638 (Form B and the unbuilt catalog) ->
 # 9+neg.f5a15364c11d (integrated with W#27's loop budget and #105's write authority, both
-# observation texts the one-sign golden records).
+# observation texts the one-sign golden records) -> 9+neg.001902a9950c (W#55's fresh-argument and
+# original-control observation text) -> 9+neg.89326e7f549c (W#49: the stale wrapper's memory ends at
+# a test boundary; the one-sign id is unchanged by it). The identity-sensitivity rule above then moved
+# both ids: two-sign 9+neg.89326e7f549c -> 9+neg.1a13fddd1d5f. W#27's liveness-bound clause then
+# moved both again: two-sign 9+neg.1a13fddd1d5f -> 9+neg.de8c78c57407. W#45's memory_cut clause moved
+# both once more: two-sign 9+neg.de8c78c57407 -> 9+neg.fec711a421e9. W#29's in-process memory_cut
+# clause moved both again: two-sign 9+neg.fec711a421e9 -> 9+neg.6035bc2f613d.
 GOLDEN_TWO_SIGN_OUTPUT = {
     "fp_annotations": 4,
     "fp_value": 3,

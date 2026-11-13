@@ -7,6 +7,12 @@
     "refusal": "",
     "standing": "ungateable"
   },
+  "Wesker/action.py::progress_gap_notice": {
+    "cut_reasons": [],
+    "function_digest": "56642bbc2f8daf23",
+    "refusal": "",
+    "standing": "complete"
+  },
   "Wesker/action.py::stack_dump_owner": {
     "cut_reasons": [],
     "function_digest": "4e082b208c38cfa2",
@@ -34,6 +40,24 @@
     "function_digest": "13c8098d2a47b147",
     "refusal": "",
     "standing": "ungateable"
+  },
+  "Wesker/ci.py::harness_dispositions": {
+    "cut_reasons": [],
+    "function_digest": "edf0ee970660a110",
+    "refusal": "",
+    "standing": "complete"
+  },
+  "Wesker/ci.py::harness_standing": {
+    "cut_reasons": [],
+    "function_digest": "f17c550891479557",
+    "refusal": "",
+    "standing": "complete"
+  },
+  "Wesker/ci.py::memory_rollup_standing": {
+    "cut_reasons": [],
+    "function_digest": "d3371dc4da9fd5cc",
+    "refusal": "",
+    "standing": "complete"
   },
   "Wesker/ci.py::truncation_cause": {
     "cut_reasons": [],
@@ -89,15 +113,39 @@
     "refusal": "",
     "standing": "complete"
   },
+  "Wesker/engine.py::equivalence_probe_standing": {
+    "cut_reasons": [],
+    "function_digest": "43e4d4bc55bbbb92",
+    "refusal": "",
+    "standing": "complete"
+  },
   "Wesker/engine.py::execution_lock_disposition": {
     "cut_reasons": [],
     "function_digest": "30afa2daf0abb2dc",
     "refusal": "",
     "standing": "complete"
   },
+  "Wesker/engine.py::first_refusal": {
+    "cut_reasons": [],
+    "function_digest": "ac8696a991464e24",
+    "refusal": "",
+    "standing": "complete"
+  },
   "Wesker/engine.py::form_b_output_modes": {
     "cut_reasons": [],
     "function_digest": "9e4ee52bb7aa38eb",
+    "refusal": "",
+    "standing": "complete"
+  },
+  "Wesker/engine.py::kill_relation_standing": {
+    "cut_reasons": [],
+    "function_digest": "dcb32fb013f7a351",
+    "refusal": "",
+    "standing": "complete"
+  },
+  "Wesker/engine.py::killer_scan_standing": {
+    "cut_reasons": [],
+    "function_digest": "6e69153f82462c4c",
     "refusal": "",
     "standing": "complete"
   },
@@ -131,14 +179,80 @@
     "refusal": "",
     "standing": "complete"
   },
+  "Wesker/engine.py::original_control_standing": {
+    "cut_reasons": [],
+    "function_digest": "d8751347fc91b3cd",
+    "refusal": "",
+    "standing": "complete"
+  },
+  "Wesker/engine.py::stronger_kill_reason": {
+    "cut_reasons": [],
+    "function_digest": "d3e0e6fbcfe39284",
+    "refusal": "",
+    "standing": "complete"
+  },
+  "Wesker/engine.py::survivor_reach": {
+    "cut_reasons": [],
+    "function_digest": "160fe760fd254bb7",
+    "refusal": "",
+    "standing": "complete"
+  },
+  "Wesker/interrupt.py::abandoned_worker_standing": {
+    "cut_reasons": [],
+    "function_digest": "ab396a2dc6f25ad2",
+    "refusal": "",
+    "standing": "complete"
+  },
+  "Wesker/interrupt.py::child_wait_disposition": {
+    "cut_reasons": [],
+    "function_digest": "d79a4471e8914ea1",
+    "refusal": "",
+    "standing": "complete"
+  },
+  "Wesker/interrupt.py::process_tree_members": {
+    "cut_reasons": [],
+    "function_digest": "81c19977c758ec2d",
+    "refusal": "",
+    "standing": "complete"
+  },
+  "Wesker/isolation.py::decided_kill_reason": {
+    "cut_reasons": [],
+    "function_digest": "83ad56c5fd007309",
+    "refusal": "",
+    "standing": "complete"
+  },
   "Wesker/isolation.py::isolated_test_selection": {
     "function_digest": "cd8a3be413a6f79c",
+    "refusal": "",
+    "standing": "complete"
+  },
+  "Wesker/isolation.py::mutant_verdict": {
+    "cut_reasons": [],
+    "function_digest": "d1dd1fb2e1c7c5f9",
+    "refusal": "",
+    "standing": "complete"
+  },
+  "Wesker/memory_guard.py::speculative_address_cap": {
+    "cut_reasons": [],
+    "function_digest": "27c6be4e5615cca0",
     "refusal": "",
     "standing": "complete"
   },
   "Wesker/monitoring.py::armed_wall_ms": {
     "cut_reasons": [],
     "function_digest": "0ca1ab470c6af077",
+    "refusal": "",
+    "standing": "complete"
+  },
+  "Wesker/monitoring.py::liveness_action": {
+    "cut_reasons": [],
+    "function_digest": "84fc865c2278550c",
+    "refusal": "",
+    "standing": "complete"
+  },
+  "Wesker/monitoring.py::liveness_bound_ms": {
+    "cut_reasons": [],
+    "function_digest": "bcb96cc362858980",
     "refusal": "",
     "standing": "complete"
   },
@@ -154,6 +268,12 @@
     "refusal": "",
     "standing": "complete"
   },
+  "Wesker/monitoring.py::parse_compute_budget": {
+    "cut_reasons": [],
+    "function_digest": "2a658bd95e062820",
+    "refusal": "",
+    "standing": "complete"
+  },
   "Wesker/monitoring.py::step_budget_verdict": {
     "cut_reasons": [],
     "function_digest": "d8eca6039415c200",
@@ -163,6 +283,12 @@
   "Wesker/monitoring.py::step_cap": {
     "cut_reasons": [],
     "function_digest": "dc7a6a6011901325",
+    "refusal": "",
+    "standing": "complete"
+  },
+  "Wesker/mu_minus.py::stale_memory_standing": {
+    "cut_reasons": [],
+    "function_digest": "e81250c3a37f1447",
     "refusal": "",
     "standing": "complete"
   },
@@ -179,6 +305,18 @@
     "function_digest": "17bc0412de23ec64",
     "refusal": "",
     "standing": "ungateable"
+  },
+  "Wesker/pytest_runner.py::argument_copy_standing": {
+    "cut_reasons": [],
+    "function_digest": "cd396b9cba9b8522",
+    "refusal": "",
+    "standing": "complete"
+  },
+  "Wesker/pytest_runner.py::identity_standing": {
+    "cut_reasons": [],
+    "function_digest": "5120433401083802",
+    "refusal": "",
+    "standing": "complete"
   },
   "Wesker/swap_plan.py::swap_label": {
     "cut_reasons": [],
@@ -200,7 +338,7 @@
   },
   "Wesker/trace_evidence.py::baseline_outcome": {
     "cut_reasons": [],
-    "function_digest": "28d9a5d957d25eac",
+    "function_digest": "2deeebaca5e7a884",
     "refusal": "",
     "standing": "complete"
   },
@@ -210,9 +348,15 @@
     "refusal": "",
     "standing": "complete"
   },
+  "Wesker/trace_evidence.py::reach_qualification": {
+    "cut_reasons": [],
+    "function_digest": "15f7c1d619df3a34",
+    "refusal": "",
+    "standing": "complete"
+  },
   "Wesker/trace_evidence.py::trace_admissibility": {
     "cut_reasons": [],
-    "function_digest": "5a0e2f360f570d34",
+    "function_digest": "a191fd360d39b892",
     "refusal": "",
     "standing": "complete"
   },

@@ -6,10 +6,94 @@ Notable changes, newest first. Dates are the commit dates.
 
 Development source after 1.2.2; no version or release is implied. The operator universe is unchanged —
 policy 8, the same categories and the same fingerprint counts — but the observation rule it declares
-changed twice, so the policy id moved twice.
+changed three times, so the policy id moved three times.
 
 ### Correctness
 
+- **A pytest failure after the measurement finished no longer throws the finished report away, and a
+  missing live session names its cause.** Shard 2/4 of the same run measured `ci.py` for 45 minutes,
+  printed every file's result, and refused with `execution mode is 'legacy-direct-call', not
+  'pytest-live'`. `run_in_session` returned None for any exception `pytest.main` raised, including one
+  raised after the measurement had returned (a `pytest_sessionfinish` hook that raises reproduces it:
+  `reason: pytest_crashed` with the report already computed), and the Action read None as "no live
+  session", the one sentence a project with an uncollectable suite also gets. `crash_standing` now decides
+  (`no_session`, `session_lost`, `result_kept`): a crash after the body keeps the result and the Action
+  prints a `::warning::` with the exception; the others stay a refusal. `no_live_session_reason` names the
+  cause of a missing session (the crash, the collection errors, an empty collection, a missing pytest);
+  `profile_codebase_live` takes a `diagnostic` dict to carry it. (W#29)
+- **A mutant that allocates without bound in the badge run is one mutant with no verdict, not a dead
+  runner.** Shard 4/4 of the same run was killed by the kernel (exit 137) evaluating a mutant in process:
+  only the isolated worker had an address-space cap, so the badge run, which is not `--isolated`, had none.
+  An in-process mutant may now grow the measuring process by the run's memory budget
+  (`WESKER_MEM_BUDGET_MB`, else RAM/8 clamped to 256 MB-2 GB; a non-positive budget opts out; a platform
+  that refuses `RLIMIT_AS` stays uncapped), and one that raises `MemoryError` under it, caught or not, is
+  the existing unscored `memory_cut`. Measured on a fixture whose mutant allocates 5 GB under an outer
+  6000 MB limit: peak 4809 MB before, 42 MB and `memory_cut` after. Policy id moves (the observation
+  clause now covers the in-process cap; the universe and `POLICY_VERSION` do not): one-sign
+  `9.5d2c6bafc8ae` -> `9.a5aeead0de4f`, two-sign `9+neg.fec711a421e9` -> `9+neg.6035bc2f613d`. (W#29)
+- **A trace whose observation failed makes that test's reach unknown, not the run's end, and a shard
+  that fails for any reason writes a record that names it.** Shard 1/4 of the first sharded `Specification
+  (full)` run (GitHub run 43315433429 on `8fcadfe`) died six minutes in on `MonitoringObservationFailed:
+  observation_inflight (subscription=4765)` out of the baseline trace, wrote no `shard_report.json`, and
+  the aggregation could say only `report_missing`. The cause is not a broker defect: a test that leaks a
+  thread which keeps running the traced file leaves deliveries in flight when the next trace is read, and
+  the tracer raised unless its own worker was uncontained (a 3-line fixture reproduces it on the first
+  pass). A failed observation is now that test's `reach: incomplete_observation` (new; it joins the other
+  causes with `+`, last): its lines stay as observed, what is missing is unknown, its trace is not
+  cached, and `observation_failure_standing` names where the failure lives (`observed`, `tolerated`,
+  `reach_unknown`, `refuse` for a caller that collects no reach). Separately, ANY exception that escapes
+  the measurement now writes the shard record with the new refusal `measurement_failed` (class, message,
+  innermost frame), so the merge states the cause. (W#29)
+- **A mutant over the memory cap is one mutant with no verdict, not a cut function, and its outcome no
+  longer depends on what ran before it.** Under `--isolated --mem-limit-mb` a mutant the cap stopped was
+  recorded `contained=False`, which the evaluation loops read as "a worker is still alive": the function
+  stopped after that one mutant (2 to 6 of 23 evaluated, 0.5 s of a 10 s budget spent), `--json` listed it
+  under `containment_lost`, the whole function was a `cut`, and which mutant came first decided how much
+  was measured (four runs of one command gave 10, 8, 7 and 8 mutants, one with an `equivalent`). It is now
+  the disposition `memory_cut`, beside `diverged` and `undetermined`: named in `unresolved_functions`
+  under its own remedy, unscored, never a kill, a survivor or an equivalent; the worker is replaced and
+  the function's other mutants are evaluated, so the function reads `profiled`. Three more defects were
+  behind the instability and are fixed with it: a worker kept after a cap was still full of what the
+  runaway allocated, so the NEXT mutants (`return None`) read as memory cuts; a `MemoryError` caught by the
+  code under test (`except Exception: return -1`) became an assertion KILL, so the cap manufactured kills
+  (the worker now watches for a raised `MemoryError`, caught or not); and category order within a function
+  followed set iteration order, so it changed with the process (ties now break by category name). The
+  truncation cause `memory` no longer exists: `truncation_cause` takes two arguments, and
+  `converged_coverage_depth` has no `memory_cut` parameter. Policy id moves (the observation clause names
+  the outcome; the universe and `POLICY_VERSION` do not): one-sign `9.10f8e602bf48` -> `9.5d2c6bafc8ae`,
+  two-sign `9+neg.de8c78c57407` -> `9+neg.fec711a421e9`. (W#45, W#39)
+- **The wall that bounds a mutant's liveness follows the machine, and a fired wall is retried once.**
+  The isolated per-mutant wall was a fixed `max(per_mutant_timeout_ms, 10 s)`, so work no loop budget
+  counts (a loop in a helper, a C builtin, another thread) read COMPLETE on a fast machine and
+  `undetermined` on a slow one. The bound is now a compute budget (10 reference seconds;
+  `WESKER_COMPUTE_BUDGET_S` sets it, and an invalid value is refused, not ignored) times this machine's
+  measured slowdown on a fixed reference workload, taken once per process (`monitoring.harness_slowdown`,
+  `liveness_bound_ms`, whose code names the deciding term). A bound that fires is retried once on a fresh
+  worker, with the machine measured again, and a second fire is `undetermined`. The unarmed in-process
+  allowance's floor and cap and the original's counted-run wall follow the same slowdown. Policy id moves
+  (the observation clause names the bound; the universe and `POLICY_VERSION` do not): one-sign
+  `9.008828e5f6a9` -> `9.10f8e602bf48`, two-sign `9+neg.1a13fddd1d5f` -> `9+neg.de8c78c57407`. (W#27)
+- **A trace row says when its reach is unknown, and what kind of non-pass a route cannot type.**
+  A test that reaches the target through a thread alive before it started (a pool warmed at import), or only
+  in a child process, used to read `reach=complete lines=()`: an admissible "reached nothing". Its
+  `TraceEvidence.reach` is now `incomplete_preexisting_thread` or `incomplete_subprocess` (causes join with
+  `+`, with `incomplete_thread`); the unobservable lines are never attributed and such a trace is never
+  cached. On the legacy direct-call route (no pytest phase) a non-pass that cannot be told apart (skip,
+  `xfail()`, setup error) or a callable carrying skip/xfail marks is the named outcome `untyped`, refused as
+  `refuse_untyped`, where it was typed `error` or, for an xfail-marked test, named a wrong expectation.
+  The `trace_evidence` docstring no longer claims same-line short-circuit operands stay apart. A failed
+  subscription setup whose rollback also fails no longer leaves its registration in the broker. Adds
+  fields and codes; no mutant's disposition changes and the policy id does not move. (W#17, W#32)
+- **One profile run can carry the per-test kill relation.** `run_function_profiling(full_matrix=True)`
+  runs every test that reaches a mutant and returns, per killed mutant, every test that kills it with that
+  test's own kill reason (`ProfilingResult.kill_relation`; `kill_relation_standing` says whether it is
+  whole, and is `not_requested` when it was not asked for), in both execution modes: in-process through
+  `evaluate_mutant`'s scan, isolated through a worker that no longer stops at the first value kill. The
+  #55 original control still voids a node the original also fails, and a loop budget, a wall bound or a
+  refused measurement is an unresolved cell, never a kill. It adds a field and changes no verdict: every
+  mutant's killed / survived / unscored disposition and `killed_by` are what they are with it off, so
+  the policy id does not move. Default off, because it runs tests a first-killer run skips. Detective
+  paid for this relation by profiling once per test (audit 0.9 s to 3.6 s). (Detective D#145)
 - **A test exception never selects a second invocation.** The unpatched fallback called
   `test_fn(mutated_func)` and, on any `TypeError`, called `test_fn()` again, so a body that changed
   state and raised could run twice and read as a survivor. The calling convention is now chosen by
@@ -21,9 +105,39 @@ changed twice, so the policy id moved twice.
   before its test ran. Binding now honours the advertised signature where the actual one also binds,
   and on 3.14 reads parameter shape without evaluating deferred annotations. (`3e98ad8`, W#47)
 
+- **A kill is a difference from the original on the same, authored input.** One isolated worker runs
+  every mutant in one process, and a module-level `parametrize` row is the same object for all of
+  them, so a mutant that wrote into its argument altered the row for every later mutant. Those later
+  failures counted as kills (a mutant identical to the original read "killed by assertion" and
+  Detective printed `✓ COMPLETE` over it), and in-process the altered row lost real crash kills.
+  Now, in both modes: (1) every evaluation, the original's and each mutant's, gets a fresh deep copy
+  of the test's parametrize values (direct, indirect and fixture params) from a snapshot taken before
+  any test body ran; an argument that cannot be copied stays shared and is named in the profile
+  (`shared_arguments`), and so is an item whose test passes on the authored objects but fails on a copy
+  (it depends on object identity: `identity_sensitive`), measured on the original's first failure;
+  (2) a test that fails under a mutant is re-run against the original in the
+  same process state, and a failure the original reproduces is the unscored outcome
+  `original_also_fails`, never a kill and never a survivor. Both modes read one decision,
+  `engine.original_control_standing`. The in-process control used to cover only the tests the mutant
+  could not be patched into; it now covers every failure. (W#55; Detective #127)
+- **A stale kill needs two calls in one test.** The stale wrapper (Form B `return_stale`) held the
+  previous call's return for the whole evaluation, across tests. Two tests that each call once, and
+  each pass alone, killed it together, the kill was credited to whichever ran second, and the verdict
+  depended on test order and on which subset ran. Def. 11.8 (i) says stale stands for an output that
+  is not a pure function of this call; a test detects it by calling twice and seeing two results. The
+  wrapper's memory now ends at every test boundary, in both modes: two calls with different results
+  in one test kill it by assertion and are credited to that test; two tests with one call each
+  survive, in either order. Detective's pins that write one test per `--input` therefore no longer
+  kill it; a pin must call the function twice in one test. (W#49)
+
 Policy id: `8.dcc355186875` → `8.68a525594c46` → `8.51a0c2a545b5`; two-sign
 `8+neg.671d835828bf` → `8+neg.40ae45e28e39` → `8+neg.8d34cddbefca`. Detective's verdict cache keys
 on the id, so rows recorded under an older observation rule are not reused.
+
+W#55 moves it again, on the policy-9 universe (categories and counts unchanged): `9.261d14e34119` →
+`9.415d3755221e` → `9.008828e5f6a9` (copies are a measured precondition, see above); two-sign
+`9+neg.f5a15364c11d` → `9+neg.001902a9950c` → `9+neg.89326e7f549c` (W#49) → `9+neg.1a13fddd1d5f`. Receipts and cached verdicts
+recorded under the old id are not reused. W#49 alone moves only the two-sign id: its rule is a two-sign Form B operator's, so the one-sign id and its receipts stand.
 
 ### The two-sign policy (μ⁻)
 
@@ -64,6 +178,16 @@ functions with a single input, where stale reads as candidate-equivalent.
   `spec-full.yml` sets it to 900, bounds the job at 180 minutes (liveness, never the measurement's
   budget) and lets a newer push supersede a running measurement. Every push of 2026-10-24 had run
   that job for six hours with no output after the file count. (`9362bc5`, W#29)
+- **The Action can measure a codebase as shards and merge them into the number one run would give.**
+  `python -m Wesker.action --plan-shards N` prints the matrix for the targets an unsharded run would
+  measure (a deterministic split by source size, no empty group); `--shard i/N` measures one group; every
+  run now writes `.wesker/shard_report.json` (its files, commit, policy id, Wesker version, shard
+  index/count, report, and the refusal it ended in, if any); `--merge --plan P reports...` sums the counts,
+  computes each percentage once, and refuses, naming the cause and publishing no number, for a missing
+  shard, disagreeing commit/policy/version, a file in two shards, a union that is not the plan, or any
+  shard's own refusal. `spec-full.yml` is now plan, a `fail-fast: false` measure matrix and an aggregate
+  job; the per-job limits, the stack dumps and the pinned actions are kept. Adds an action input `shard`;
+  no verdict and no policy id changes. (W#29, B1)
 
 ## 1.2.2 — 2026-10-24
 

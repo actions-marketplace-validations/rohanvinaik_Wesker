@@ -52,7 +52,12 @@ from .engine import (
     _ValueMutator,
     estimate_universe_size,
 )
-from .monitoring import STEP_BUDGET_FACTOR, STEP_BUDGET_FLOOR, STEP_PROBE_CAP
+from .monitoring import (
+    LIVENESS_BUDGET_S,
+    STEP_BUDGET_FACTOR,
+    STEP_BUDGET_FLOOR,
+    STEP_PROBE_CAP,
+)
 from .mu_minus import MU_MINUS_CATALOG
 from .swap_plan import SWAP_PAIR_BUDGET
 
@@ -391,7 +396,10 @@ def _categories(two_sign: bool = False) -> dict[str, dict[str, Any]]:
                 "in its types (Fork 2, output_mode_applies), and never raises there. "
                 "B — the target's own definition with Wesker.mu_minus.form_b(<mode>) "
                 "applied innermost, so every evaluator, the isolated worker included, "
-                "builds it from source."
+                "builds it from source. return_stale holds the previous call's return only "
+                "within one test: the memory ends at every test boundary, in either execution "
+                "mode, so a stale kill needs two calls in one test, is credited to that test, "
+                "and does not depend on test order or on which subset ran (Def. 11.8(i))."
             ),
         }
     return cats
@@ -461,7 +469,11 @@ def mutation_policy(two_sign: bool = False) -> MutationPolicy:
                 "nontermination; a budgeted observation's wall bound covers reaching its "
                 "cap inside the aggregate deadline and its time is never charged to the "
                 "mutant's allowance, so wall-clock bounds bound liveness only and yield "
-                "undetermined, never kills or survival evidence"
+                "undetermined, never kills or survival evidence; a liveness bound is a "
+                f"compute budget of {LIVENESS_BUDGET_S:g} reference seconds stretched by how "
+                "much slower the measuring machine runs a fixed reference workload, so one "
+                "function reaches one verdict on a slow machine as on a fast one, and a bound "
+                "that fires is retried once before the observation is named undetermined"
             ),
             (
                 "each test run against a mutant writes only inside its write authority — "
@@ -470,6 +482,26 @@ def mutation_policy(two_sign: bool = False) -> MutationPolicy:
                 "tree; a write outside it is prevented, and the observation is the unscored "
                 "outcome write_outside_authority — the guard's, never a kill or survival "
                 "evidence, while another test's kill of the same mutant still stands"
+            ),
+            (
+                "every evaluation, the original's and each mutant's, in either execution mode, "
+                "receives the test's arguments as the suite authored them: parametrize values "
+                "(direct, indirect and fixture params) are deep-copied from a snapshot taken "
+                "before any test body ran, and an argument stays shared, named, when it cannot be "
+                "copied or when the original passes on the authored objects and fails on the "
+                "copy (identity_sensitive); a kill is a difference from the original on the same input, so a "
+                "test that fails under a mutant is re-run against the original in the same "
+                "process state, and a failure the original reproduces is the unscored outcome "
+                "original_also_fails — never a kill and never survival evidence, while another "
+                "test's kill of the same mutant still stands"
+            ),
+            (
+                "in either execution mode a mutant that raises MemoryError under the "
+                "address-space cap (the isolated worker's, or in process the growth the run's "
+                "memory budget allows the measuring process), whoever catches it, is the "
+                "unscored outcome memory_cut — a stop by a budget, never a kill, survival "
+                "evidence or equivalence; it is one mutant without a verdict, so the isolated "
+                "worker is replaced and the function's other mutants are still evaluated"
             ),
             (
                 "survivors probe synthesized boundary inputs for likely equivalence "

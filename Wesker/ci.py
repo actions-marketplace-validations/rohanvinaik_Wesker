@@ -30,9 +30,11 @@ import unittest
 from collections.abc import Callable, Iterable
 from contextvars import ContextVar
 from pathlib import Path
-from typing import Any
+from typing import IO, Any
 
 from Wesker.engine import (
+    MEMORY_CUT,
+    ORIGINAL_ALSO_FAILS,
     run_function_converged,
 )
 from Wesker.filter import filter_categories, prioritize_categories
@@ -927,9 +929,22 @@ def callable_item_status(call: Any) -> str:
     right after the run it describes: the next run overwrites it. Any other callable shape — a plain
     function, a legacy closure — carries none and reads ``unobserved``, which leaves the engine's own
     run code to decide (``trace_evidence.baseline_outcome``).
+
+    ``marked`` (#17) is the one exception: a callable with no live status that carries pytest
+    ``skip`` / ``skipif`` / ``xfail`` marks. The route that produced it does not evaluate marks, so
+    running it says nothing about what pytest would have made of it, and the baseline types it
+    ``untyped`` rather than reading a clean return as a pass or a raise as a wrong expectation.
     """
     value = getattr(getattr(call, "__wesker_item_status__", None), "value", None)
-    return value if isinstance(value, str) else "unobserved"
+    if isinstance(value, str):
+        return value
+    marks = getattr(call, "pytestmark", None)
+    names = (
+        {getattr(m, "name", None) for m in marks} if isinstance(marks, list) else set()
+    )
+    if names & {"skip", "skipif", "xfail"}:
+        return "marked"
+    return "unobserved"
 
 
 def callable_base_name(call: Any) -> str:
@@ -1790,9 +1805,13 @@ def profile_codebase_live(
     project_root: str,
     targets: list[str],
     paths: list[str] | None = None,
+    diagnostic: dict[str, Any] | None = None,
     **kwargs: Any,
 ) -> dict | None:
     """:func:`profile_codebase`, executed inside a LIVE pytest session.
+
+    ``diagnostic`` (W#29) receives the reason when no report comes back (``run_in_session``'s
+    ``reason`` and ``detail``), so a caller refusing on ``None`` can name the cause.
 
     This is Wesker-as-a-mutation-tester: the whole profile runs within
     ``pytest_runtestloop``, so every mutant is judged by pytest itself — real
@@ -1834,6 +1853,7 @@ def profile_codebase_live(
         _profile_and_describe_suite,
         target_files=targets,
         paths=paths,
+        diagnostic=diagnostic,
     )
 
 
@@ -1888,19 +1908,18 @@ def is_truncated_measurement(coverage_depth: str, budget_exhausted: bool) -> boo
     return coverage_depth == "cut" or budget_exhausted
 
 
-def truncation_cause(
-    coverage_depth: str, budget_exhausted: bool, memory_standing: str
-) -> str:
+def truncation_cause(coverage_depth: str, budget_exhausted: bool) -> str:
     """WHY one function's profile was cut, named for the remedy it needs (pure).
 
     `is_truncated_measurement` answers whether a profile may be counted. A refusal built on that
     alone can say how many functions were cut but not what to do about them, and the remedies
-    differ — one of them is not a budget at all:
+    differ — one of them is not a budget at all. (A mutant the memory cap stopped is NOT a cause here
+    since W#45: it is one mutant with no verdict, named by `unresolved_causes` as `memory_cut`; the
+    function's other mutants were evaluated.)
 
       "budget"         the function ran past its budget before its selected mutants were all
                        evaluated. When the budget ran out, containment is not recorded separately,
                        so this code makes no claim that the worker was contained.
-      "memory"         a mutant hit the isolated worker's address-space cap (W#21).
       "uncontained"    a timed-out test could not be stopped — blocked outside the interpreter — and
                        the profile stopped there (#14). More budget cannot fix it.
       "not_truncated"  a measurement the rollup counts.
@@ -1912,8 +1931,6 @@ def truncation_cause(
         return "not_truncated"
     if budget_exhausted:
         return "budget"
-    if memory_standing == "cut":
-        return "memory"
     return "uncontained"
 
 
@@ -1930,11 +1947,16 @@ def truncation_cause(
 #   "truncated"   the run itself stopped short; `truncation_cause` owns it at the function level.
 #   "harness"     the outcome measures the harness, not the suite: the mutant was never built, never
 #                 installed, never entered, or the test it needed runs the engine and was refused
-#                 before it could wait for itself. It leaves the ratio, as it always has.
+#                 before it could wait for itself. It leaves the ratio, as it always has, and since
+#                 W#54 the rollup says so: `harness_dispositions` names what a function holds,
+#                 `total_harness_mutants` / `harness_mutants` count it, `harness_functions` names it
+#                 and `describe_harness` renders it beside the kill rate. The badge does not gate on it.
 UNSCORED_ROLLUP: tuple[tuple[str, str], ...] = (
     ("undetermined", "unresolved"),
     ("diverged", "unresolved"),
+    (MEMORY_CUT, "unresolved"),
     (WRITE_OUTSIDE_AUTHORITY, "unresolved"),
+    (ORIGINAL_ALSO_FAILS, "unresolved"),
     ("cut", "truncated"),
     ("harness_error", "harness"),
     ("not_installed", "harness"),
@@ -1958,9 +1980,16 @@ def unresolved_causes(unscored_by: dict) -> tuple[str, ...]:
       "diverged"                 a mutant exceeded a deterministic step budget relative to the
                                  original's iterations: budget-relative evidence, never a kill and
                                  never proof of nontermination.
+      "memory_cut"               the isolated worker's address-space cap stopped a mutant (W#45): a stop
+                                 by a budget, which proves nothing about the value, so it is neither
+                                 a kill nor a survivor. One mutant, never the function: the worker is
+                                 replaced and the function's other mutants are evaluated.
       "write_outside_authority"  a test run against the mutant tried to write outside its write
                                  authority and the write was prevented before it landed, so the test
                                  was never observed to pass or fail (W#51).
+      "original_also_fails"      every test that failed under the mutant fails the same way against the
+                                 ORIGINAL in the same process state (#55): those tests detected
+                                 nothing, so the mutant is neither killed nor survived.
       a disposition `UNSCORED_ROLLUP` does not know, under its own name, after the known ones: an
                                  unmapped outcome is never read as a verdict.
       ()                         every evaluated mutant reached a verdict (the "truncated" and
@@ -1980,20 +2009,206 @@ def unresolved_causes(unscored_by: dict) -> tuple[str, ...]:
     return (*known, *sorted(present - owners.keys()))
 
 
+def harness_dispositions(unscored_by: dict) -> tuple[str, ...]:
+    """Every harness disposition a function holds, in table order (W#54, pure — pinned).
+
+    The third owner in `UNSCORED_ROLLUP`. The rollup named the "unresolved" and "truncated" owners and
+    dropped "harness", so a function whose mutants were never built, installed or entered reported a
+    kill rate over the rest with nothing saying that some had left the denominator, or how many. This
+    is `unresolved_causes` for that owner: the dispositions come from ``unscored_by`` (the per-
+    disposition counts `ProfilingResult.to_dict` emits), a zero count is absence and not a finding,
+    and a disposition the table does not know is not read here: `unresolved_causes` owns it.
+    """
+    present = {disposition for disposition, count in unscored_by.items() if count}
+    return tuple(
+        d for d, owner in UNSCORED_ROLLUP if owner == "harness" and d in present
+    )
+
+
+def harness_standing(recorded: bool, harness_mutants: int) -> str:
+    """What a report says about the mutants the harness kept out of its kill rate (W#54, pure — pinned).
+
+    Absence and emptiness never render alike (COMMUNICATING_DETERMINISM §4):
+
+      "not_recorded"  the report carries no harness record at all (written before W#54): nothing is
+                      claimed about whether any mutant left the denominator.
+      "none"          the report records the harness and no mutant left the ratio for that reason.
+      "left_ratio"    ``harness_mutants`` mutants left the ratio: the kill rate is over the rest.
+    """
+    if not recorded:
+        return "not_recorded"
+    return "left_ratio" if harness_mutants > 0 else "none"
+
+
+def memory_rollup_standing(isolated: bool, limit_mb: int, standings: list[str]) -> str:
+    """What the run can say about memory, as one named code (W#45, pure — pinned).
+
+    ``standings`` is each function's own ``memory_standing`` (``enforced``, ``telemetry_only``, ``cut``
+    or ``n/a``); a ``cut`` function held its cap, which is how it was cut. ``limit_mb`` is the cap the
+    caller passed (0 when none). The codes carry different remedies and never share a sign:
+
+      "unbounded"       not isolated, no cap given: no per-mutant memory bound exists on this path.
+      "limit_ignored"   not isolated but a cap was given: the cap was NOT applied.
+      "no_limit"        isolated without a cap: the workers run uncapped.
+      "enforced"        isolated; the OS accepted the cap for every function that ran a worker.
+      "telemetry_only"  isolated; the OS refused the cap for every function: observed, not bounded.
+      "partial"         isolated; some functions held the cap and some did not.
+      "none_measured"   isolated with a cap, and no function recorded a standing.
+    """
+    if not isolated:
+        return "limit_ignored" if limit_mb > 0 else "unbounded"
+    if limit_mb <= 0:
+        return "no_limit"
+    held = sum(1 for s in standings if s in ("enforced", "cut"))
+    refused = sum(1 for s in standings if s == "telemetry_only")
+    if held and refused:
+        return "partial"
+    if held:
+        return "enforced"
+    return "telemetry_only" if refused else "none_measured"
+
+
+def describe_memory(mutation: dict) -> str:
+    """The memory line that stands beside the kill rate (W#45, pure).
+
+    Says what bounds a runaway mutant on THIS run, and when a requested cap did not land says that it
+    was not applied and what that means. Absence is not a value: a report with no record says so.
+    """
+    code = mutation.get("memory_standing")
+    if not code:
+        return "Memory: not recorded in this report — nothing is claimed about a memory bound."
+    mb = mutation.get("memory_limit_mb") or 0
+    counts = mutation.get("memory_standings") or {}
+    refused = counts.get("telemetry_only", 0)
+    if code == "unbounded":
+        return (
+            "Memory: NOT bounded. This run is not --isolated, so no per-mutant memory cap exists; a "
+            "mutant that allocates without bound in a callee or in C is stopped only by the wall "
+            "clock (the per-mutant timeout and --budget), which cannot interrupt one huge allocation "
+            "and can exhaust this machine. `--isolated --mem-limit-mb N` is the per-mutant bound."
+        )
+    if code == "limit_ignored":
+        return (
+            f"Memory: --mem-limit-mb {mb} was NOT applied: it takes effect only with --isolated, so "
+            "no per-mutant memory cap exists on this run (the wall clock is the only bound)."
+        )
+    if code == "no_limit":
+        return "Memory: isolated workers ran with NO memory cap (no limit was given)."
+    if code == "enforced":
+        return (
+            f"Memory: enforced at {mb} MB per isolated worker. A mutant over the cap is a named "
+            "cut, never a kill."
+        )
+    if code == "telemetry_only":
+        return (
+            f"Memory: the {mb} MB cap was requested but NOT applied on this platform (the OS refused "
+            "RLIMIT_AS) — memory is observed, not bounded. A runaway mutant is not stopped by the "
+            "cap, will not be recorded as a memory cut, and can exhaust this machine. Run where the "
+            "OS accepts the limit (Linux) or inside a container with a memory limit."
+        )
+    if code == "partial":
+        return (
+            f"Memory: the {mb} MB cap held for some functions and was NOT applied for {refused} "
+            "(the OS refused RLIMIT_AS): those functions' memory was observed, not bounded."
+        )
+    return f"Memory: a {mb} MB cap was requested; no function recorded whether it held."
+
+
+# What each harness disposition means for the reader of a kill rate, and what a named `not_entered` cause
+# asks of them. None is a test result: the mutant never reached a verdict about the suite.
+_HARNESS_MEANINGS = (
+    (
+        "harness_error",
+        "never built: Wesker could not construct the mutant, so no test ran against it.",
+    ),
+    (
+        "not_installed",
+        (
+            "built, but no call site was rebound to it (a wrapped or cached target the install "
+            "cannot patch), so no test could see it."
+        ),
+    ),
+    (
+        "not_entered",
+        "installed, but no test entered it; the cause is named per function below.",
+    ),
+    (
+        "nested_measurement",
+        (
+            "a test the verdict needed runs the engine and its nested measurement was refused; "
+            "measure that test in a killable worker (`--isolated`)."
+        ),
+    ),
+)
+
+_NOT_ENTERED_CAUSE_NOTES = {
+    "not_reached": "no test reaches the function: route one to it",
+    "decorator_wrapper": "a wrapper bound in a module calls the original",
+    "captured_at_import": "a module-level constant or registry holds the original",
+    "pre_bound_reference": "a module binds the original under another name",
+    "holder_not_found": "tests reached it, no holder found",
+    "no_reach_data": "no complete trace says whether the tests reached it",
+}
+
+
+def describe_harness(mutation: dict, limit: int = 20) -> str:
+    """The harness line that stands beside a kill rate, or "" never: every report says one thing (W#54, pure).
+
+    One renderer for every text surface that prints a ratio (`python -m Wesker`, `Wesker.metrics`, the
+    Action's step summary), so none can drop the mutants that left the denominator. Counted per
+    disposition, each function named, and `not_entered` carrying its named cause (#18).
+    """
+    recorded = "harness_functions" in mutation
+    total = int(mutation.get("total_harness_mutants", 0) or 0)
+    standing = harness_standing(recorded, total)
+    if standing == "not_recorded":
+        return "Harness: not recorded in this report — nothing is claimed about mutants kept out of the kill rate."
+    if standing == "none":
+        return "Harness: 0 mutants left the kill rate (none unbuilt, uninstalled, unentered or refused)."
+    by = mutation.get("harness_mutants") or {}
+    counted = ", ".join(f"{d} {by[d]}" for d, _ in _HARNESS_MEANINGS if by.get(d))
+    n_fn = int(mutation.get("total_harness", 0) or 0)
+    lines = [
+        (
+            f"Harness: {total} mutant(s) in {n_fn} function(s) are NOT in the kill rate "
+            f"({counted}) — they measure the harness, not your tests."
+        )
+    ]
+    entries = mutation.get("harness_functions") or []
+    for disposition, meaning in _HARNESS_MEANINGS:
+        group = [e for e in entries if e.get("disposition") == disposition]
+        if not group:
+            continue
+        lines.append(f"  {disposition} [{by.get(disposition, 0)}] {meaning}")
+        for e in group[:limit]:
+            causes = e.get("causes") or {}
+            named = ", ".join(
+                f"{c} {n} ({_NOT_ENTERED_CAUSE_NOTES.get(c, 'cause not described')})"
+                for c, n in sorted(causes.items())
+            )
+            lines.append(
+                f"    {e.get('function_key') or '?'} — {e.get('count', 0)}"
+                + (f": {named}" if named else "")
+            )
+        if len(group) > limit:
+            lines.append(f"    … and {len(group) - limit} more")
+    return "\n".join(lines)
+
+
 # The remedy each cause needs, in the order a reader should act on them: a worker that could not be
 # stopped is the one no budget fixes, so it comes first.
 _TRUNCATION_REMEDIES = (
     (
         "uncontained",
         (
-            "A timed-out test could not be stopped (it was blocked outside the interpreter), so "
-            "the profile stopped there. A larger budget will not help: bound the blocking call, "
-            "or run that test in a killable process."
+            "A timed-out test could not be stopped (it was blocked outside the interpreter, and not "
+            "on a child process, which Wesker kills), so it is STILL RUNNING in this process. It "
+            "shares the working directory, environment, standard streams and patched module "
+            "attributes, and runs the unwinding of its test (monkeypatch undo, fixture teardown) "
+            "whenever its blocking call returns, so no measurement taken while it lives is clean. "
+            "A larger budget will not help: bound the blocking call at the place named, or run "
+            "that test in a killable process (`--isolated`)."
         ),
-    ),
-    (
-        "memory",
-        "A mutant hit the isolated worker's memory cap. Raise the worker's memory limit.",
     ),
     (
         "budget",
@@ -2012,6 +2227,12 @@ _BASELINE_MARKERS = {
 }
 
 
+def _blocked_at(entry: dict) -> str:
+    """``" — blocked at <site>"`` when the entry says where its worker is parked, else "" (W#29, pure)."""
+    site = str(entry.get("where") or "")
+    return f" — blocked at {site}" if site else ""
+
+
 def _describe_containment_lost(lost: list[dict], limit: int = 3) -> list[str]:
     """The lines naming what could not be stopped for one cut function (pure).
 
@@ -2025,12 +2246,12 @@ def _describe_containment_lost(lost: list[dict], limit: int = 3) -> list[str]:
             where = _BASELINE_MARKERS.get(test) or (
                 (test or "an unnamed test") + ", in the baseline trace"
             )
-            lines.append(f"    could not stop: {where}")
+            lines.append(f"    could not stop: {where}{_blocked_at(entry)}")
         else:
             lines.append(
                 f"    could not stop: {test or 'an unnamed test'}, running mutant "
                 f"{entry.get('mutant') or entry.get('mutant_id') or '?'} "
-                f"(line {entry.get('mutated_line', '?')})"
+                f"(line {entry.get('mutated_line', '?')}){_blocked_at(entry)}"
             )
     if len(lost) > limit:
         lines.append(f"    … and {len(lost) - limit} more")
@@ -2070,6 +2291,50 @@ def describe_truncation(truncated: list[dict], limit: int = 20) -> str:
     return "\n".join(blocks)
 
 
+def unreached_entries(result: dict) -> list[dict]:
+    """The survivors of one function that NO test ran against, as a rollup entry (pure).
+
+    ``[{"function_key", "count", "of"}]`` when at least one survivor record carries
+    ``reach == "no_test_ran"`` (`engine.survivor_reach`), else ``[]``. Absence of the field (a record
+    from the isolated path or an older engine) is not "tests ran" and is not counted as "no test ran":
+    the entry exists only on a positive reading.
+    """
+    records = result.get("survivor_records") or []
+    n = sum(1 for r in records if r.get("reach") == "no_test_ran")
+    if not n:
+        return []
+    return [
+        {
+            "function_key": result.get("function_key", ""),
+            "count": n,
+            "of": int(result.get("total_mutants", 0)),
+        }
+    ]
+
+
+def describe_unreached(entries: list[dict], limit: int = 10) -> str:
+    """The note for survivors that no test ran against, or "" when there are none (pure)."""
+    if not entries:
+        return ""
+    total = sum(int(e.get("count", 0)) for e in entries)
+    lines = [
+        (
+            f"  .. NOTE: {total} surviving mutant(s) in {len(entries)} function(s) had NO test run "
+            "against them: no usable test executes that code in this process (none exists, the "
+            "tests that do fail on the unmutated code and are barred, or they reach it only through "
+            "a subprocess, as the isolated worker's do). They are counted unpinned; whether the "
+            "suite pins them is not measured here."
+        )
+    ]
+    for e in entries[:limit]:
+        lines.append(
+            f"     {e.get('function_key') or '?'} — {e.get('count', 0)}/{e.get('of', 0)} mutants"
+        )
+    if len(entries) > limit:
+        lines.append(f"     … and {len(entries) - limit} more")
+    return "\n".join(lines)
+
+
 def completeness_warnings(mutation: dict) -> str:
     """The warnings a codebase rollup's ratio must carry beside it, or "" when it needs none (W#51, pure).
 
@@ -2099,6 +2364,9 @@ def completeness_warnings(mutation: dict) -> str:
         ]
         detail = describe_unresolved(mutation.get("unresolved_functions") or [])
         lines += ["     " + ln for ln in detail.splitlines()]
+    note = describe_unreached(mutation.get("unreached_functions") or [])
+    if note:
+        lines.append(note)
     return "\n".join(lines)
 
 
@@ -2124,6 +2392,17 @@ _UNRESOLVED_REMEDIES = (
         ),
     ),
     (
+        MEMORY_CUT,
+        (
+            "A mutant hit the isolated worker's memory cap (`--mem-limit-mb`) — a stop by a budget, "
+            "which proves nothing about the value: it is neither killed nor survived, so its "
+            "question is missing from both sides of the ratio. The worker was replaced and every "
+            "other mutant of the function was evaluated. A runaway mutant (unbounded allocation) "
+            "is rightly stopped; raise `--mem-limit-mb` only if the cap is below what the tests "
+            "legitimately need."
+        ),
+    ),
+    (
         WRITE_OUTSIDE_AUTHORITY,
         (
             "A test run against the mutant tried to write outside its write authority (the "
@@ -2132,6 +2411,17 @@ _UNRESOLVED_REMEDIES = (
             "and the mutant's question is missing from both sides of the ratio. Keep the test's "
             "writes inside its temporary directory (resolve relative paths there, e.g. "
             "monkeypatch.chdir(tmp_path)) to measure it."
+        ),
+    ),
+    (
+        ORIGINAL_ALSO_FAILS,
+        (
+            "Every test that failed under the mutant fails the same way against the ORIGINAL in "
+            "the same process state, so none of them detected a difference and the mutant's "
+            "question is missing from both sides of the ratio. A mutant that wrote into shared "
+            "state a copy of the arguments cannot reach (a module global, a class attribute, a "
+            "file) leaves every later test failing whatever the code under it is. Make the test "
+            "build that state itself (a fixture, a copy), so each run starts from the same one."
         ),
     ),
 )
@@ -2169,6 +2459,43 @@ def describe_unresolved(unresolved: list[dict], limit: int = 20) -> str:
     return "\n".join(blocks)
 
 
+def _harness_entries(r: dict) -> list[dict]:
+    """One entry per harness disposition one function's result holds (W#54).
+
+    ``count`` is the engine's own tally (``unscored_by``); ``mutants`` names them from
+    ``unscored_records``; a ``not_entered`` entry carries its per-cause counts (``not_entered_causes``).
+    """
+    entries: list[dict] = []
+    by = dict(r.get("unscored_by") or {})
+    for disposition in harness_dispositions(by):
+        entry: dict = {
+            "function_key": r.get("function_key", ""),
+            "disposition": disposition,
+            "count": int(by[disposition]),
+            "mutants": [
+                str(u.get("mutant_id", "?"))
+                for u in (r.get("unscored_records") or [])
+                if u.get("disposition") == disposition
+            ],
+        }
+        if disposition == "not_entered":
+            entry["causes"] = dict(r.get("not_entered_causes") or {})
+        entries.append(entry)
+    return entries
+
+
+def _harness_totals(entries: list[dict]) -> dict[str, int]:
+    """Mutants per harness disposition across the run, in table order (W#54)."""
+    totals: dict[str, int] = {}
+    for disposition, owner in UNSCORED_ROLLUP:
+        if owner != "harness":
+            continue
+        n = sum(e["count"] for e in entries if e["disposition"] == disposition)
+        if n:
+            totals[disposition] = n
+    return totals
+
+
 def profile_codebase(
     project_root: str,
     targets: list[str],
@@ -2179,6 +2506,7 @@ def profile_codebase(
     verbose: bool = True,
     isolated: bool = False,
     worker_mem_limit_mb: int | None = None,
+    progress: IO[str] | None = None,
 ) -> dict:
     """Profile all functions across multiple files with multi-pass convergence.
 
@@ -2198,12 +2526,30 @@ def profile_codebase(
             reaches full DOF coverage, so extra passes deepen WITHIN covered
             dimensions (a second mutant per dimension, a third, …) rather than
             reaching new ones — they buy kill evidence, not coverage.
+        progress: where the per-file progress lines go (W#52). ``None`` is ``sys.stdout`` as it
+            stands at each line. A caller that measures code able to close or redirect fd 1 and
+            ``sys.stdout`` (the Action, measuring Wesker with Wesker's own tests) passes a stream on a
+            descriptor it duplicated BEFORE profiling, so the run's own output survives whatever the
+            measured code does to the process's streams.
     """
+
+    dropped_progress = 0
+
+    def say(text: str = "", end: str = "\n") -> None:
+        # Progress never costs the measurement: a line that cannot be written is dropped, because the
+        # report is written by the caller, after it re-enters its streams. A dropped line is COUNTED,
+        # and the count is in the report: a log with a hole in it must say that it has one.
+        nonlocal dropped_progress
+        try:
+            print(text, end=end, file=progress, flush=True)
+        except (OSError, ValueError):
+            dropped_progress += 1
+
     # Layer 2: load historical priors from previous run
     cached_state = _load_cached_state(project_root)
     if verbose and cached_state and cached_state.get("per_category"):
         n_cats = len(cached_state["per_category"])
-        print(f"  {_DIM}(loaded {n_cats}-category priors from previous run){_RESET}")
+        say(f"  {_DIM}(loaded {n_cats}-category priors from previous run){_RESET}")
 
     total_killed = 0
     total_mutants = 0
@@ -2211,6 +2557,9 @@ def profile_codebase(
     total_truncated = 0
     truncated_functions: list[dict] = []
     unresolved_functions: list[dict] = []
+    harness_functions: list[dict] = []
+    unreached_functions: list[dict] = []
+    memory_standings: list[str] = []
     total_universe = 0
     total_dof = 0
     total_dof_covered = 0
@@ -2230,7 +2579,7 @@ def profile_codebase(
     for i, target in enumerate(targets, 1):
         if verbose:
             short = target.rsplit("/", 1)[-1]
-            print(f"  {_DIM}[{i}/{len(targets)}]{_RESET} {short}", end="", flush=True)
+            say(f"  {_DIM}[{i}/{len(targets)}]{_RESET} {short}", end="")
 
         file_start = time.monotonic()
         results = profile_file(
@@ -2271,10 +2620,15 @@ def profile_codebase(
         # Each cut is recorded with its cause, so a refusal can name the function and the remedy
         # rather than only count them.
         for r in results:
+            # The third owner (W#54): mutants the harness kept out of the ratio. Counted for EVERY
+            # function, a cut one included: the cut below names the function's unevaluated mutants,
+            # these were evaluated and are outside the ratio for another reason.
+            harness_functions.extend(_harness_entries(r))
+            unreached_functions.extend(unreached_entries(r))
+            memory_standings.append(str(r.get("memory_standing", "n/a")))
             cause = truncation_cause(
                 r.get("coverage_depth", ""),
                 bool(r.get("budget_exhausted")),
-                str(r.get("memory_standing", "n/a")),
             )
             if cause != "not_truncated":
                 truncated_functions.append(
@@ -2373,13 +2727,13 @@ def profile_codebase(
                     if file_universe > file_total
                     else ""
                 )
-                print(
+                say(
                     f" {c}{file_killed}/{file_total}{_RESET}{equiv_note}{coverage}"
                     f" {_DIM}{file_ms:.0f}ms{_RESET}"
                 )
         else:
             if verbose:
-                print(f" {_DIM}(no mutants){_RESET}")
+                say(f" {_DIM}(no mutants){_RESET}")
 
     elapsed = (time.monotonic() - start) * 1000
     effective_total = total_mutants - total_equivalent
@@ -2416,8 +2770,30 @@ def profile_codebase(
         # a function holding two causes has an entry under each (W#51) and is counted once.
         "total_unresolved": len({u["function_key"] for u in unresolved_functions}),
         "unresolved_functions": unresolved_functions,
+        # Mutants the HARNESS kept out of the kill rate (W#54): never built, installed or entered, or
+        # refused as a nested measurement. Not a completeness refusal (the badge does not gate on it),
+        # but never silent: counted per disposition and named per function beside the ratio.
+        "total_harness_mutants": sum(e["count"] for e in harness_functions),
+        "harness_mutants": _harness_totals(harness_functions),
+        "total_harness": len({e["function_key"] for e in harness_functions}),
+        "harness_functions": harness_functions,
+        # Survivors no test ran against (item 4): unpinned because nothing in this process executes
+        # the code, which is not the same finding as a suite that ran and missed.
+        "unreached_functions": unreached_functions,
+        # What bounded memory on this run (W#45), from each function's own `memory_standing`.
+        "isolated": isolated,
+        "memory_limit_mb": worker_mem_limit_mb or 0,
+        "memory_standing": memory_rollup_standing(
+            isolated, worker_mem_limit_mb or 0, memory_standings
+        ),
+        "memory_standings": {
+            s: memory_standings.count(s) for s in sorted(set(memory_standings))
+        },
         "passes": passes,
         "elapsed_ms": round(elapsed),
+        # Progress lines this run could not write (W#52): its stream was closed or redirected under
+        # it. The measurement is unaffected; the LOG is incomplete, and says so (`progress_gap_notice`).
+        "progress_lines_dropped": dropped_progress,
         "per_file": per_file,
         "per_category": list(global_cats.values()),
         # Every surviving mutant, located. The report's only per-mutant detail: what a

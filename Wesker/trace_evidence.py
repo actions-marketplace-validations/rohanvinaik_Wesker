@@ -2,8 +2,11 @@
 
 The baseline trace observes which test executed which line, and which branch EDGE: an arc is the
 ``(prev_line, cur_line)`` transition a line event completes inside one frame, so the two sides of a
-conditional, short-circuit operands and loop-zero-vs-entry — which line execution collapses — stay
-apart. "A trace observed this line" and "a baseline-green, contained test proves this line under the
+conditional on DIFFERENT lines, and loop-entry-vs-zero-iterations, which line execution collapses,
+stay apart. What an arc does NOT resolve is anything inside ONE line: the operands of ``a or b``
+written on one line share the single arc into the body whichever operand decided it, so a
+short-circuit path is not an obligation this ledger can discharge (an arc between lines is not an
+instruction-level branch edge). That is a stated limit, not a measured "all operands taken". "A trace observed this line" and "a baseline-green, contained test proves this line under the
 session" are different facts, and unioning coverage BEFORE qualifying it by outcome is how a failing
 test's reach came to close a line ledger (Detective #59's counterexample). This module holds the
 per-item ledger those two views derive from, without loss through early unioning:
@@ -26,7 +29,11 @@ Each item carries what that qualification needs, and nothing is inferred from ab
   * its REACH completeness — whether everything the item executed was VISIBLE to the tracer. The
     tracer follows threads a test starts while it runs; a thread that outlives the test's traced
     window may run target code nobody observed, so that item's reach is ``incomplete_thread`` and
-    the lines it lacks are UNKNOWN, never a negative.
+    the lines it lacks are UNKNOWN, never a negative. A thread that was alive BEFORE the test and
+    ran target code during it (a pool warmed in a fixture) cannot be attributed to this test, so
+    the row is ``incomplete_preexisting_thread``, and a test that creates a process is
+    ``incomplete_subprocess`` (the child's lines are outside this interpreter): same rule, the
+    absences are unknown. Several causes join with ``+`` (:func:`reach_qualification`).
 """
 
 from __future__ import annotations
@@ -36,7 +43,10 @@ from dataclasses import dataclass
 
 #: The typed baseline outcomes (#17): pytest's own terminal categories for one item's run on the
 #: UNMUTATED program. Only ``passed`` is green.
-BASELINE_OUTCOMES = ("passed", "failed", "skipped", "xfailed", "error")
+#: ``untyped`` is the one NAMED non-answer: a run on the legacy direct-call route (no pytest phase)
+#: that did not pass, or that carries skip/xfail marks the route does not evaluate, so its kind
+#: cannot be told (#17). It is never green and never one of the four typed kinds.
+BASELINE_OUTCOMES = ("passed", "failed", "skipped", "xfailed", "error", "untyped")
 
 
 def item_run_status(setup: str, call: str, teardown: str) -> str:
@@ -92,24 +102,73 @@ def baseline_outcome(run_code: str | None, item_status: str) -> str:
 
     * ``error`` when the run never reached a verdict (``timeout`` / ``uncontained``): whatever a
       report says about a run that was stopped is partial. Checked first.
+    * ``untyped`` when ``item_status`` is ``marked``: the callable carries skip/skipif/xfail marks
+      and runs on a route that does not evaluate them (the legacy direct-call route, outside a live
+      session), so whether pytest would have skipped it, expected it to fail or run it cannot be
+      said — a pass would be a claim about a test pytest might not have run.
     * pytest's ``error`` / ``failed`` when it reported one — it alone sees which PHASE failed, so a
       fixture's AssertionError is an error, not a wrong expectation.
-    * a RAISING callable with no report: ``assertion`` / ``exception`` (a declared failure) is
-      ``failed``; anything else is ``error``, never ``failed`` — under the direct-call contract a
-      crash is ambiguous (a missing fixture argument), the rule ``failing_on_baseline`` keeps by not
-      accusing such a test of a wrong expectation. An unrecognised code is ``error`` too: a new kill
-      reason is by construction "did not pass".
+    * a RAISING callable with no report (the legacy direct-call route): ``assertion`` /
+      ``exception`` (a declared failure) is ``failed``; anything else is ``untyped``. A crash there
+      is a missing fixture argument (a setup error), a ``pytest.skip()``, a ``pytest.xfail()`` or a
+      real exception, and the route has no phase to tell them apart. It was typed ``error``, which
+      printed a skip as a setup error; it is never ``failed`` either (the rule ``failing_on_baseline``
+      keeps by not accusing such a test of a wrong expectation). An unrecognised code is ``untyped``
+      too: a new kill reason is by construction "did not pass", and not known to be an error.
     * a clean return: pytest's ``skipped`` / ``xfailed`` when it reported one, else ``passed``.
     """
     if run_code in ("timeout", "uncontained"):
         return "error"
+    if item_status == "marked":
+        return "untyped"
     if item_status in ("error", "failed"):
         return item_status
     if run_code is not None:
-        return "failed" if run_code in ("assertion", "exception") else "error"
+        return "failed" if run_code in ("assertion", "exception") else "untyped"
     if item_status in ("skipped", "xfailed"):
         return item_status
     return "passed"
+
+
+def reach_qualification(
+    outlived_thread: bool,
+    preexisting_thread_ran: bool,
+    spawned_process: bool = False,
+    observation_failed: bool = False,
+) -> str:
+    """The reach-completeness code of ONE traced test (#17, pure — pinned).
+
+    Split out of the tracer's worker, which holds thread objects and audit events the literal-input
+    allowlist cannot express; the tracer keeps that handling and this holds the decision. Four
+    independent facts make absences unknown, and they have different remedies, so they never share
+    a name. The answer is ``complete`` when none holds, else the names of the facts that hold,
+    joined by ``+`` in this fixed order:
+
+    * ``incomplete_thread`` — a thread THIS test started outlived its traced window, so code it ran
+      afterwards was never observed.
+    * ``incomplete_preexisting_thread`` — a thread alive BEFORE the test ran target code during it
+      (a pool warmed in a fixture or at import): that work cannot be attributed to this test.
+    * ``incomplete_subprocess`` — the test (or a thread it started) created a process (the audit
+      events ``subprocess.Popen`` / ``os.fork`` / ``os.exec*`` / ``os.posix_spawn`` / ...). Code the
+      child ran is outside this interpreter and was never observed.
+    * ``incomplete_observation`` — the observer itself failed while tracing this test (W#29): a
+      delivery was still in flight when the trace was read, a callback raised, or discovery
+      failed. What the tracer did record stays recorded, but it may have missed events, so a line
+      absent from ``lines`` is unknown. The failure belongs to this test's trace, never to the
+      measurement of the codebase.
+    * ``complete`` — none: absence in ``lines`` is a measured negative.
+    """
+    causes = [
+        name
+        for name, held in (
+            ("incomplete_thread", outlived_thread),
+            ("incomplete_preexisting_thread", preexisting_thread_ran),
+            ("incomplete_subprocess", spawned_process),
+            ("incomplete_observation", observation_failed),
+        )
+        if held
+    ]
+    return "+".join(causes) if causes else "complete"
 
 
 def trace_admissibility(
@@ -140,6 +199,10 @@ def trace_admissibility(
       or teardown, was skipped, or failed as expected. Each is named, never folded into
       ``refuse_failed``: "your expectation is wrong" and "this test never ran to a verdict" have
       different remedies.
+    * ``refuse_untyped`` — the item ran on a route that cannot say what its non-pass was (the
+      legacy direct-call route: a skip, an expected failure and a setup error look alike there) or
+      carries marks that route does not evaluate. Named apart from ``refuse_failed``: the remedy for
+      "your expectation is wrong" does not apply to a test nobody can say failed.
     * ``refuse_failed`` — the item is baseline-RED: its expectation does not hold on the unmutated
       program, so its execution proves nothing about the code under test. Also the answer whenever
       ``baseline_passed`` is False with no typed outcome to say more, and for an outcome this does
@@ -165,6 +228,8 @@ def trace_admissibility(
         return "refuse_skipped"
     if outcome == "xfailed":
         return "refuse_xfailed"
+    if outcome == "untyped":
+        return "refuse_untyped"
     if not baseline_passed or outcome not in ("passed", "unrecorded"):
         return "refuse_failed"
     if not fresh:
@@ -206,7 +271,9 @@ class TraceEvidence:
     baseline_outcome: str = "unrecorded"
     #: Whether everything this item executed was VISIBLE to the tracer (#17): ``complete``, or
     #: ``incomplete_thread`` when a thread it started outlived its traced window, so code that thread
-    #: ran afterwards was never observed. It qualifies ABSENCE only: the lines that were observed
+    #: ran afterwards was never observed, or ``incomplete_preexisting_thread`` when a thread alive
+    #: before the test ran target code during it (unattributable, so not in ``lines``), or
+    #: ``incomplete_subprocess`` when the test created a process, or ``incomplete_observation`` when the observer failed while tracing it; causes join with ``+``. It qualifies ABSENCE only: the lines that were observed
     #: stay exactly as admissible as ``reason`` says, while a line missing from ``lines`` is
     #: "not observed", never "not reached".
     reach: str = "complete"

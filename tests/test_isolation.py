@@ -125,9 +125,10 @@ def test_the_module_uses_a_real_process_group():
 # ── the mutant verdict decision ─────────────────────────────────────────────────
 
 
-def test_a_failed_or_timed_out_node_is_a_kill():
+def test_a_failed_node_is_a_kill_and_a_timed_out_one_is_not():
+    """A wall bound is liveness only (W#27): a node that hung past it established nothing."""
     assert mutant_verdict("failed") == "killed"
-    assert mutant_verdict("timeout") == "killed"
+    assert mutant_verdict("timeout") == "undetermined"
 
 
 def test_all_nodes_passing_is_a_survivor():
@@ -182,9 +183,9 @@ def test_a_mutant_no_test_kills_reports_survived(tmp_path):
     assert r.contained and mutant_verdict(r.outcome) == "survived"
 
 
-def test_a_hanging_mutant_is_killed_by_timeout_and_contained(tmp_path):
+def test_a_hanging_mutant_is_undetermined_by_timeout_and_contained(tmp_path):
     """A mutant that never returns hangs the node; the isolated worker terminates its process group
-    and reports a contained timeout kill — the containment an in-process thread cannot guarantee."""
+    and reports a contained wall-bound stop (never a kill) — the containment an in-process thread cannot guarantee."""
     _tiny_project(tmp_path)
     r = run_mutant_isolated(
         str(tmp_path),
@@ -195,7 +196,7 @@ def test_a_hanging_mutant_is_killed_by_timeout_and_contained(tmp_path):
         2.0,
     )
     assert r.timed_out is True and r.contained is True
-    assert mutant_verdict(r.outcome) == "killed"
+    assert mutant_verdict(r.outcome) == "undetermined"
 
 
 # ── the persistent recycled worker (increment 3) ────────────────────────────────
@@ -233,7 +234,7 @@ def test_a_hanging_mutant_retires_the_worker_but_stays_contained(tmp_path):
         h = worker.evaluate("def f(x):\n    while True:\n        pass\n", 2.0)
         assert h.timed_out is True and h.contained is True
         assert worker.alive is False, "a hung worker must be retired, not reused"
-        assert mutant_verdict(h.outcome) == "killed"
+        assert mutant_verdict(h.outcome) == "undetermined"
     finally:
         worker.close()
 
@@ -241,7 +242,7 @@ def test_a_hanging_mutant_retires_the_worker_but_stays_contained(tmp_path):
 # ── the typed kill vocabulary survives isolation (increment 4) ───────────────────
 #
 # pytest's exit code says only killed/survived. The engine's `value_killed` split needs to know
-# WHY — a value pin (assertion/exception) versus a run-only kill (crash/timeout). These prove the
+# WHY — a value pin (assertion/exception) versus a run-only kill (crash). These prove the
 # reason crosses back out of the isolated process intact, matching the in-process classifier, so
 # routing profiling through the worker does not silently collapse the split.
 
@@ -1164,12 +1165,14 @@ def test_the_worker_flags_a_memory_error_as_a_budget_cut_and_survives(tmp_path):
         worker.close()
 
 
-def test_a_memory_cut_maps_to_a_non_gateable_cut_disposition():
-    """The engine turns a worker memory cut into a non-gateable `cut` disposition — unscored, never a
-    kill or a survivor."""
+def test_a_memory_cut_maps_to_a_named_unscored_disposition_of_one_mutant():
+    """The engine turns a worker memory cut into the named `memory_cut` disposition (W#45) — unscored,
+    never a kill or a survivor, like `diverged`. It is CONTAINED (the cap stopped it; the worker is
+    retired), so it neither stops the function nor reads as `containment_lost`."""
     import ast
 
     from Wesker.engine import (
+        SCORED_DISPOSITIONS,
         _isolated_result,
         generate_mutants,
         mutant_disposition,
@@ -1182,14 +1185,18 @@ def test_a_memory_cut_maps_to_a_non_gateable_cut_disposition():
     res = _isolated_result(
         mutant, IsolatedRun(1, False, True, "", memory_cut=True), 0.0
     )
-    assert res.contained is False, "a memory cut must be non-gateable"
+    assert res.contained is True, "the cap contained it: no worker is left running"
     assert res.killed is False
-    assert (
-        mutant_disposition(
-            res.constructed, res.installed, res.entered, res.contained, res.killed
-        )
-        == "cut"
+    disposition = mutant_disposition(
+        res.constructed,
+        res.installed,
+        res.entered,
+        res.contained,
+        res.killed,
+        killed_by=res.killed_by,
     )
+    assert disposition == "memory_cut"
+    assert disposition not in SCORED_DISPOSITIONS
 
 
 def test_a_normal_isolated_run_reports_its_memory_capability_honestly(tmp_path):

@@ -28,7 +28,8 @@ import select
 import signal
 import subprocess
 import sys
-from collections.abc import Sequence
+import threading
+from collections.abc import Iterator, Sequence
 from dataclasses import dataclass
 from typing import Any
 
@@ -51,6 +52,77 @@ _SUBPROCESS_NAMES = frozenset(
 )
 _THREAD_NAMES = frozenset({"threading", "_thread", "Thread", "start_new_thread"})
 _SIGNAL_NAMES = frozenset({"signal", "setitimer", "sigwait", "pthread_kill"})
+
+
+# Who holds the output quarantine right now, as ``{"owner": (token, thread)}``; empty when nobody does.
+# One dict operation decides who enters (`setdefault` is atomic), so no lock can be stranded by an
+# injected exception, and an owner whose thread has died is taken over rather than waited on.
+_QUARANTINE: dict[str, tuple[object, threading.Thread]] = {}
+
+
+@contextlib.contextmanager
+def quarantined_output() -> Iterator[bool]:
+    """For the length of the block, the measuring process's file descriptors 1 and 2 are a sink
+    (Wesker #52); yields whether THIS entry took them.
+
+    Code under measurement writes where it likes: `print` is caught by `sys.stdout`'s redirect, but
+    `os.write(1, ...)`, a child process that inherits the descriptor, and a nested Action's re-entered
+    streams go straight to the descriptor, which is the run's own log. A line of a nested Action's banner
+    reached the badge run's job log this way, and in the plain CLI (which has no private progress
+    descriptor) the same bytes landed inside its own `[n/N]` line. What the tests print is discarded;
+    the owner's progress goes through a private duplicate taken before profiling, and the CLI prints
+    between evaluations, not inside one.
+
+    Entered by the thread that JOINS the code under measurement, never by the worker: a worker that
+    cannot be stopped would otherwise restore the descriptors whenever it finally ended. Nested entries
+    (the engine inside a test, a test inside a quarantined block) do nothing and yield False, so the
+    outermost entry restores exactly what it saved. A descriptor that is already closed degrades to
+    no quarantine rather than failing the run: the quarantine is a courtesy to the log, never a risk to
+    the measurement.
+    """
+    token = object()
+    me = threading.current_thread()
+    mine = False
+    saved: list[int] = []
+    sink = -1
+    try:
+        held = _QUARANTINE.get("owner")
+        if held is not None and not held[1].is_alive():
+            _QUARANTINE.pop("owner", None)  # its owner died inside the block: take over
+        mine = _QUARANTINE.setdefault("owner", (token, me))[0] is token
+        if mine:
+            for stream in (sys.stdout, sys.stderr):
+                with contextlib.suppress(Exception):
+                    stream.flush()
+            try:
+                # A closed descriptor has nothing to quarantine: either probe raising OSError leaves both alone.
+                os.fstat(1)
+                os.fstat(2)
+                sink = os.open(os.devnull, os.O_WRONLY)
+                saved = [os.dup(1), os.dup(2)]
+                os.dup2(sink, 1)
+                os.dup2(sink, 2)
+            except OSError:
+                # a closed or unusable descriptor: put back whatever was taken, and run unquarantined
+                _restore_descriptors(saved)
+                saved = []
+        yield mine and bool(saved)
+    finally:
+        if mine:
+            _restore_descriptors(saved)
+            if sink >= 0:
+                with contextlib.suppress(OSError):
+                    os.close(sink)
+            _QUARANTINE.pop("owner", None)
+
+
+def _restore_descriptors(saved: list[int]) -> None:
+    """Put descriptors 1 and 2 back from the duplicates ``saved`` holds, and close the duplicates."""
+    for fd, copy in zip((1, 2), saved, strict=False):
+        with contextlib.suppress(OSError):
+            os.dup2(copy, fd)
+        with contextlib.suppress(OSError):
+            os.close(copy)
 
 
 def isolated_test_selection(node_id: str, has_plain_source: bool) -> str:
@@ -101,7 +173,7 @@ class IsolatedRun:
     stdout: str
     #: The kill vocabulary the worker classified for this mutant (assertion/exception/crash), or
     #: None. Set only on the server path, where a mutant's failure reasons cross back as data; the
-    #: one-shot and timeout paths leave it None (a timeout's reason is named by `mutant_verdict`).
+    #: one-shot and timeout paths leave it None (a timed-out run has no kill reason: it is `undetermined`).
     killed_by: str | None = None
     #: False when the mutant would not compile — the worker installed nothing, so the outcome
     #: measures the harness, not the suite (#18). The engine scores that `harness_error`, outside
@@ -130,6 +202,18 @@ class IsolatedRun:
     #: failure is the guard's: it records no kill reason, so `killed_by` speaks for the other nodes.
     write_blocked: str | None = None
     blocked_writes: tuple[str, ...] = ()
+    #: #55 — the nodes whose failure under the mutant the ORIGINAL reproduces in the same process
+    #: state (the worker's original control). Non-empty only when nothing else failed the mutant: those
+    #: failures detected nothing, so the engine names the mutant `original_also_fails`, never a kill.
+    original_also_fails: tuple[str, ...] = ()
+    #: Detective #145 — the full-matrix scan: every node that failed under the mutant and whose failure
+    #: the original control did NOT reproduce, with that node's own kill reason, in run order. None when
+    #: the scan was not asked for (the worker then stops at the first value kill, so a list would be a
+    #: prefix of the relation, never the relation). `unresolved_nodes` are nodes whose cell the scan
+    #: could not settle (a loop budget stopped them, a write was prevented, a phase outside the call
+    #: failed): neither a kill nor a pass.
+    killers: tuple[tuple[str, str], ...] | None = None
+    unresolved_nodes: tuple[str, ...] = ()
 
     @property
     def outcome(self) -> str:
@@ -231,16 +315,19 @@ def mutant_verdict(outcome: str) -> str:
     The worker runs the covering node IDs against the mutant; pytest's exit is the verdict.
 
     * ``failed`` — a node FAILED under the mutant: the suite detected the mutation → ``killed``.
-    * ``timeout`` — the mutant made a node hang past its budget: a run-only kill, detected by time
-      → ``killed`` (the worker was terminated; containment travels separately on the run).
+    * ``timeout`` — the mutant made a node hang past its wall: nothing was established. A wall
+      bound is liveness only, never detection (W#27) → ``undetermined``, neither killed nor
+      survived (the worker was terminated; containment travels separately on the run).
     * ``passed`` — every node passed under the mutant: nothing distinguished it → ``survived``.
     * ``no_tests`` / ``error`` — no node ran, or the run could not collect: this measures the
       HARNESS, not the suite, and belongs on NEITHER side of the denominator → ``harness``, the
       same discipline ``engine.mutant_disposition`` keeps for the in-process path so a collection
       failure never inflates a kill score.
     """
-    if outcome in ("failed", "timeout"):
+    if outcome == "failed":
         return "killed"
+    if outcome == "timeout":
+        return "undetermined"
     if outcome == "passed":
         return "survived"
     return "harness"
@@ -270,6 +357,24 @@ def classify_kill_reason(is_assertion: bool, is_declared_failure: bool) -> str:
     if is_declared_failure:
         return "exception"
     return "crash"
+
+
+def decided_kill_reason(reasons: list[str]) -> str:
+    """The reason that DECIDES a mutant's kill, from the surviving per-node reasons in run order
+    (Detective #145, pure — pinned).
+
+    A mutant's kill is decided at the FIRST value pin (an assertion or a declared exception): the
+    in-process loop returns there, and the worker's `shouldfail` stops its session there, so nothing
+    after it is run. Under the full-matrix scan the session does not stop, and a later node's reason
+    must not change what the same mutant reads without the scan. So: the first value pin in run order
+    decides; failing that a crash; ``""`` when nothing killed. When at most one value pin exists (every
+    run that stops at it) this equals `aggregate_kill_reason`; it differs only where the scan sees two,
+    and then it names the one the unscanned run would have named.
+    """
+    for reason in reasons:
+        if reason in ("assertion", "exception"):
+            return reason
+    return "crash" if "crash" in reasons else ""
 
 
 def aggregate_kill_reason(reasons: list[str]) -> str:
@@ -665,7 +770,7 @@ class IsolatedMutantWorker:
 
     A single mutant that hangs terminates the whole process GROUP — the worker AND any child — and
     marks this worker dead, so the caller recycles a fresh one; the hung mutant's result is a
-    contained timeout kill.
+    contained wall-bound stop: ``timed_out``, which is `undetermined`, never a kill.
     """
 
     def __init__(
@@ -725,6 +830,7 @@ class IsolatedMutantWorker:
         timeout_s: float,
         node_ids: Sequence[str] | None = None,
         step_caps: dict[str, int] | None = None,
+        full_matrix: bool = False,
     ) -> IsolatedRun:
         """Evaluate ONE mutant on the reused worker. A hang kills the group and retires the worker.
 
@@ -740,6 +846,9 @@ class IsolatedMutantWorker:
         if step_caps:
             # W#27: per-node loop budgets, keyed by `isolated_selector_key`.
             spec["step_caps"] = dict(step_caps)
+        if full_matrix:
+            # Detective #145: run every node and report each failing node's own reason.
+            spec["full_matrix"] = True
         try:
             # Explicit checks, not `assert`s (see `open`): an assert vanishes under `python -O`.
             if self._proc.stdin is None or self._proc.stdout is None:
@@ -752,7 +861,7 @@ class IsolatedMutantWorker:
         ready, _, _ = select.select([self._proc.stdout], [], [], timeout_s)
         if not ready:
             # The mutant hung the worker. Kill the whole group and retire it — a fresh worker takes
-            # the next mutant, and this one is a contained timeout kill.
+            # the next mutant, and this one is a contained wall-bound stop (`undetermined`, never a kill).
             contained = self._reap()
             self._alive = False
             return IsolatedRun(-9, True, contained, "")
@@ -785,6 +894,15 @@ class IsolatedMutantWorker:
             diverged=bool(data.get("diverged", False)),
             write_blocked=data.get("write_blocked") or None,
             blocked_writes=tuple(str(p) for p in data.get("blocked_writes") or ()),
+            original_also_fails=tuple(
+                str(n) for n in data.get("original_also_fails") or ()
+            ),
+            killers=(
+                None
+                if data.get("killers") is None
+                else tuple((str(n), str(r)) for n, r in data["killers"])
+            ),
+            unresolved_nodes=tuple(str(n) for n in data.get("unresolved_nodes") or ()),
         )
 
     def _reap(self) -> bool:

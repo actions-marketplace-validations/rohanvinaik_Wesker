@@ -41,6 +41,7 @@ import contextlib
 import io
 import os
 import sys
+import traceback
 from collections.abc import Callable
 from typing import Any
 
@@ -49,7 +50,13 @@ from Wesker.trace_evidence import item_run_status
 from Wesker.write_authority import declared_roots, session_write_roots
 from Wesker.write_authority import install as install_write_authority
 
-__all__ = ["run_in_session", "session_callables"]
+__all__ = [
+    "FreshArguments",
+    "argument_copy_standing",
+    "identity_standing",
+    "run_in_session",
+    "session_callables",
+]
 
 try:  # pytest is an OPTIONAL dependency — this module degrades to a no-op without it.
     import pytest as _pytest
@@ -167,6 +174,184 @@ def _reset_item(item: Any) -> None:
         init()
 
 
+def argument_copy_standing(
+    copy_raised: bool, compare_raised: bool, copy_equals: bool
+) -> str:
+    """Whether ONE test argument may be handed out as a fresh copy (#55, pure — pinned).
+
+    A kill is a DIFFERENCE FROM THE ORIGINAL ON THE SAME, AUTHORED INPUT (KNOWABILITY Def. 2.3), so
+    every evaluation must receive the argument as the suite authored it. A module-level
+    ``parametrize`` row is ONE object for every mutant, and a mutant that writes into it changes what
+    every later evaluation (and the original's control) is given. The remedy is a fresh deep copy of a
+    pristine snapshot per evaluation; this decides, per argument, whether that copy is trustworthy.
+
+      copy            the copy was made and compares equal to the original: hand out copies.
+      uncopyable      ``deepcopy`` raised (a lock, a file handle, a generator): the argument stays
+                      SHARED. Named by the caller, never skipped silently — the original control (the
+                      isolated worker's and the in-process loop's) is what still guards it.
+      uncomparable    the copy exists but ``==`` raised or has no truth value (an array): nothing
+                      says the copy is the same value, so it stays shared, named.
+      identity_bearing  the copy is NOT equal to the original (a sentinel ``object()``, a plain
+                      instance compared by identity): a test that checks ``is``/``==`` against the
+                      authored object would fail on the original itself, so the argument stays
+                      shared, named — a broken suite is worse than a named gap.
+    """
+    if copy_raised:
+        return "uncopyable"
+    if compare_raised:
+        return "uncomparable"
+    return "copy" if copy_equals else "identity_bearing"
+
+
+def identity_standing(authored_passes: bool, copy_passes: bool) -> str:
+    """Whether a test that gets COPIES of its arguments is the same test (#55, pure — pinned).
+
+    ``argument_copy_standing`` clears an argument when its copy compares EQUAL, and equal is not
+    identical: a test can assert ``lookup(k) is x`` against a module-level object, or write through
+    ``x`` and read the module-level name afterwards. Handed a copy, the ORIGINAL fails such a test, and
+    a healthy test would read as failing (inert, its kills lost). So copying is a measured precondition,
+    not an assumed one: the original is run on the authored objects and on the copies.
+
+      copy_ok             the original passes on the copies (whatever it does on the authored ones):
+                          the copies are harmless, hand them out.
+      identity_sensitive  it passes on the authored objects and FAILS on the copies: the test depends
+                          on the objects themselves. Its arguments stay shared, named, and the original
+                          control guards them.
+      fails_on_original   it fails on both: the test is failing on the original whatever it is handed.
+                          The baseline names it; the copies are not what failed it, and stay.
+    """
+    if copy_passes:
+        return "copy_ok"
+    return "identity_sensitive" if authored_passes else "fails_on_original"
+
+
+class FreshArguments:
+    """Fresh test arguments for every evaluation (#55).
+
+    pytest hands a parametrized test the objects its ``callspec.params`` hold, and those objects are
+    the module-level ones: the same for every mutant, in one process, for the life of the process. This
+    keeps a PRISTINE deep copy of each item's parameters, taken the first time the item is seen (before
+    any test body has run in this process), and puts a new deep copy of it into ``callspec.params``
+    before each evaluation's setup. ``callspec.params`` is what direct parametrize arguments, indirect
+    ones, and ``@pytest.fixture(params=...)`` fixtures all read, so the one assignment reaches every
+    argument object pytest hands the test that survives across evaluations.
+
+    The arguments of ONE item are copied together (one memo), so two parameters naming the same object
+    still name one object. An argument :func:`argument_copy_standing` does not clear stays shared and is
+    NAMED in :attr:`shared`, ``"<nodeid> :: <argument> (<standing>)"``: the protection is not silently
+    absent. Shared state a copy cannot reach (module globals, class attributes, files) is guarded by the
+    original control instead.
+    """
+
+    def __init__(self) -> None:
+        self._pristine: dict[str, dict[str, Any]] = {}
+        self._shared: dict[str, dict[str, str]] = {}
+        #: The authored objects themselves, by item: what an identity-sensitive test must be handed.
+        self._authored: dict[str, dict[str, Any]] = {}
+        #: Items whose copies have been measured against the original (`identity_standing`).
+        self._measured: set[str] = set()
+        #: Items already snapshotted: a second sight must never re-snapshot, even after an item stopped
+        #: being copied.
+        self._seen: set[str] = set()
+
+    @staticmethod
+    def _params(item: Any) -> dict[str, Any] | None:
+        params = getattr(getattr(item, "callspec", None), "params", None)
+        return params if isinstance(params, dict) and params else None
+
+    def capture(self, item: Any) -> None:
+        """Snapshot this item's parameters, once. A second sight of the item changes nothing: by then
+        an earlier evaluation may already have altered the live objects."""
+        import copy
+
+        key = str(getattr(item, "nodeid", ""))
+        params = self._params(item)
+        if params is None or key in self._seen:
+            return
+        self._seen.add(key)
+        try:
+            together: dict[str, Any] | None = copy.deepcopy(params)
+        # BLE001: an arbitrary user object refuses copying in arbitrary ways; each is named below
+        except Exception:  # noqa: BLE001
+            together = None
+        pristine: dict[str, Any] = {}
+        shared: dict[str, str] = {}
+        for name, value in params.items():
+            if together is not None:
+                snap, raised = together[name], False
+            else:
+                try:
+                    snap, raised = copy.deepcopy(value), False
+                # BLE001: as above, per argument
+                except Exception:  # noqa: BLE001
+                    snap, raised = None, True
+            compare_raised, equal = False, False
+            if not raised:
+                try:
+                    equal = bool(snap == value)
+                # BLE001: an array-valued or raising __eq__ is "uncomparable", a named fact
+                except Exception:  # noqa: BLE001
+                    compare_raised = True
+            standing = argument_copy_standing(raised, compare_raised, equal)
+            if standing == "copy":
+                pristine[name] = snap
+            else:
+                shared[name] = standing
+        self._pristine[key] = pristine
+        self._shared[key] = shared
+        self._authored[key] = {name: params[name] for name in pristine}
+
+    def refresh(self, item: Any) -> None:
+        """Replace this item's copyable parameters with a new deep copy of the pristine snapshot."""
+        import copy
+
+        params = self._params(item)
+        pristine = self._pristine.get(str(getattr(item, "nodeid", "")))
+        if params is None or not pristine:
+            return
+        params.update(copy.deepcopy(pristine))
+
+    def unmeasured(self, item: Any) -> bool:
+        """True while this item hands out copies that no run of the original has yet been checked on."""
+        key = str(getattr(item, "nodeid", ""))
+        return bool(self._pristine.get(key)) and key not in self._measured
+
+    def measured(self, item: Any) -> None:
+        self._measured.add(str(getattr(item, "nodeid", "")))
+
+    def use_authored(self, item: Any) -> None:
+        """Put the AUTHORED objects back into this item's parameters (for the measurement run only)."""
+        params = self._params(item)
+        authored = self._authored.get(str(getattr(item, "nodeid", "")))
+        if params is not None and authored:
+            params.update(authored)
+
+    def mark_by_identity(self, item: Any, authored_passes: bool) -> bool:
+        """Settle an item whose copy run FAILED, given whether the authored run passed; True when the
+        item is identity-sensitive (its arguments are now shared and the authored run stands)."""
+        if identity_standing(authored_passes, False) == "identity_sensitive":
+            self.mark_identity_sensitive(str(getattr(item, "nodeid", "")))
+            return True
+        return False
+
+    def mark_identity_sensitive(self, nodeid: str) -> None:
+        """Stop copying this item's arguments: the original fails on a copy (:func:`identity_standing`)."""
+        pristine = self._pristine.pop(nodeid, None) or {}
+        self._authored.pop(nodeid, None)
+        self._measured.add(nodeid)
+        shared = self._shared.setdefault(nodeid, {})
+        for name in pristine:
+            shared[name] = "identity_sensitive"
+
+    def shared(self) -> list[str]:
+        """The arguments left shared, each named with its standing, sorted."""
+        return sorted(
+            f"{nodeid} :: {name} ({standing})"
+            for nodeid, names in self._shared.items()
+            for name, standing in names.items()
+        )
+
+
 def _cheap_failure_repr(excinfo: Any, *_args: Any, **_kwargs: Any) -> str:
     """The failure text a MEASUREMENT session's reports carry: the exception's type and message, and
     no traceback (EP-C1 — Detective docs/ENGINEERING_PASS_2026-09-26.md).
@@ -250,6 +435,45 @@ def _install_cheap_failure_repr(item: Any) -> None:
         item._repr_failure_py = _cheap_failure_repr
 
 
+def _fresh_arguments_of(item: Any) -> FreshArguments:
+    """The fresh-arguments holder of one wrapped item, snapshotted now (#55): taken at wrapping time,
+    before any run has had a chance to alter the module-level objects the item's parameters are."""
+    fresh = FreshArguments()
+    fresh.capture(item)
+    return fresh
+
+
+def _settle_first_run(
+    item: Any,
+    cap: _ExcCapture,
+    fresh: FreshArguments,
+    reports: list[Any],
+    first_run: bool,
+    rtp: Callable[..., list[Any]],
+    reset: Callable[[Any], None],
+) -> list[Any]:
+    """The reports a wrapped item's run stands on once its FIRST run has been judged (#55).
+
+    The first failure of an item that is handed copies: is it the copy's? The first run of an item is
+    the baseline's, the original's. Run it once on the AUTHORED objects; if that passes, the test
+    depends on object identity and its arguments stay shared. Every later run stands on its own reports.
+    """
+    if not first_run:
+        return reports
+    if any(r.failed for r in reports):
+        first_exc = cap.last.get(item.nodeid)
+        fresh.use_authored(item)
+        cap.last.pop(item.nodeid, None)
+        reset(item)
+        again = rtp(item, nextitem=None, log=False)
+        if fresh.mark_by_identity(item, not any(r.failed for r in again)):
+            reports = again
+        else:
+            cap.last[item.nodeid] = first_exc
+    fresh.measured(item)
+    return reports
+
+
 def _make_item_callable(item: Any, capture: _ExcCapture) -> Callable[[], None]:
     """Wrap a LIVE pytest item as a zero-arg callable that raises on failure.
 
@@ -294,6 +518,10 @@ def _make_item_callable(item: Any, capture: _ExcCapture) -> Callable[[], None]:
     # kill under a mutant — so the distinction the baseline needs travels beside the return, never in
     # it. Reset at the start of every run, so a stopped run reads `unobserved`, not a stale verdict.
     status = _ItemStatus()
+    # Fresh arguments for EVERY run of this item (#55): the original's, the baseline's and each
+    # mutant's. The snapshot is taken now, at wrapping time, before any run has had a chance to alter
+    # the module-level objects the item's parameters are.
+    fresh = _fresh_arguments_of(item)
 
     def run(  # type: ignore[no-untyped-def]
         *,
@@ -303,11 +531,16 @@ def _make_item_callable(item: Any, capture: _ExcCapture) -> Callable[[], None]:
         _reset=_reset_item,
         _status=status,
         _classify=_reports_status,
+        _fresh=fresh,
+        _settle=_settle_first_run,
     ) -> None:
         _cap.last.pop(_item.nodeid, None)
         _status.value = "unobserved"
+        first_run = _fresh.unmeasured(_item)
+        _fresh.refresh(_item)
         _reset(_item)
         reports = _rtp(_item, nextitem=None, log=False)
+        reports = _settle(_item, _cap, _fresh, reports, first_run, _rtp, _reset)
         _status.value = _classify(reports)
         if not any(r.failed for r in reports):
             return
@@ -334,6 +567,8 @@ def _make_item_callable(item: Any, capture: _ExcCapture) -> Callable[[], None]:
     run.__name__ = name
     run.__qualname__ = str(getattr(item, "nodeid", name))
     run.__wesker_item_status__ = status  # type: ignore[attr-defined]  # ty: ignore[unresolved-attribute]
+    # The arguments left shared, named (#55): read by the profile, never silently absent.
+    run.__wesker_fresh_arguments__ = fresh  # type: ignore[attr-defined]  # ty: ignore[unresolved-attribute]
     if mod is not None:
         # inspect.getmodule() fallback in _patch_mutant_into_test keys off __module__.
         run.__module__ = getattr(mod, "__name__", run.__module__)
@@ -400,6 +635,44 @@ class _CollectionErrorCapture:
         if report.failed:
             longrepr = str(report.longrepr) if report.longrepr else "(no detail)"
             self.errors.append((report.nodeid or "(root)", longrepr[:800]))
+
+
+def crash_standing(body_started: bool, body_finished: bool) -> str:
+    """What a crash of ``pytest.main`` means for the measurement it hosted (W#29, pure — pinned).
+
+    A crash is not one fact, and the old answer (discard everything, report "no live session") was right
+    for only the first two. The session exists to host the body; once the body has RETURNED, its result
+    is whole, and a pytest failure after it (the terminal summary, a session-finish hook, a closed
+    stdout that a mutant of the capture machinery left behind) says nothing about it. Measured: an
+    exception from a ``pytest_sessionfinish`` hook threw away a finished report and the Action refused
+    with "execution mode is 'legacy-direct-call'", after a shard had measured for 45 minutes.
+
+      "no_session"    the body never started: no measurement exists
+      "session_lost"  the body started and did not finish: its result does not exist
+      "result_kept"   the body finished: the result is returned, and the crash is only reported
+    """
+    if body_finished:
+        return "result_kept"
+    return "session_lost" if body_started else "no_session"
+
+
+def describe_crash(
+    error_type: str, message: str, standing: str, trace_tail: str
+) -> str:
+    """The sentence a pytest crash earns in ``diagnostic["detail"]`` (W#29, pure — pinned).
+
+    The words follow :func:`crash_standing`, because the remedies differ:
+
+      no_session    "pytest raised <T> before the measurement started"
+      session_lost  "pytest raised <T> while the measurement was running"
+      result_kept   "pytest raised <T> after the measurement had finished; its result was kept"
+    """
+    when = {
+        "result_kept": "after the measurement had finished; its result was kept",
+        "session_lost": "while the measurement was running",
+    }.get(standing, "before the measurement started")
+    said = message.strip() or "(no message)"
+    return f"pytest raised {error_type} {when}: {said}\n{trace_tail.rstrip()}"
 
 
 def run_in_session(
@@ -615,10 +888,23 @@ def run_in_session(
             rc = int(pytest.main(args, plugins=[_Driver(), capture, collect_errors]))
     # BLE001: pytest.main runs the target's suite and plugins; a crash is recorded in
     # `diagnostic` and returned as no result
-    except Exception:  # noqa: BLE001
+    except Exception as crashed:  # noqa: BLE001
+        standing = crash_standing("ran" in box, "result" in box)
         if diagnostic is not None:
-            diagnostic["reason"] = "pytest_crashed"
-        return None
+            diagnostic["reason"] = (
+                "pytest_crashed_after_result"
+                if standing == "result_kept"
+                else "pytest_crashed"
+            )
+            # Which exception, from where, and whether the body had finished (W#29).
+            diagnostic["detail"] = describe_crash(
+                type(crashed).__name__,
+                str(crashed),
+                standing,
+                "".join(traceback.format_exception(crashed)[-6:]),
+            )
+        if standing != "result_kept":
+            return None
     finally:
         # Restore the live-manifest and scope this session bound, innermost first, so a nested
         # or sequential session sees the enclosing context exactly as it was (#26).

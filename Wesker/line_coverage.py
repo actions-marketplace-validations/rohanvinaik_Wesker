@@ -28,6 +28,7 @@ from types import CodeType
 from typing import Any
 
 from Wesker.interrupt import Abandoned, JoinedWorker, MeasurementRefused, bounded_join
+from Wesker.trace_evidence import reach_qualification
 
 
 def _traceable_lines(
@@ -145,6 +146,41 @@ def _target_matcher(target_files: set[str]) -> Callable[[str], str | None]:
     return match
 
 
+# (#17) The audited operations that create a process. The child runs OUTSIDE this interpreter, where
+# no monitoring tool can follow it, so a test that makes one has reach that is unknown. The hook is
+# installed once (CPython has no way to remove one) and is a single dict lookup while no trace is
+# active; it records only the creating THREAD, never blocks or alters the operation.
+_PROCESS_CREATION_EVENTS = frozenset(
+    {
+        "subprocess.Popen",
+        "_posixsubprocess.fork_exec",
+        "os.system",
+        "os.exec",
+        "os.posix_spawn",
+        "os.spawn",
+        "os.fork",
+        "os.forkpty",
+    }
+)
+_spawn_watchers: dict[int, tuple[Callable[[int], bool], list[int]]] = {}
+_spawn_hook_installed = False
+
+
+def _spawn_audit_hook(event: str, _args: tuple) -> None:
+    if event in _PROCESS_CREATION_EVENTS and _spawn_watchers:
+        ident = threading.get_ident()
+        for owns, spawned in list(_spawn_watchers.values()):
+            if owns(ident):
+                spawned.append(ident)
+
+
+def _install_spawn_hook() -> None:
+    global _spawn_hook_installed
+    if not _spawn_hook_installed:
+        sys.addaudithook(_spawn_audit_hook)
+        _spawn_hook_installed = True
+
+
 def _trace_one(
     test_fn: Callable[..., None],
     target_file: str,
@@ -232,6 +268,35 @@ def failing_on_baseline(
     return failing
 
 
+def observation_failure_standing(code: str, contained: bool, can_qualify: bool) -> str:
+    """What a failed observation of ONE test's trace means for the measurement (W#29, pure — pinned).
+
+    ``code`` is the failure the subscription recorded (``MonitoringObservationFailed.code``). It was
+    raised out of the tracer and ended the whole run (measured: `observation_inflight`, subscription
+    4765, out of Wesker's own baseline trace in CI), when the evidence it spoils is one test's. The
+    answer is where that fact lives:
+
+      "observed"          ``code`` is empty: nothing failed
+      "tolerated"         a delivery was still in flight on a worker that could NOT be stopped: that
+                          non-quiescence is already explicit in the uncontained result, so it is not
+                          named twice
+      "reach_unknown"     any other failure, and the caller collects reach: this test's lines stay as
+                          recorded and what is missing from them is UNKNOWN (``incomplete_observation``),
+                          never a negative
+      "refuse"            any other failure, and the caller collects no reach to say so in: the failure
+                          is raised, as before. A caller that cannot qualify the absence must not
+                          receive a trace that looks complete
+
+    A contained worker with a delivery still in flight is NOT tolerated: nothing explains it, so it is
+    an unobserved reach rather than silence.
+    """
+    if not code:
+        return "observed"
+    if code == "observation_inflight" and not contained:
+        return "tolerated"
+    return "reach_unknown" if can_qualify else "refuse"
+
+
 def _trace_one_multi(
     test_fn: Callable[..., None],
     target_files: set[str],
@@ -279,6 +344,7 @@ def _trace_one_multi(
     frame_last: dict[int, int] = {}
 
     alive_before = set(threading.enumerate())
+    preexisting_hit: list[int] = []
     worker_holder: list[threading.Thread] = []
     token = allocate_run_token()
 
@@ -289,6 +355,25 @@ def _trace_one_multi(
         # Read CPython's existing registration without manufacturing an observer.
         registered = registered_thread(thread_id)
         return registered is not None and registered not in alive_before
+
+    def _is_preexisting_thread(thread_id: int) -> bool:
+        # A thread that was already alive when this test began, other than the one running it.
+        registered = registered_thread(thread_id)
+        return registered is not None and registered in alive_before
+
+    def _on_foreign_line(
+        code: CodeType,
+        lineno: int,
+        frame: Any = None,
+        run_token: int | None = None,
+    ) -> None:
+        # (#17) WITNESS only: a pre-existing thread cannot be attributed to THIS test (a pool
+        # warmed in a fixture serves whichever test submits), so its lines never enter the
+        # test's reach. That it ran target code during the window is recorded, so the row can
+        # say its reach is unknown instead of complete-and-empty.
+        filename = code.co_filename
+        if filename in target_files or match(filename) is not None:
+            preexisting_hit.append(lineno)
 
     def _on_line(
         code: CodeType,
@@ -328,8 +413,24 @@ def _trace_one_multi(
         if capture_arcs and frame is not None:
             frame_last.pop(id(frame), None)
 
+    spawned: list[int] = []
+    # What the worker saw when it ended: (a thread outlived the run, a pre-existing thread ran
+    # target code, a process was created). Joined with the observer's own state below, once.
+    facts: list[tuple[bool, bool, bool]] = []
+    _install_spawn_hook()
+    _spawn_watchers[token] = (_owns_thread, spawned)
     handles = []
     try:
+        handles.append(
+            subscribe(
+                [],
+                sys.monitoring.events.LINE,
+                _on_foreign_line,
+                run_token=token,
+                selectors=tuple(target_files),
+                thread_filter=_is_preexisting_thread,
+            )
+        )
         handles.append(
             subscribe(
                 [],
@@ -362,6 +463,7 @@ def _trace_one_multi(
                 )
             )
     except BaseException:
+        _spawn_watchers.pop(token, None)
         retire_run_token(token)
         for h in handles:
             h.close()
@@ -373,12 +475,26 @@ def _trace_one_multi(
             test_fn()
         except (Exception, Abandoned, MeasurementRefused):  # noqa: BLE001, S110
             pass
+        except (KeyboardInterrupt, SystemExit):
+            raise
+        # BLE001: pytest's own outcomes (`Skipped`, `XFailed`, `Failed`) derive from BaseException; a
+        # test that raises one still contributes the lines it reached, and an unhandled one would
+        # escape this thread as a thread-exception warning that pytest turns into a failure (#17)
+        except BaseException:  # noqa: BLE001, S110
+            pass
         finally:
-            if reach is not None and any(
-                t not in alive_before and t is not threading.current_thread()
-                for t in threading.enumerate()
-            ):
-                reach.append("incomplete_thread")
+            if reach is not None:
+                facts.append(
+                    (
+                        any(
+                            t not in alive_before
+                            and t is not threading.current_thread()
+                            for t in threading.enumerate()
+                        ),
+                        bool(preexisting_hit),
+                        bool(spawned),
+                    )
+                )
 
     thread = JoinedWorker(target=_worker, daemon=True)
     try:
@@ -387,18 +503,29 @@ def _trace_one_multi(
             thread, budget_s if budget_s and budget_s > 0 else None
         )
     finally:
+        _spawn_watchers.pop(token, None)
         retire_run_token(token)
         for h in handles:
             h.close()
 
+    observation_failed = False
     for h in handles:
         try:
             h.check()
         except MonitoringObservationFailed as exc:
-            # Non-quiescence is already explicit in this inadmissible result.
-            # Preserve other observation failures rather than returning partial proof.
-            if contained or exc.code != "observation_inflight":
+            standing = observation_failure_standing(
+                exc.code, contained, reach is not None
+            )
+            if standing == "refuse":
                 raise
+            observation_failed = observation_failed or standing == "reach_unknown"
+    if reach is not None:
+        outlived, preexisting, spawned_process = facts[0] if facts else (False,) * 3
+        code = reach_qualification(
+            outlived, preexisting, spawned_process, observation_failed
+        )
+        if code != "complete":
+            reach.append(code)
 
     return (
         {f: set(lines) for f, lines in dict(hits).items()},

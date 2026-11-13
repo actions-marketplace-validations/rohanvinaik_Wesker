@@ -28,6 +28,8 @@ that the selection is optimal, not a claim about anyone's tests.
 from __future__ import annotations
 
 import argparse
+import contextlib
+import gc
 import io
 import json
 import os
@@ -35,11 +37,15 @@ import re
 import subprocess
 import sys
 import threading
+import traceback
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from collections.abc import Callable
+    from typing import IO
+
+from Wesker.shards import completeness_code, shard_setting
 
 _DETECTIVE_PKG = "detective-spec"
 
@@ -164,7 +170,7 @@ def gate_suite_health(report: dict, max_inert_pct: int = 50) -> str | None:
 
 def gate_truncation(report: dict) -> str | None:
     """Refuse to call a CUT measurement a completeness measurement — cut by the budget, by a worker
-    that could not be stopped, or by the memory cap (Wesker #13/#14/W#21).
+    that could not be stopped (Wesker #13/#14). A mutant the memory cap stopped is not a cut (W#45).
 
     The refusal names each cut function under the remedy its cause needs. A count alone told the
     maintainer that something was cut and not what: the remedies differ, and for a worker that
@@ -234,6 +240,8 @@ def _summary_markdown(report: dict, scope_note: str) -> str:
     item: it can afford to say WHY the number means something, and saying it here rather than
     on the front reads as conviction rather than salesmanship.
     """
+    from Wesker.ci import describe_harness, describe_memory
+
     spec = report.get("spec_pct", 0)
     pinned = report.get("total_dof_pinned", 0)
     dof = report.get("total_dof", 0)
@@ -255,6 +263,11 @@ def _summary_markdown(report: dict, scope_note: str) -> str:
         f"| Unspecified | **{dof - pinned}** |",
         f"| Mutants run | {mutants} ({per_dim} per dimension) |",
         f"| Judged by | `{report.get('execution_mode', 'unknown')}` |",
+        "",
+        "```",
+        describe_harness(report),
+        describe_memory(report),
+        "```",
         "",
         "<details><summary>Why this number is comparable and a kill rate is not</summary>",
         "",
@@ -352,6 +365,7 @@ def _write_outputs(report: dict) -> None:
         "dof-pct": report.get("dof_pct", 0),
         "kill-pct": report.get("kill_pct", 0),
         "total-mutants": report.get("total_mutants", 0),
+        "harness-mutants": report.get("total_harness_mutants", 0),
         "execution-mode": report.get("execution_mode", "unknown"),
         "survivors": len(report.get("survivors") or []),
     }
@@ -365,6 +379,11 @@ def _annotate(report: dict) -> None:
     Emitted in addition to SARIF because annotations need no extra permissions and show up
     even where code scanning is unavailable (most private repos on free plans).
     """
+    from Wesker.ci import describe_harness
+
+    if report.get("total_harness_mutants"):
+        # W#54: the ratio the survivors below belong to leaves these mutants out; say so with them.
+        print(f"::notice::{describe_harness(report).splitlines()[0]}")
     for s in (report.get("survivors") or [])[:50]:
         path = str(s.get("function_key", "")).split("::", 1)[0]
         line = s.get("mutated_line")
@@ -373,9 +392,28 @@ def _annotate(report: dict) -> None:
         loc = f"file={path}" + (f",line={line}" if line else "")
         msg = f"Unspecified dimension `{dim}` — no test distinguishes: {change}"
         print(f"::warning {loc}::{msg}")
+    # W#52: a run whose progress lines could not all be written says so here, with the report's other
+    # annotations, after the streams have been re-entered.
+    gap = progress_gap_notice(report.get("progress_lines_dropped", 0))
+    if gap:
+        print(gap)
 
 
 # ── Entry point ──────────────────────────────────────────────────
+
+
+# The process-global marker the outermost Action sets for as long as it owns the streams (W#52): its pid.
+# It is read with `stack_dump_owner`, the same pure decision the stall dump reads, but is a DIFFERENT
+# variable: the dump's marker exists only when a dump is armed, and a nested Action must find the stream
+# owner whether or not one is.
+_STREAM_OWNER_ENV = "WESKER_STREAM_OWNER"
+
+
+def _is_nested() -> bool:
+    """Whether an Action in THIS process already owns the streams (reads the marker; sets nothing)."""
+    return (
+        stack_dump_owner(os.environ.get(_STREAM_OWNER_ENV, ""), os.getpid()) == "nested"
+    )
 
 
 def _stream_reentry() -> Callable[[], None]:
@@ -387,13 +425,20 @@ def _stream_reentry() -> Callable[[], None]:
     restores the function, not the file descriptor. Measured (2026-08-05,
     the first whole-codebase run after DATAFLOW grew that universe): the
     badge run completed its measurement and then died at the first
-    ``::warning`` annotation with EBADF, taking the report down with it.
+    ``::warning`` annotation with EBADF — taking the report down with it.
     Same belt-and-braces as ``ci._body`` re-entering the streams around the
     baseline, one layer up: the MEASUREMENT may fight hostile mutants — the
-    REPORT must not. Per-file progress lines during the run stay best-effort;
-    the GitHub-protocol lines (annotations, outputs, summary, banner) are the
-    contract and are written only after re-entry.
+    REPORT must not. Per-file progress lines during the run go through a private
+    descriptor (`_open_progress`); the GitHub-protocol lines (annotations, outputs,
+    summary, banner) are the contract and are written only after re-entry.
+
+    A NESTED Action (W#52) — a test of the Action run by the measurement inside the measuring
+    process — owns no streams: it snapshots nothing and re-enters nothing, so its output lands where
+    the calling test's capture put it, and a mutant of this very code cannot touch the descriptors the
+    measuring process reports through. The hand it returns does nothing.
     """
+    if _is_nested():
+        return lambda: None
     saved_out, saved_err = os.dup(1), os.dup(2)
 
     def reenter() -> None:
@@ -409,8 +454,52 @@ def _stream_reentry() -> Callable[[], None]:
         sys.stderr = io.TextIOWrapper(
             io.FileIO(2, "w", closefd=False), line_buffering=True
         )
+        # W#52: rebinding drops the previous wrappers, and one a mutant built with `closefd=True`
+        # closes the descriptor it wraps when it is collected, which is the one just restored. Let
+        # every dropped wrapper die, then restore again: the descriptors the report speaks through
+        # are the ones in place AFTER the last finalizer has run.
+        gc.collect()
+        os.dup2(saved_out, 1)
+        os.dup2(saved_err, 2)
 
     return reenter
+
+
+def progress_gap_notice(dropped: int) -> str:
+    """The line that says this run's log is missing progress lines, or "" when it is not (W#52, pure — pinned).
+
+    A progress line the run could not write is dropped so that the measurement survives. Dropping it
+    silently would leave a log that reads as complete: the reader of a silent stretch cannot tell "the
+    run printed nothing" from "the run could not print". The report itself is unaffected, and the
+    notice says that too, so a hole in the log is never read as a hole in the measurement.
+    """
+    if dropped <= 0:
+        return ""
+    return (
+        f"::warning::{dropped} progress line(s) of this run could not be written: the code under "
+        "measurement closed or redirected the run's output. The measurement and this report are "
+        "unaffected; the per-file progress above is incomplete."
+    )
+
+
+def _open_progress() -> IO[str]:
+    """A line-buffered text stream on a PRIVATE duplicate of the real stdout, made before profiling (W#52).
+
+    The measuring process's per-file progress is written here, never through ``sys.stdout`` or fd 1:
+    a nested Action, or a mutant of the stream code, can close or redirect those, and the run then
+    dies on its next ``[3/24]`` line. The duplicate is not a name the code under measurement uses.
+
+    It is a SECOND writer on the descriptor ``sys.stdout`` already writes to, so whatever ``sys.stdout``
+    still holds in its buffer is flushed first. When stdout is a pipe, as in every CI log, Python
+    block-buffers it: the banner printed before profiling stayed in that buffer while the first progress
+    prefix went straight out through the duplicate, and the log read
+    ``[1/1] mod.pyWesker — Whole codebase — 1 file(s).`` with the result on the next line.
+    """
+    for stream in (sys.stdout, sys.stderr):
+        # a closed or replaced stream has nothing of ours to order
+        with contextlib.suppress(Exception):
+            stream.flush()
+    return os.fdopen(os.dup(1), "w", buffering=1, encoding="utf-8", errors="replace")
 
 
 def _profile_live(
@@ -418,6 +507,7 @@ def _profile_live(
     targets: list[str],
     budget: float,
     config: dict,
+    diagnostic: dict | None = None,
 ) -> tuple[dict | None, str]:
     """Run the live profile between the stream re-entry and the stack dump; ``(report, refusal)``.
 
@@ -425,8 +515,17 @@ def _profile_live(
     other outcome is the report's, as before, including None for no live session.
     """
     lost_worker = worker_lost_types()
+    nested = _is_nested()
     reenter_streams = _stream_reentry()
     cancel_stack_dump = _stack_dump_from_env()
+    # An owner reports progress through its private duplicate and publishes the marker that makes every
+    # Action inside the measurement nested (W#52); a nested one does neither.
+    progress = None if nested else _open_progress()
+    kwargs = {} if progress is None else {"progress": progress}
+    if diagnostic is not None:
+        kwargs["diagnostic"] = diagnostic
+    if not nested:
+        os.environ[_STREAM_OWNER_ENV] = str(os.getpid())
     try:
         return (
             profile_codebase_live(
@@ -436,6 +535,7 @@ def _profile_live(
                 max_per_category=config.get("max_per_category"),
                 passes=config.get("convergence_passes", 1),
                 verbose=True,
+                **kwargs,
             ),
             "",
         )
@@ -443,10 +543,16 @@ def _profile_live(
         return None, worker_lost_reason(lost)
     finally:
         cancel_stack_dump()
+        if not nested:
+            os.environ.pop(_STREAM_OWNER_ENV, None)
         # Everything from here down is the REPORT — gates, SARIF, annotations,
         # outputs, summary, banner — and must not inherit a corpse fd from a
         # hostile mutant of the capture machinery.
         reenter_streams()
+        if progress is not None:
+            # closing the private progress stream must never cost the report that follows
+            with contextlib.suppress(Exception):
+                progress.close()
 
 
 def worker_lost_types() -> tuple[type[BaseException], ...]:
@@ -473,6 +579,84 @@ def worker_lost_reason(lost: BaseException) -> str:
         "thread (a resource limit the measured code lowered is one measured cause). Nothing measured "
         "after it can be trusted. If it recurs, report it with this log."
     )
+
+
+def no_live_session_reason(reason: str, detail: str) -> str:
+    """The refusal text when no live pytest session produced a report, by cause (W#29, pure — pinned).
+
+    Every cause used to read as one sentence, "execution mode is 'legacy-direct-call'": a shard that
+    measured a file for 45 minutes and then lost its report to a pytest crash said the same thing as a
+    project whose suite could not be collected. The cause is `run_in_session`'s ``reason``:
+
+      "pytest_crashed"      pytest raised before or while the measurement ran; ``detail`` says what
+      "collection_errors"   a test file could not be collected; ``detail`` names them
+      "empty_collection"    pytest collected no test at all
+      "pytest_missing"      pytest is not importable
+      anything else         no cause was recorded: the old sentence, and it says so
+    """
+    said = detail.strip()
+    if reason == "pytest_crashed":
+        return (
+            "the live pytest session ended in a crash, so its report was not returned.\n"
+            + said
+        )
+    if reason == "collection_errors":
+        return (
+            "pytest could not collect the suite, so no live session ran the measurement.\n"
+            + (said or "Run `pytest --collect-only` to see the errors.")
+        )
+    if reason == "empty_collection":
+        return (
+            "pytest collected no test, so no live session ran the measurement.\n"
+            "Check testpaths and that the project's tests are importable."
+        )
+    if reason == "pytest_missing":
+        return "pytest is not installed, so no live session ran the measurement."
+    return (
+        gate_execution_mode({"execution_mode": "legacy-direct-call"}) or ""
+    ) + "\n(no cause was recorded for the missing session.)"
+
+
+def _session_detail(diagnostic: dict) -> str:
+    """The detail a missing session came with: its own text, else the test files that failed to collect."""
+    detail = str(diagnostic.get("detail", ""))
+    if detail:
+        return detail
+    errors = diagnostic.get("errors") or ()
+    return "; ".join(
+        f"{nodeid}: {str(error).strip().splitlines()[-1] if str(error).strip() else ''}".rstrip(
+            ": "
+        )
+        for nodeid, error in errors
+    )
+
+
+def escaped_exception_reason(error_type: str, message: str, where: str) -> str:
+    """The refusal an exception that escaped the measurement earns (W#29, pure — pinned).
+
+    Before this the shard died on the traceback and wrote no record, so the aggregation could say only
+    `report_missing`, which names no cause. The reason carries the exception's class, its message and
+    the innermost frame (``file:line in function``) so the merge states what ended the shard. A blank
+    message and a blank frame are each said to be unavailable, never left as an empty sentence.
+    """
+    said = message.strip() or "(no message)"
+    at = where.strip() or "(frame unavailable)"
+    return (
+        f"the measurement ended on {error_type}: {said} (at {at}).\n"
+        "Nothing measured in this run can be trusted or summed. The full traceback is in this job's "
+        "log above."
+    )
+
+
+def _innermost_frame(exc: BaseException) -> str:
+    """``file:line in function`` of the deepest frame ``exc`` unwound through, or "" when it has none."""
+    tb = exc.__traceback__
+    where = ""
+    while tb is not None:
+        code = tb.tb_frame.f_code
+        where = f"{code.co_filename}:{tb.tb_lineno} in {code.co_name}"
+        tb = tb.tb_next
+    return where
 
 
 def _fail(reason: str) -> int:
@@ -701,19 +885,56 @@ def main(argv: list[str] | None = None) -> int:
         help="Report a budget-limited sample instead of failing (the number is then not a "
         "completeness measurement)",
     )
+    parser.add_argument(
+        "--shard",
+        default="",
+        help="Measure one shard of a sharded run, as i/N (the targets are that shard's group)",
+    )
+    parser.add_argument(
+        "--plan-shards",
+        type=int,
+        default=None,
+        metavar="N",
+        help="Print the matrix JSON that splits the targets into N groups, and measure nothing",
+    )
+    parser.add_argument(
+        "--plan-out",
+        default="",
+        help="With --plan-shards: also write the full plan here",
+    )
+    parser.add_argument(
+        "--merge",
+        action="store_true",
+        help="Merge the shard reports named as arguments into the report one unsharded run would "
+        "give (needs --plan)",
+    )
+    parser.add_argument(
+        "reports",
+        nargs="*",
+        metavar="REPORT",
+        help="With --merge: the shard report files",
+    )
+    parser.add_argument(
+        "--plan", default="", help="With --merge: the plan the shards were cut from"
+    )
     args = parser.parse_args(argv)
 
-    from Wesker.metrics import _discover_targets, _load_config
+    if args.plan_shards is not None:
+        return _plan_main(args)
+    if args.merge:
+        return _merge_main(args)
+    shard_code, shard_index, shard_count = shard_setting(args.shard)
+    if shard_code == "invalid":
+        return _fail(f"--shard must be i/N with 1 <= i <= N, got '{args.shard}'.")
+
+    from Wesker.metrics import _load_config
     from Wesker.sarif import to_sarif
     from Wesker.self_profile import profiler_for_targets
 
     config = _load_config()
-    targets = list(args.targets) or _discover_targets(config)
+    targets = _resolve_targets(args.targets, config)
     if not targets:
-        return _fail(
-            "no source files found.\n"
-            "Set [tool.wesker] source_dir in pyproject.toml, or pass targets explicitly."
-        )
+        return _fail(_NO_TARGETS)
 
     scope_note = f"Whole codebase — {len(targets)} file(s)."
     if args.base_ref:
@@ -735,27 +956,74 @@ def main(argv: list[str] | None = None) -> int:
         scope_note = f"Changed in this pull request — {len(targets)} file(s)."
 
     print(f"Wesker — {scope_note}")
+    report: dict | None = None
+
+    def refuse(code: str, reason: str) -> int:
+        # #29: a refusal is recorded under its name, with the files it concerns, so a merge can
+        # re-state it instead of finding a shard that "did not report".
+        _write_shard_record(shard_index, shard_count, targets, code, reason, report)
+        return _fail(reason)
+
+    diagnostic: dict[str, object] = {}
     # Wesker profiling Wesker runs from a private copy of the package, so the modules being
     # mutated are not the ones executing the run. Any other project resolves to the public
     # engine here, exactly as before.
-    report, lost = _profile_live(
-        profiler_for_targets(targets), targets, args.budget, config
-    )
+    try:
+        report, lost = _profile_live(
+            profiler_for_targets(targets),
+            targets,
+            args.budget,
+            config,
+            diagnostic=diagnostic,
+        )
+    # BLE001: ANY failure that escapes the measurement ends it with a record that names it (W#29).
+    # A shard that dies on a traceback writes nothing, and the aggregation can then only say
+    # `report_missing`, which names no cause. Ctrl-C is not a measurement failure and passes through.
+    except (Exception, SystemExit) as escaped:  # noqa: BLE001
+        traceback.print_exc()
+        return refuse(
+            "measurement_failed",
+            escaped_exception_reason(
+                type(escaped).__name__, str(escaped), _innermost_frame(escaped)
+            ),
+        )
+
     if lost:
-        return _fail(lost)
+        return refuse("worker_lost", lost)
     if report is None:
-        return _fail(
-            gate_execution_mode({"execution_mode": "legacy-direct-call"}) or ""
+        return refuse(
+            "no_live_session",
+            no_live_session_reason(
+                str(diagnostic.get("reason", "")), _session_detail(diagnostic)
+            ),
         )
     report["execution_mode"] = "pytest-live"
+    if diagnostic.get("reason") == "pytest_crashed_after_result":
+        # The measurement finished and its report is whole; pytest failed after it (W#29). Said, not hidden.
+        print(
+            "::warning::pytest raised after the measurement had finished; the report was kept.\n"
+            + str(diagnostic.get("detail", "")),
+            file=sys.stderr,
+        )
 
-    for gate in (gate_execution_mode(report), gate_suite_health(report)):
+    for code, gate in (
+        ("execution_mode", gate_execution_mode(report)),
+        ("suite_health", gate_suite_health(report)),
+    ):
         if gate:
-            return _fail(gate)
+            return refuse(code, gate)
     refusal = _completeness_refusal(report, args.allow_truncation)
     if refusal:
-        return _fail(refusal)
+        return refuse(
+            completeness_code(
+                report.get("total_truncated", 0),
+                report.get("total_unresolved", 0),
+                args.allow_truncation,
+            ),
+            refusal,
+        )
 
+    _write_shard_record(shard_index, shard_count, targets, "", "", report)
     Path(".wesker").mkdir(exist_ok=True)
     Path(".wesker/mutation_report.json").write_text(json.dumps(report, indent=2))
     if args.sarif:
@@ -777,6 +1045,11 @@ def main(argv: list[str] | None = None) -> int:
         print(f"SARIF: {sarif_path}")
 
     _annotate(report)
+    return _conclude(report, scope_note, args.threshold)
+
+
+def _conclude(report: dict, scope_note: str, threshold: int) -> int:
+    """Outputs, step summary, banner and the threshold gate: what a passing report ends with."""
     _write_outputs(report)
     _write_github_file("GITHUB_STEP_SUMMARY", _summary_markdown(report, scope_note))
 
@@ -787,14 +1060,138 @@ def main(argv: list[str] | None = None) -> int:
         f"({report.get('total_dof_pinned', 0)}/{report.get('total_dof', 0)} dimensions)\n"
         f"{'=' * 60}"
     )
-    if args.threshold and spec < args.threshold:
+    if threshold and spec < threshold:
         print(
             f"\n::error::Specification completeness {spec}% is below the "
-            f"{args.threshold}% threshold",
+            f"{threshold}% threshold",
             file=sys.stderr,
         )
         return 1
     return 0
+
+
+# ── Sharding (#29) ───────────────────────────────────────────────
+
+_NO_TARGETS = (
+    "no source files found.\n"
+    "Set [tool.wesker] source_dir in pyproject.toml, or pass targets explicitly."
+)
+
+
+def _resolve_targets(explicit: list[str], config: dict) -> list[str]:
+    """The files a run measures: the explicit list, else auto-detection (one rule, shared by the plan)."""
+    from Wesker.metrics import _discover_targets
+
+    return list(explicit) or _discover_targets(config)
+
+
+def _write_shard_record(
+    index: int,
+    count: int,
+    targets: list[str],
+    refusal: str,
+    detail: str,
+    report: dict | None,
+) -> None:
+    """Write ``.wesker/shard_report.json``: what a merge needs to verify and sum this run."""
+    from Wesker import __version__
+    from Wesker.policy import mutation_policy
+    from Wesker.shards import environment_commit, shard_record
+
+    record = shard_record(
+        index=index,
+        count=count,
+        targets=targets,
+        commit=environment_commit(),
+        policy_id=mutation_policy().policy_id,
+        version=__version__,
+        refusal=refusal,
+        detail=detail,
+        report=report,
+    )
+    Path(".wesker").mkdir(exist_ok=True)
+    Path(".wesker/shard_report.json").write_text(json.dumps(record, indent=2))
+
+
+def _plan_main(args: argparse.Namespace) -> int:
+    """``--plan-shards N``: print the matrix for the targets an unsharded run would measure."""
+    from Wesker.metrics import _load_config
+    from Wesker.shards import build_plan, matrix_json
+
+    targets = _resolve_targets(args.targets, _load_config())
+    if not targets:
+        return _fail(_NO_TARGETS)
+    try:
+        plan = build_plan(targets, args.plan_shards)
+    except ValueError as exc:
+        return _fail(
+            f"cannot plan {len(targets)} file(s) into {args.plan_shards} shard(s): {exc}"
+        )
+    if args.plan_out:
+        Path(args.plan_out).parent.mkdir(parents=True, exist_ok=True)
+        Path(args.plan_out).write_text(json.dumps(plan, indent=2))
+    print(matrix_json(plan))
+    return 0
+
+
+def _merge_main(args: argparse.Namespace) -> int:
+    """``--merge``: the shard reports, verified against the plan, as the report one run would give."""
+    from Wesker import shards
+
+    if not args.plan:
+        return _fail(
+            "plan_missing: --merge needs --plan, the plan the shards were cut from."
+        )
+    try:
+        plan = shards.read_json(args.plan)
+    except ValueError as exc:
+        return _fail(f"plan_unreadable: {exc}")
+    groups = plan.get("groups") if isinstance(plan, dict) else None
+    if (
+        not isinstance(groups, list)
+        or plan.get("kind") != shards.PLAN_KIND
+        or any(
+            not isinstance(g, list) or any(not isinstance(f, str) for f in g)
+            for g in groups
+        )
+    ):
+        return _fail(f"plan_unreadable: {args.plan} is not a shard plan.")
+
+    records: list[dict] = []
+    for path in args.reports:
+        try:
+            decoded = shards.read_json(path)
+        except ValueError as exc:
+            return _fail(f"report_unreadable: {exc}")
+        standing = shards.record_standing(decoded if isinstance(decoded, dict) else {})
+        if standing != "ok":
+            return _fail(f"{standing}: {path} is not a usable shard report.")
+        records.append(decoded)
+
+    summaries = [shards.summarize(r) for r in records]
+    code = shards.merge_standing(groups, summaries)
+    if code != "merged":
+        return _fail(f"{code}: {shards.describe_merge(code, groups, summaries)}")
+
+    ordered = sorted(records, key=lambda r: r["shard_index"])
+    report = shards.merge_reports([r["report"] for r in ordered])
+    for gate in (gate_execution_mode(report), gate_suite_health(report)):
+        if gate:
+            return _fail(gate)
+    refusal = _completeness_refusal(report, args.allow_truncation)
+    if refusal:
+        return _fail(
+            f"{shards.completeness_code(report['total_truncated'], report['total_unresolved'], args.allow_truncation)}: {refusal}"
+        )
+
+    Path(".wesker").mkdir(exist_ok=True)
+    Path(".wesker/mutation_report.json").write_text(json.dumps(report, indent=2))
+    n_files = sum(len(g) for g in groups)
+    scope_note = (
+        f"Whole codebase — {n_files} file(s), measured as {len(groups)} shard(s)."
+    )
+    print(f"Wesker — {scope_note}")
+    return _conclude(report, scope_note, args.threshold)
 
 
 def _version() -> str:
